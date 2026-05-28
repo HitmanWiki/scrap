@@ -1,5 +1,5 @@
 """
-Sniper Service - Compatible with solders 0.18.1 and your working script
+Sniper Service - Uses PumpSwap for pump.fun tokens, Jupiter for regular tokens
 """
 
 import asyncio
@@ -15,6 +15,7 @@ from solders import message
 from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
 from typing import Optional
+import json
 
 
 class SniperService:
@@ -24,31 +25,18 @@ class SniperService:
     
     def _rpc_call(self, method: str, params: list) -> dict:
         """Make raw RPC call"""
-        import requests
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
             response = requests.post(self.rpc_url, json=payload, timeout=30)
             return response.json()
         except Exception as e:
             return {"error": {"message": str(e)}}
-        
+    
     async def get_token_decimals(self, token_mint: str) -> int:
-        """Get token decimals - special handling for pump.fun tokens"""
-        
-        # pump.fun tokens have 6 decimals
+        """Get token decimals - pump.fun tokens have 6 decimals"""
         if token_mint.endswith('pump'):
             return 6
         
-        # Try RPC first
-        try:
-            result = self._rpc_call("getMint", [token_mint])
-            if 'result' in result and result['result']:
-                decimals = result['result'].get('decimals', 9)
-                return decimals
-        except:
-            pass
-        
-        # Try Jupiter token list
         try:
             url = f"https://tokens.jup.ag/token/{token_mint}"
             resp = requests.get(url, timeout=5)
@@ -61,8 +49,11 @@ class SniperService:
         
         return 9
     
+    def is_pump_fun_token(self, token_mint: str) -> bool:
+        """Check if token is from pump.fun (ends with 'pump')"""
+        return token_mint.endswith('pump')
+    
     async def get_token_price(self, token_mint: str) -> Optional[float]:
-        """Get token price from DexScreener"""
         try:
             url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
             resp = requests.get(url, timeout=5)
@@ -82,7 +73,6 @@ class SniperService:
             return False
     
     async def resolve_dexscreener_pair(self, pair_url: str) -> Optional[str]:
-        """Resolve DexScreener URL to token address"""
         import re
         try:
             match = re.search(r'dexscreener\.com/([a-zA-Z0-9]+)/([a-zA-Z0-9]+)', pair_url)
@@ -103,7 +93,6 @@ class SniperService:
         return None
     
     async def extract_contract_address(self, text: str) -> Optional[str]:
-        """Extract contract address - matches your working script"""
         import re
         urls = re.findall(r'https?://(?:www\.)?dexscreener\.com/[^\s]+', text)
         for url in urls:
@@ -120,7 +109,6 @@ class SniperService:
         return None
     
     async def is_holding_token(self, wallet_pubkey: Pubkey, token_mint: str) -> bool:
-        """Check if wallet holds token"""
         try:
             mint_pubkey = Pubkey.from_string(token_mint)
             ata = get_associated_token_address(wallet_pubkey, mint_pubkey)
@@ -132,7 +120,6 @@ class SniperService:
             return False
     
     async def get_wallet_balance(self, wallet_pubkey: Pubkey) -> float:
-        """Get SOL balance"""
         try:
             response = self.client.get_balance(wallet_pubkey, "processed")
             return response.value / 1e9
@@ -140,7 +127,6 @@ class SniperService:
             return 0
     
     async def get_token_balance(self, wallet_pubkey: Pubkey, token_mint: str) -> float:
-        """Get token balance - added for show_positions"""
         try:
             mint_pubkey = Pubkey.from_string(token_mint)
             ata = get_associated_token_address(wallet_pubkey, mint_pubkey)
@@ -151,12 +137,145 @@ class SniperService:
         except:
             return 0
     
+    # ============================================
+    # PUMP.FUN SELL (Using pump_swap)
+    # ============================================
+    async def execute_pump_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
+        """Sell pump.fun tokens using pump_swap library"""
+        try:
+            from pump_swap import sell
+            
+            print(f"   🎯 Using PumpSwap for pump.fun token")
+            print(f"   Selling {amount_tokens:.6f} tokens via PumpSwap...")
+            
+            decimals = await self.get_token_decimals(token_mint)
+            amount_raw = int(amount_tokens * 10**decimals)
+            print(f"   📊 Decimals: {decimals}, Raw: {amount_raw}")
+            
+            private_key_base58 = base58.b58encode(bytes(wallet)).decode()
+            slippage_percent = slippage_bps / 100
+            
+            # Use pump_swap's sell function
+            result = await sell(
+                mint=token_mint,
+                amount=amount_raw,
+                slippage=slippage_percent,
+                private_key=private_key_base58,
+                rpc_url=self.rpc_url
+            )
+            
+            txid = result.get('txid', '')
+            print(f"   ✅ PumpSwap Sell TXID: {txid}")
+            
+            return {
+                "success": True,
+                "txid": txid,
+                "sol_received": 0,
+                "explorer": f"https://solscan.io/tx/{txid}"
+            }
+            
+        except ImportError:
+            print(f"   ⚠️ pump_swap not installed. Run: pip install pump-swap")
+            return {"success": False, "error": "pump_swap library not installed"}
+        except Exception as e:
+            print(f"   ❌ PumpSwap sell failed: {e}")
+            return {"success": False, "error": str(e)}
+    
+    # ============================================
+    # REGULAR TOKEN SELL (Using Jupiter)
+    # ============================================
+    async def execute_jupiter_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
+        """Sell regular tokens using Jupiter API"""
+        try:
+            print(f"   🎯 Using Jupiter for regular token")
+            print(f"   Selling {amount_tokens:.6f} tokens via Jupiter...")
+            
+            decimals = await self.get_token_decimals(token_mint)
+            amount_raw = int(amount_tokens * 10**decimals)
+            
+            # Try multiple amounts
+            for percentage in [1.0, 0.5, 0.25, 0.1]:
+                test_raw = int(amount_raw * percentage)
+                if test_raw < 1000:
+                    continue
+                
+                quote_url = "https://lite-api.jup.ag/swap/v1/quote"
+                params = {
+                    "inputMint": token_mint,
+                    "outputMint": "So11111111111111111111111111111111111111112",
+                    "amount": test_raw,
+                    "slippageBps": slippage_bps,
+                }
+                
+                resp = requests.get(quote_url, params=params, timeout=10)
+                if resp.status_code == 200:
+                    quote = resp.json()
+                    if "outputAmount" in quote and quote["outputAmount"] != "0":
+                        expected_sol = int(quote["outputAmount"]) / 1e9
+                        print(f"   ✅ Quote successful! Expected SOL: {expected_sol:.6f}")
+                        
+                        swap_url = "https://lite-api.jup.ag/swap/v1/swap"
+                        payload = {
+                            "quoteResponse": quote,
+                            "userPublicKey": str(wallet.pubkey()),
+                            "wrapAndUnwrapSol": True,
+                            "dynamicComputeUnitLimit": True,
+                            "prioritizationFeeLamports": "auto"
+                        }
+                        
+                        resp = requests.post(swap_url, json=payload, timeout=10)
+                        if resp.status_code != 200:
+                            continue
+                        swap_data = resp.json()
+                        if "swapTransaction" not in swap_data:
+                            continue
+                        
+                        tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+                        raw_tx = VersionedTransaction.from_bytes(tx_bytes)
+                        message_bytes = message.to_bytes_versioned(raw_tx.message)
+                        signature = wallet.sign_message(message_bytes)
+                        signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
+                        signed_tx_bytes = bytes(signed_tx)
+                        
+                        result = self.client.send_raw_transaction(signed_tx_bytes, opts=TxOpts(skip_preflight=True))
+                        txid = str(result.value)
+                        
+                        print(f"   ✅ Jupiter Sell TXID: {txid}")
+                        
+                        return {
+                            "success": True,
+                            "txid": txid,
+                            "sol_received": expected_sol,
+                            "explorer": f"https://solscan.io/tx/{txid}"
+                        }
+            
+            return {"success": False, "error": "No working amount found for Jupiter"}
+            
+        except Exception as e:
+            print(f"   ❌ Jupiter sell failed: {e}")
+            return {"success": False, "error": str(e)}
+    
+    # ============================================
+    # MAIN EXECUTE SELL (Routes to correct method)
+    # ============================================
+    async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
+        """Execute sell - routes to PumpSwap for pump.fun tokens, Jupiter for others"""
+        
+        if self.is_pump_fun_token(token_mint):
+            print(f"\n   🔄 Token is pump.fun - using PumpSwap")
+            return await self.execute_pump_sell(wallet, token_mint, amount_tokens, slippage_bps)
+        else:
+            print(f"\n   🔄 Regular token - using Jupiter")
+            return await self.execute_jupiter_sell(wallet, token_mint, amount_tokens, slippage_bps)
+    
+    # ============================================
+    # BUY EXECUTION (Uses Jupiter)
+    # ============================================
     async def execute_buy(self, wallet: Keypair, token_mint: str, amount_sol: float, slippage_bps: int) -> dict:
-        """Execute buy - Read amount from transaction response"""
+        """Execute buy using Jupiter (works for both token types)"""
         try:
             print(f"   Amount: {amount_sol} SOL | Slippage: {slippage_bps/100}%")
             
-            # 1. Quote from Lite API
             quote_url = "https://lite-api.jup.ag/swap/v1/quote"
             params = {
                 "inputMint": "So11111111111111111111111111111111111111112",
@@ -170,7 +289,6 @@ class SniperService:
                 return {"success": False, "error": f"Quote HTTP {resp.status_code}"}
             quote = resp.json()
             
-            # 2. Build swap
             swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             payload = {
                 "quoteResponse": quote,
@@ -187,7 +305,6 @@ class SniperService:
             if "swapTransaction" not in swap_data:
                 return {"success": False, "error": "No swapTransaction"}
             
-            # 3. Sign transaction
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             raw_tx = VersionedTransaction.from_bytes(tx_bytes)
             message_bytes = message.to_bytes_versioned(raw_tx.message)
@@ -195,68 +312,33 @@ class SniperService:
             signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
             signed_tx_bytes = bytes(signed_tx)
             
-            # 4. Send transaction
             print("   Sending transaction...")
-            result = self.client.send_raw_transaction(
-                signed_tx_bytes,
-                opts=TxOpts(skip_preflight=True)
-            )
+            result = self.client.send_raw_transaction(signed_tx_bytes, opts=TxOpts(skip_preflight=True))
             txid = str(result.value)
             print(f"   ✅ TXID: {txid}")
             
-            # 5. Get token amount from the transaction (wait for it to be available)
-            print("   ⏳ Fetching transaction details...")
+            await asyncio.sleep(8)
             
             tokens_bought = 0
-            decimals = 9
+            decimals = await self.get_token_decimals(token_mint)
             
-            # Get token decimals first
             try:
-                mint_info = self._rpc_call("getMint", [token_mint])
-                if 'result' in mint_info and mint_info['result']:
-                    decimals = mint_info['result'].get('decimals', 9)
+                mint_pubkey = Pubkey.from_string(token_mint)
+                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+                balance_result = self._rpc_call("getTokenAccountBalance", [str(ata)])
+                if 'result' in balance_result and balance_result['result']:
+                    value_data = balance_result['result'].get('value', {})
+                    if value_data:
+                        tokens_bought = float(value_data.get('uiAmount', 0))
+                        print(f"   📊 Balance: {tokens_bought:.6f} tokens")
             except:
                 pass
             
-            # Wait for transaction to be available and parse it
-            for attempt in range(8):
-                await asyncio.sleep(2)
-                try:
-                    tx_detail = self._rpc_call("getTransaction", [
-                        txid,
-                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-                    ])
-                    
-                    if 'result' in tx_detail and tx_detail['result']:
-                        meta = tx_detail['result'].get('meta', {})
-                        post_balances = meta.get('postTokenBalances', [])
-                        
-                        # Find the token in post_balances
-                        for token in post_balances:
-                            if token.get('mint') == token_mint:
-                                amount_raw = token.get('uiTokenAmount', {}).get('uiAmount', 0)
-                                tokens_bought = float(amount_raw) if amount_raw else 0
-                                print(f"   📊 Found in transaction: {tokens_bought:.6f} tokens")
-                                break
-                        
-                        if tokens_bought > 0:
-                            break
-                        else:
-                            print(f"   ⏳ Attempt {attempt+1}: Token not in post_balances yet...")
-                    else:
-                        print(f"   ⏳ Attempt {attempt+1}: Transaction not available...")
-                        
-                except Exception as e:
-                    print(f"   ⚠️ Attempt {attempt+1}: {e}")
-            
-            # Fallback: use quote's outputAmount
             if tokens_bought <= 0:
                 raw_output = quote.get("outputAmount", "0")
                 if raw_output != "0":
                     tokens_bought = int(raw_output) / 10**decimals
                     print(f"   📊 Using quote: {tokens_bought:.6f} tokens")
-            
-            print(f"   📊 Final: {tokens_bought:.6f} tokens")
             
             return {
                 "success": True,
@@ -266,80 +348,4 @@ class SniperService:
             }
         except Exception as e:
             print(f"   ❌ Buy failed: {e}")
-            return {"success": False, "error": str(e)}
-        
-    async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Execute sell using only Lite API (which works on Heroku)"""
-        try:
-            print(f"   Selling {amount_tokens:.6f} tokens of {token_mint[:8]}...")
-            
-            # Get token decimals
-            decimals = await self.get_token_decimals(token_mint)
-            amount_raw = int(amount_tokens * 10**decimals)
-            print(f"   📊 Decimals: {decimals}, Raw: {amount_raw}")
-            
-            # Use ONLY Lite API (confirmed working on Heroku)
-            quote_url = "https://lite-api.jup.ag/swap/v1/quote"
-            params = {
-                "inputMint": token_mint,
-                "outputMint": "So11111111111111111111111111111111111111112",
-                "amount": amount_raw,
-                "slippageBps": slippage_bps,
-            }
-            
-            print(f"   Getting quote from Lite API...")
-            resp = requests.get(quote_url, params=params, timeout=10)
-            
-            if resp.status_code != 200:
-                return {"success": False, "error": f"Quote HTTP {resp.status_code}"}
-            
-            quote = resp.json()
-            
-            if "outputAmount" not in quote or quote["outputAmount"] == "0":
-                return {"success": False, "error": "No liquidity or amount too large"}
-            
-            expected_sol = int(quote["outputAmount"]) / 1e9
-            print(f"   ✅ Quote successful: {expected_sol:.6f} SOL")
-            
-            # Build swap transaction
-            swap_url = "https://lite-api.jup.ag/swap/v1/swap"
-            payload = {
-                "quoteResponse": quote,
-                "userPublicKey": str(wallet.pubkey()),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto"
-            }
-            
-            print(f"   Building transaction...")
-            resp = requests.post(swap_url, json=payload, timeout=10)
-            if resp.status_code != 200:
-                return {"success": False, "error": f"Swap HTTP {resp.status_code}"}
-            
-            swap_data = resp.json()
-            if "swapTransaction" not in swap_data:
-                return {"success": False, "error": "No swapTransaction"}
-            
-            # Sign and send
-            tx_bytes = base64.b64decode(swap_data["swapTransaction"])
-            raw_tx = VersionedTransaction.from_bytes(tx_bytes)
-            message_bytes = message.to_bytes_versioned(raw_tx.message)
-            signature = wallet.sign_message(message_bytes)
-            signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
-            signed_tx_bytes = bytes(signed_tx)
-            
-            print(f"   Sending transaction...")
-            result = self.client.send_raw_transaction(signed_tx_bytes, opts=TxOpts(skip_preflight=True))
-            txid = str(result.value)
-            
-            print(f"   ✅ Sold! TXID: {txid}")
-            
-            return {
-                "success": True,
-                "txid": txid,
-                "sol_received": expected_sol,
-                "explorer": f"https://solscan.io/tx/{txid}"
-            }
-        except Exception as e:
-            print(f"   ❌ Sell failed: {e}")
             return {"success": False, "error": str(e)}
