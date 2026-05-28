@@ -1,6 +1,8 @@
 """
-Sniper Service - Handles all Solana trading operations
+Sniper Service - No solana package dependency
+Uses only solders + requests for all Solana operations
 """
+
 import asyncio
 import base58
 import base64
@@ -11,28 +13,86 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 from solders.token.associated import get_associated_token_address
 from solders import message
-from solana.rpc.api import Client
-from typing import Optional, Dict
+from typing import Optional
+from dataclasses import dataclass
+
+
+@dataclass
+class TxOpts:
+    """Transaction options"""
+    skip_preflight: bool = False
+    preflight_commitment: str = "confirmed"
+    max_retries: int = 3
+
+
+class SimpleRpcClient:
+    """Simple RPC client using requests - no solana package needed"""
+    
+    def __init__(self, rpc_url: str):
+        self.rpc_url = rpc_url
+    
+    def _rpc_call(self, method: str, params: list) -> dict:
+        """Make a raw RPC call to Solana"""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        }
+        try:
+            response = requests.post(self.rpc_url, json=payload, timeout=30)
+            return response.json()
+        except Exception as e:
+            return {"error": {"message": str(e)}}
+    
+    def get_balance(self, pubkey: str, commitment: str = "confirmed") -> int:
+        """Get SOL balance in lamports"""
+        result = self._rpc_call("getBalance", [pubkey, {"commitment": commitment}])
+        if 'error' in result:
+            return 0
+        return result.get('result', {}).get('value', 0)
+    
+    def get_token_balance(self, token_account: str, commitment: str = "confirmed") -> Optional[float]:
+        """Get token balance in UI amount"""
+        result = self._rpc_call("getTokenAccountBalance", [token_account, {"commitment": commitment}])
+        if 'error' in result:
+            return None
+        if 'result' in result and result['result']:
+            val = result['result']
+            if isinstance(val, dict):
+                return float(val.get('value', {}).get('uiAmount', 0))
+        return None
+    
+    def send_raw_transaction(self, tx_bytes: bytes) -> str:
+        """Send a raw signed transaction"""
+        tx_base58 = base58.b58encode(tx_bytes).decode()
+        result = self._rpc_call("sendTransaction", [tx_base58, {"encoding": "base58"}])
+        if 'error' in result:
+            raise Exception(result['error'].get('message', 'Send transaction failed'))
+        return result['result']
+    
+    def get_transaction(self, txid: str) -> dict:
+        """Get transaction details"""
+        result = self._rpc_call("getTransaction", [
+            txid,
+            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+        ])
+        return result.get('result', {})
+    
+    def get_account_info(self, pubkey: str) -> dict:
+        """Get account info"""
+        result = self._rpc_call("getAccountInfo", [pubkey, {"encoding": "base64"}])
+        return result.get('result', {})
+
 
 class SniperService:
     def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
-        self.client = Client(rpc_url)
+        self.client = SimpleRpcClient(rpc_url)
     
     def _rpc_call(self, method: str, params: list) -> dict:
-        """Make a raw RPC call to Solana"""
-        try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": method,
-                "params": params
-            }
-            response = requests.post(self.rpc_url, json=payload, timeout=30)
-            return response.json()
-        except Exception as e:
-            print(f"   ❌ RPC call failed: {e}")
-            return {"error": {"message": str(e)}}
+        """Direct RPC call"""
+        return self.client._rpc_call(method, params)
     
     async def get_token_decimals(self, token_mint: str) -> int:
         """Get token decimals from RPC"""
@@ -47,9 +107,8 @@ class SniperService:
         return 9
     
     async def get_token_price(self, token_mint: str) -> Optional[float]:
-        """Get token price from Jupiter or DexScreener"""
+        """Get token price from Jupiter"""
         try:
-            # Try Jupiter first
             url = f"https://price.jup.ag/v4/price?ids={token_mint}"
             resp = requests.get(url, timeout=5)
             if resp.status_code == 200:
@@ -58,70 +117,40 @@ class SniperService:
                     return float(data['data'][token_mint]['price'])
         except:
             pass
-        
-        try:
-            # Fallback to DexScreener
-            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get('pairs') and len(data['pairs']) > 0:
-                    return float(data['pairs'][0].get('priceUsd', 0))
-        except:
-            pass
-        
         return None
     
     async def is_holding_token(self, wallet_pubkey: Pubkey, token_mint: str) -> bool:
         """Check if wallet holds any amount of a token"""
         try:
             ata = get_associated_token_address(wallet_pubkey, Pubkey.from_string(token_mint))
-            result = self._rpc_call("getTokenAccountBalance", [str(ata)])
-            
-            if 'result' in result and result['result']:
-                value = result['result']
-                if isinstance(value, dict):
-                    amount = float(value.get('value', {}).get('uiAmount', 0))
-                    return amount > 0
-            return False
+            balance = self.client.get_token_balance(str(ata))
+            return balance is not None and balance > 0
         except Exception as e:
             return False
     
     async def get_wallet_balance(self, wallet_pubkey: Pubkey) -> float:
-        """Get SOL balance of a wallet"""
+        """Get SOL balance of a wallet in SOL"""
         try:
-            result = self._rpc_call("getBalance", [str(wallet_pubkey)])
-            if 'result' in result:
-                return result['result']['value'] / 1e9
-            return 0
+            balance_lamports = self.client.get_balance(str(wallet_pubkey))
+            return balance_lamports / 1e9
         except:
             return 0
     
     async def get_token_balance(self, wallet_pubkey: Pubkey, token_mint: str) -> float:
         """Get token balance of a wallet"""
         try:
-            mint = Pubkey.from_string(token_mint)
-            ata = get_associated_token_address(wallet_pubkey, mint)
-            result = self._rpc_call("getTokenAccountBalance", [str(ata)])
-            
-            if 'result' in result and result['result']:
-                value = result['result']
-                if isinstance(value, dict):
-                    return float(value.get('value', {}).get('uiAmount', 0))
-            return 0
+            ata = get_associated_token_address(wallet_pubkey, Pubkey.from_string(token_mint))
+            balance = self.client.get_token_balance(str(ata))
+            return balance if balance else 0
         except:
             return 0
     
     async def get_token_amount_from_tx(self, txid: str, wallet_pubkey: Pubkey, token_mint: str) -> float:
         """Extract token amount from transaction"""
         try:
-            tx_detail = self._rpc_call("getTransaction", [
-                txid,
-                {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-            ])
-            
-            if 'result' in tx_detail and tx_detail['result']:
-                meta = tx_detail['result'].get('meta', {})
+            tx_detail = self.client.get_transaction(txid)
+            if tx_detail:
+                meta = tx_detail.get('meta', {})
                 post_balances = meta.get('postTokenBalances', [])
                 pre_balances = meta.get('preTokenBalances', [])
                 wallet_str = str(wallet_pubkey)
@@ -159,11 +188,6 @@ class SniperService:
                 return {"success": False, "error": f"Quote failed: HTTP {resp.status_code}"}
             quote = resp.json()
             
-            # Get expected output
-            expected_output = quote.get('outputAmount', '0')
-            if expected_output != '0':
-                print(f"   📊 Expected output: {int(expected_output)/10**9:.6f} tokens")
-            
             # 2. Build swap transaction
             swap_url = "https://quote-api.jup.ag/v6/swap"
             payload = {
@@ -184,7 +208,7 @@ class SniperService:
             if "swapTransaction" not in swap_data:
                 return {"success": False, "error": "No swapTransaction in response"}
             
-            # 3. Sign the transaction
+            # 3. Sign the transaction using solders
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             raw_tx = VersionedTransaction.from_bytes(tx_bytes)
             message_bytes = message.to_bytes_versioned(raw_tx.message)
@@ -193,39 +217,27 @@ class SniperService:
             
             # 4. Send the transaction
             print(f"   Sending transaction...")
-            signed_tx_base58 = base58.b58encode(bytes(signed_tx)).decode()
-            result = self._rpc_call("sendTransaction", [signed_tx_base58, {"encoding": "base58"}])
-            
-            if 'error' in result:
-                return {"success": False, "error": result['error'].get('message', 'Unknown error')}
-            
-            txid = result['result']
-            print(f"   ✅ TXID: {txid}")
+            try:
+                txid = self.client.send_raw_transaction(bytes(signed_tx))
+                print(f"   ✅ TXID: {txid}")
+            except Exception as e:
+                return {"success": False, "error": f"Send failed: {str(e)}"}
             
             # 5. Wait and fetch actual token amount
             print(f"   ⏳ Waiting 8 seconds for confirmation...")
             await asyncio.sleep(8)
             
             tokens_bought = 0
-            decimals = 9
             
             # Try multiple times to get balance
             for attempt in range(5):
                 try:
-                    mint_pubkey = Pubkey.from_string(token_mint)
-                    ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                    balance_result = self._rpc_call("getTokenAccountBalance", [str(ata)])
-                    
-                    if 'result' in balance_result and balance_result['result']:
-                        val = balance_result['result']
-                        if isinstance(val, dict):
-                            value_data = val.get('value', {})
-                            if value_data:
-                                tokens_bought = float(value_data.get('uiAmount', 0))
-                                decimals = value_data.get('decimals', 9)
-                                print(f"   ✅ Attempt {attempt+1}: {tokens_bought:.8f} tokens")
-                                if tokens_bought > 0:
-                                    break
+                    ata = get_associated_token_address(wallet.pubkey(), Pubkey.from_string(token_mint))
+                    balance = self.client.get_token_balance(str(ata))
+                    if balance is not None and balance > 0:
+                        tokens_bought = balance
+                        print(f"   ✅ Attempt {attempt+1}: {tokens_bought:.8f} tokens")
+                        break
                 except Exception as e:
                     print(f"   ⚠️ Attempt {attempt+1} failed: {e}")
                 
@@ -305,13 +317,10 @@ class SniperService:
             signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
             
             # 4. Send the transaction
-            signed_tx_base58 = base58.b58encode(bytes(signed_tx)).decode()
-            result = self._rpc_call("sendTransaction", [signed_tx_base58, {"encoding": "base58"}])
-            
-            if 'error' in result:
-                return {"success": False, "error": result['error'].get('message', 'Unknown error')}
-            
-            txid = result['result']
+            try:
+                txid = self.client.send_raw_transaction(bytes(signed_tx))
+            except Exception as e:
+                return {"success": False, "error": f"Send failed: {str(e)}"}
             
             # 5. Get SOL received
             sol_received = 0
