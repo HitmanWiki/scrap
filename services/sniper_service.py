@@ -136,7 +136,7 @@ class SniperService:
             return 0
     
     async def execute_buy(self, wallet: Keypair, token_mint: str, amount_sol: float, slippage_bps: int) -> dict:
-        """Execute buy - FIXED: Direct balance fetch after transaction"""
+        """Execute buy - FIXED: Parse transaction directly"""
         try:
             print(f"   Amount: {amount_sol} SOL | Slippage: {slippage_bps/100}%")
             
@@ -188,9 +188,9 @@ class SniperService:
             txid = str(result.value)
             print(f"   ✅ TXID: {txid}")
             
-            # 5. Wait for confirmation and fetch balance - FIXED
-            print("   ⏳ Waiting for confirmation...")
-            await asyncio.sleep(5)
+            # 5. Wait and parse transaction directly (MOST RELIABLE)
+            print("   ⏳ Waiting 8 seconds for confirmation...")
+            await asyncio.sleep(8)
             
             tokens_bought = 0
             decimals = 9
@@ -205,37 +205,68 @@ class SniperService:
             except:
                 pass
             
-            # Fetch balance from the ATA
+            # Parse transaction to get token amount (WORKS even if ATA not created)
             try:
-                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                # Use raw RPC call instead of client method
-                balance_result = self._rpc_call("getTokenAccountBalance", [str(ata)])
+                tx_detail = self._rpc_call("getTransaction", [
+                    txid,
+                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                ])
                 
-                if 'result' in balance_result and balance_result['result']:
-                    value_data = balance_result['result'].get('value', {})
-                    if value_data:
-                        tokens_bought = float(value_data.get('uiAmount', 0))
-                        print(f"   📊 Balance after buy: {tokens_bought:.6f} tokens")
-                    else:
-                        print(f"   ⚠️ No value in balance response: {balance_result['result']}")
+                if 'result' in tx_detail and tx_detail['result']:
+                    meta = tx_detail['result'].get('meta', {})
+                    post_token_balances = meta.get('postTokenBalances', [])
+                    pre_token_balances = meta.get('preTokenBalances', [])
+                    wallet_str = str(wallet.pubkey())
+                    
+                    # Find our token in post balances
+                    for post in post_token_balances:
+                        if post.get('mint') == token_mint:
+                            post_amount = float(post.get('uiTokenAmount', {}).get('uiAmount', 0))
+                            
+                            # Subtract pre-existing balance
+                            pre_amount = 0
+                            for pre in pre_token_balances:
+                                if pre.get('mint') == token_mint and pre.get('owner') == wallet_str:
+                                    pre_amount = float(pre.get('uiTokenAmount', {}).get('uiAmount', 0))
+                                    break
+                            
+                            tokens_bought = post_amount - pre_amount
+                            print(f"   📊 From transaction: {tokens_bought:.6f} tokens")
+                            break
                 else:
-                    print(f"   ⚠️ Balance call failed: {balance_result}")
+                    print(f"   ⚠️ Transaction not found yet, waiting...")
+                    # Try one more time after delay
+                    await asyncio.sleep(4)
+                    tx_detail = self._rpc_call("getTransaction", [
+                        txid,
+                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                    ])
+                    if 'result' in tx_detail and tx_detail['result']:
+                        meta = tx_detail['result'].get('meta', {})
+                        post_token_balances = meta.get('postTokenBalances', [])
+                        for post in post_token_balances:
+                            if post.get('mint') == token_mint:
+                                tokens_bought = float(post.get('uiTokenAmount', {}).get('uiAmount', 0))
+                                print(f"   📊 From transaction (retry): {tokens_bought:.6f} tokens")
+                                break
+                            
             except Exception as e:
-                print(f"   ⚠️ Balance fetch error: {e}")
+                print(f"   ⚠️ Transaction parse error: {e}")
             
-            # If still 0, try a second time after longer delay
+            # Fallback: try balance check if transaction parsing failed
             if tokens_bought <= 0:
-                print("   ⏳ Waiting additional 3 seconds...")
-                await asyncio.sleep(3)
                 try:
+                    ata = get_associated_token_address(wallet.pubkey(), Pubkey.from_string(token_mint))
                     balance_result = self._rpc_call("getTokenAccountBalance", [str(ata)])
                     if 'result' in balance_result and balance_result['result']:
                         value_data = balance_result['result'].get('value', {})
                         if value_data:
                             tokens_bought = float(value_data.get('uiAmount', 0))
-                            print(f"   📊 Second attempt: {tokens_bought:.6f} tokens")
+                            print(f"   📊 From balance: {tokens_bought:.6f} tokens")
                 except Exception as e:
-                    print(f"   ⚠️ Second fetch error: {e}")
+                    print(f"   ⚠️ Balance fetch error: {e}")
+            
+            print(f"   📊 Final tokens: {tokens_bought:.6f}")
             
             return {
                 "success": True,
