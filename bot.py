@@ -519,6 +519,7 @@ def get_settings_keyboard():
         [InlineKeyboardButton("🎯 Take Profit %", callback_data="set_take_profit")],
         [InlineKeyboardButton("📈 Target MC ($)", callback_data="set_target_mc")],
         [InlineKeyboardButton("🤖 Auto-Sell", callback_data="toggle_auto_sell")],
+        [InlineKeyboardButton("🔫 Auto-Buy", callback_data="toggle_auto_buy")],  # NEW
         [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -566,6 +567,12 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
     
     user = db.get_user(user_id)
     if not user:
+        return
+    
+    # CHECK AUTO-BUY TOGGLE
+    settings = db.get_user_settings(user_id)
+    if settings and not settings.get('auto_snipe', 1):
+        print(f"   ⏭️ Auto-buy is OFF for user {user_id}")
         return
     
     wallet = await get_user_wallet(user_id)
@@ -631,7 +638,6 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         if tokens_bought > 0:
             db.add_position(user_id, ca, tokens_bought, result.get('price', 0), txid)
             db.add_trade_history(user_id, ca, 'buy', tokens_bought, result.get('price', 0), txid)
-            await sync_positions_from_wallet(user_id)
             print(f"   ✅ Position saved: {tokens_bought:.6f} tokens")
         else:
             db.add_position(user_id, ca, 0, result.get('price', 0), txid)
@@ -645,7 +651,6 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         
         # SEND BUY NOTIFICATION with position pin
         try:
-            # Get token info for notification
             mc = await get_token_market_cap(ca)
             token_price = await solana_service.get_token_price(ca)
             value = tokens_bought * token_price if token_price else 0
@@ -710,7 +715,6 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
             )
         except:
             pass
-
 async def poll_channel_messages(channel_name: str):
     """Poll a channel for new messages"""
     global monitor_client, channel_subscribers
@@ -822,6 +826,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channels = len(db.get_user_channels(user.id))
     settings = db.get_user_settings(user.id)
     auto_sell = "✅ ON" if (settings and settings.get('auto_sell_enabled')) else "❌ OFF"
+    auto_buy = "✅ ON" if (settings and settings.get('auto_snipe', 1)) else "❌ OFF"
     
     welcome_text = f"""
 ╔═══════════════════════════╗
@@ -834,7 +839,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 │ 💳 `{wallet_addr[:6]}...{wallet_addr[-4:]}` │
 │ 💰 {balance:.4f} SOL                 │
 │ 📊 {positions} positions | 📋 {channels} channels │
-│ 🤖 Auto-Sell: {auto_sell}          │
+│ 🤖 Auto-Sell: {auto_sell}
+ 🔫 Auto-Buy: {auto_buy}                 │
 └─────────────────────────┘
 
 🔐 *Derived Wallet* — No keys stored!
@@ -909,6 +915,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.update_user_settings(user_id, auto_sell_enabled=new_val)
         status = "✅ ENABLED" if new_val else "❌ DISABLED"
         await query.edit_message_text(f"🤖 *Auto-Sell:* {status}", reply_markup=get_settings_keyboard(), parse_mode='Markdown')
+        return SELECTING_ACTION
+    elif action == "toggle_auto_buy":
+        settings = db.get_user_settings(user_id)
+        current = settings.get('auto_snipe', 1) if settings else 1
+        new_val = 0 if current else 1
+        db.update_user_settings(user_id, auto_snipe=new_val)
+        status = "✅ ON" if new_val else "❌ OFF"
+        await query.edit_message_text(
+            f"🔫 *Auto-Buy:* {status}\n\n"
+            f"{'Bot will automatically buy tokens from monitored channels' if new_val else 'Bot will NOT auto-buy. Use manual buy only.'}",
+            reply_markup=get_settings_keyboard(),
+            parse_mode='Markdown'
+        )
         return SELECTING_ACTION
     
     # Channel type
@@ -1745,6 +1764,7 @@ async def show_settings(query):
     take_profit = settings.get('take_profit_percent', 50) if settings else 50
     target_mc = settings.get('target_mc', 0) if settings else 0
     auto_sell = "✅ ON" if (settings and settings.get('auto_sell_enabled')) else "❌ OFF"
+    auto_buy = "✅ ON" if (settings and settings.get('auto_snipe', 1)) else "❌ OFF"
     target_mc_display = f"${target_mc:,.0f}" if target_mc > 0 else "Not set"
     
     text = f"""
@@ -1755,6 +1775,7 @@ async def show_settings(query):
 • Take Profit: {take_profit}%
 • Target MC: {target_mc_display}
 • Auto-Sell: {auto_sell}
+• Auto-Buy: {auto_buy}
 """
     await query.edit_message_text(text, reply_markup=get_settings_keyboard(), parse_mode='Markdown')
     return SELECTING_ACTION
