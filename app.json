@@ -1,0 +1,44 @@
+{
+  "name": "Solana Sniper Bot",
+  "description": "Multi-User Solana Sniper Bot with Channel Monitoring",
+  "repository": "https://github.com/yourusername/your-repo",
+  "keywords": ["python", "solana", "sniper", "telegram"],
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Telegram Bot Token from @BotFather",
+      "required": true
+    },
+    "SOLANA_RPC": {
+      "description": "Solana RPC URL",
+      "value": "https://api.mainnet-beta.solana.com",
+      "required": true
+    },
+    "SLIPPAGE_BPS": {
+      "description": "Default slippage in basis points",
+      "value": "1000",
+      "required": false
+    },
+    "BUY_AMOUNT_SOL": {
+      "description": "Default buy amount in SOL",
+      "value": "0.01",
+      "required": false
+    },
+    "MONITOR_API_ID": {
+      "description": "Telegram API ID for channel monitoring",
+      "required": true
+    },
+    "MONITOR_API_HASH": {
+      "description": "Telegram API Hash for channel monitoring",
+      "required": true
+    },
+    "WALLET_DERIVATION_SECRET": {
+      "description": "Secret for deriving user wallets - KEEP SAFE!",
+      "required": true
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ]
+}
