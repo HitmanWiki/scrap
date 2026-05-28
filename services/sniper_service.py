@@ -163,7 +163,7 @@ class SniperService:
             return 0
     
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Sell via PumpSwap AMM (what Phantom uses for pump tokens)"""
+        """Sell pump tokens via PumpSwap - direct program interaction"""
         try:
             from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
             import base64
@@ -171,53 +171,63 @@ class SniperService:
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
-            print(f"   💱 PumpSwap sell: {amount_tokens:,.2f} tokens...")
+            print(f"   💱 PumpSwap sell: {amount_tokens:,.2f} tokens ({amount_raw} raw)...")
             
-            # PumpSwap AMM program
+            # PumpSwap Program ID
             PUMP_SWAP_PROGRAM = Pubkey.from_string("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwRh52yfVVHy")
+            SOL_MINT = Pubkey.from_string("So11111111111111111111111111111111111111112")
+            TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
             
             mint = Pubkey.from_string(token_mint)
             user_ata = get_associated_token_address(wallet.pubkey(), mint)
             
+            # Sort mints for pool derivation (PumpSwap sorts alphabetically)
+            mint_a = bytes(mint) if bytes(mint) < bytes(SOL_MINT) else bytes(SOL_MINT)
+            mint_b = bytes(SOL_MINT) if bytes(mint) < bytes(SOL_MINT) else bytes(mint)
+            
             # Derive pool address
-            SOL_MINT = Pubkey.from_string("So11111111111111111111111111111111111111112")
+            pool, pool_bump = Pubkey.find_program_address([b"pool", mint_a, mint_b], PUMP_SWAP_PROGRAM)
             
-            # Pool seeds for PumpSwap
-            pool_seeds = [b"pool", bytes(mint), bytes(SOL_MINT)]
-            pool_address, _ = Pubkey.find_program_address(pool_seeds, PUMP_SWAP_PROGRAM)
+            # Derive vaults
+            token_vault, _ = Pubkey.find_program_address([b"vault", bytes(pool), bytes(mint)], PUMP_SWAP_PROGRAM)
+            sol_vault, _ = Pubkey.find_program_address([b"vault", bytes(pool), bytes(SOL_MINT)], PUMP_SWAP_PROGRAM)
             
-            # Token vault for the pool
-            token_vault_seeds = [b"token_vault", bytes(pool_address), bytes(mint)]
-            token_vault, _ = Pubkey.find_program_address(token_vault_seeds, PUMP_SWAP_PROGRAM)
+            # Derive pool authority
+            authority, _ = Pubkey.find_program_address([b"authority", bytes(pool)], PUMP_SWAP_PROGRAM)
             
-            # SOL vault for the pool
-            sol_vault_seeds = [b"spl_vault", bytes(pool_address), bytes(SOL_MINT)]
-            sol_vault, _ = Pubkey.find_program_address(sol_vault_seeds, PUMP_SWAP_PROGRAM)
+            # Also need user's SOL account (writable to receive SOL)
+            user_sol_account = wallet.pubkey()
             
-            # Build swap instruction
-            SWAP_DISCRIMINATOR = 0x2a7b5c2e1f3d4a6b  # PumpSwap swap discriminator
+            print(f"   Pool: {str(pool)[:12]}...")
+            print(f"   TokenVault: {str(token_vault)[:12]}...")
+            print(f"   SolVault: {str(sol_vault)[:12]}...")
+            print(f"   Authority: {str(authority)[:12]}...")
             
-            data = bytearray()
-            data.extend(SWAP_DISCRIMINATOR.to_bytes(8, 'little'))
-            data.extend(amount_raw.to_bytes(8, 'little'))
-            data.extend(int(0).to_bytes(8, 'little'))  # min_output
+            # PumpSwap swap discriminator (8 bytes)
+            SWAP_DISCRIMINATOR = 0x2a7b5c2e1f3d4a6b.to_bytes(8, 'little')
+            
+            # Instruction data
+            data = SWAP_DISCRIMINATOR
+            data += amount_raw.to_bytes(8, 'little')  # exact_input_amount
+            data += int(0).to_bytes(8, 'little')       # min_output_amount (0 = no minimum)
             
             swap_ix = Instruction(
                 program_id=PUMP_SWAP_PROGRAM,
                 accounts=[
-                    AccountMeta(pool_address, False, True),
+                    AccountMeta(pool, False, True),
                     AccountMeta(token_vault, False, True),
                     AccountMeta(sol_vault, False, True),
                     AccountMeta(user_ata, False, True),
-                    AccountMeta(wallet.pubkey(), True, True),
-                    AccountMeta(SYSTEM_PROGRAM_ID, False, False),
+                    AccountMeta(user_sol_account, True, True),
+                    AccountMeta(authority, False, False),
+                    AccountMeta(TOKEN_PROGRAM, False, False),
                 ],
-                data=bytes(data)
+                data=data
             )
             
             instructions = [
-                set_compute_unit_limit(200000),
-                set_compute_unit_price(100000),
+                set_compute_unit_limit(300000),
+                set_compute_unit_price(500000),
                 swap_ix,
             ]
             
@@ -235,20 +245,52 @@ class SniperService:
             tx_base64 = base64.b64encode(bytes(tx)).decode()
             result = self._rpc_call("sendTransaction", [
                 tx_base64,
-                {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}
+                {
+                    "encoding": "base64",
+                    "skipPreflight": True,
+                    "preflightCommitment": "processed",
+                    "maxRetries": 3
+                }
             ])
             
             if 'error' in result:
-                return {"success": False, "error": str(result['error'])}
+                err_msg = str(result['error'])[:300]
+                print(f"   ⚠️ PumpSwap error: {err_msg}")
+                
+                # If account not found, the pool might not exist (use Jupiter)
+                if "account" in err_msg.lower():
+                    print(f"   Trying Jupiter instead...")
+                    return await self.execute_jupiter_sell(wallet, token_mint, amount_tokens, slippage_bps)
+                
+                return {"success": False, "error": err_msg}
             
             txid = result.get('result', '')
-            print(f"   ✅ PumpSwap SELL: {txid}")
+            print(f"   ✅ PumpSwap SELL TXID: {txid}")
             
-            return {"success": True, "txid": txid, "sol_received": 0, "explorer": f"https://solscan.io/tx/{txid}"}
+            return {
+                "success": True,
+                "txid": txid,
+                "sol_received": 0,
+                "explorer": f"https://solscan.io/tx/{txid}"
+            }
             
         except Exception as e:
             print(f"   ❌ PumpSwap error: {e}")
+            import traceback
+            traceback.print_exc()
             return {"success": False, "error": str(e)}
+    async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
+        """Try PumpSwap first, fall back to Jupiter"""
+        is_pump = token_mint.endswith('pump')
+        
+        if is_pump:
+            print(f"   🎯 Pump token - trying PumpSwap...")
+            result = await self.execute_sell_pumpswap(wallet, token_mint, amount_tokens, slippage_bps)
+            if result['success']:
+                return result
+            print(f"   ⚠️ PumpSwap failed: {result.get('error', 'Unknown')[:100]}")
+        
+        return await self.execute_jupiter_sell(wallet, token_mint, amount_tokens, slippage_bps)
     # ============================================
     # BUY METHOD
     # ============================================
