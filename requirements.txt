@@ -1,4 +1,4 @@
-
+pump-swap>=0.1.0
 python-telegram-bot==20.7
 telethon==1.34.0
 solana==0.34.0
