@@ -269,7 +269,7 @@ class SniperService:
             return {"success": False, "error": str(e)}
         
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Execute sell - With fallback to main Jupiter API"""
+        """Execute sell - Try smaller amounts if needed"""
         try:
             print(f"   Selling {amount_tokens:.6f} tokens of {token_mint[:8]}...")
             
@@ -277,21 +277,24 @@ class SniperService:
             decimals = await self.get_token_decimals(token_mint)
             print(f"   📊 Token decimals: {decimals}")
             
-            # Convert to raw units
-            amount_raw = int(amount_tokens * 10**decimals)
-            print(f"   📊 Raw amount: {amount_raw}")
-            
-            # Try multiple API endpoints
-            endpoints = [
-                ("https://lite-api.jup.ag/swap/v1/quote", "Lite API"),
-                ("https://quote-api.jup.ag/v6/quote", "Main API"),
+            # Try different amounts (full, half, quarter)
+            amounts_to_try = [
+                (amount_tokens, "100%"),
+                (amount_tokens * 0.5, "50%"),
+                (amount_tokens * 0.25, "25%"),
+                (amount_tokens * 0.1, "10%"),
             ]
             
-            quote = None
-            used_endpoint = None
-            
-            for url, name in endpoints:
+            for try_amount, percentage in amounts_to_try:
+                if try_amount < 1:
+                    continue
+                    
+                amount_raw = int(try_amount * 10**decimals)
+                print(f"   Trying {percentage}: {try_amount:.2f} tokens (raw: {amount_raw})")
+                
+                # Try Lite API
                 try:
+                    quote_url = "https://lite-api.jup.ag/swap/v1/quote"
                     params = {
                         "inputMint": token_mint,
                         "outputMint": "So11111111111111111111111111111111111111112",
@@ -299,75 +302,60 @@ class SniperService:
                         "slippageBps": slippage_bps,
                     }
                     
-                    print(f"   Getting quote from {name}...")
-                    resp = requests.get(url, params=params, timeout=10)
+                    resp = requests.get(quote_url, params=params, timeout=10)
                     
                     if resp.status_code == 200:
-                        data = resp.json()
-                        if "outputAmount" in data and data["outputAmount"] != "0":
-                            quote = data
-                            used_endpoint = name
-                            print(f"   ✅ Quote successful from {name}")
-                            break
-                        else:
-                            print(f"   ⚠️ {name} returned zero output")
-                    else:
-                        print(f"   ⚠️ {name} HTTP {resp.status_code}")
-                        
+                        quote = resp.json()
+                        if "outputAmount" in quote and quote["outputAmount"] != "0":
+                            expected_sol = int(quote["outputAmount"]) / 1e9
+                            print(f"   ✅ Quote successful! Expected SOL: {expected_sol:.6f}")
+                            
+                            # Build swap
+                            swap_url = "https://lite-api.jup.ag/swap/v1/swap"
+                            payload = {
+                                "quoteResponse": quote,
+                                "userPublicKey": str(wallet.pubkey()),
+                                "wrapAndUnwrapSol": True,
+                                "dynamicComputeUnitLimit": True,
+                                "prioritizationFeeLamports": "auto"
+                            }
+                            
+                            resp = requests.post(swap_url, json=payload, timeout=10)
+                            if resp.status_code != 200:
+                                continue
+                            swap_data = resp.json()
+                            
+                            if "swapTransaction" not in swap_data:
+                                continue
+                            
+                            # Sign and send
+                            tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+                            raw_tx = VersionedTransaction.from_bytes(tx_bytes)
+                            message_bytes = message.to_bytes_versioned(raw_tx.message)
+                            signature = wallet.sign_message(message_bytes)
+                            signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
+                            signed_tx_bytes = bytes(signed_tx)
+                            
+                            print(f"   Sending sell transaction...")
+                            result = self.client.send_raw_transaction(
+                                signed_tx_bytes,
+                                opts=TxOpts(skip_preflight=True)
+                            )
+                            txid = str(result.value)
+                            print(f"   ✅ Sold {percentage}!")
+                            print(f"   🔗 https://solscan.io/tx/{txid}")
+                            
+                            return {
+                                "success": True,
+                                "txid": txid,
+                                "sol_received": expected_sol,
+                                "explorer": f"https://solscan.io/tx/{txid}"
+                            }
                 except Exception as e:
-                    print(f"   ⚠️ {name} error: {e}")
+                    print(f"   ⚠️ Error: {e}")
+                    continue
             
-            if not quote:
-                return {"success": False, "error": "No liquidity found for this token. Try smaller amount or different token."}
-            
-            expected_sol = int(quote["outputAmount"]) / 1e9
-            print(f"   📊 Expected SOL: {expected_sol:.6f}")
-            
-            # Build swap transaction using the same API that gave the quote
-            if used_endpoint == "Lite API":
-                swap_url = "https://lite-api.jup.ag/swap/v1/swap"
-            else:
-                swap_url = "https://quote-api.jup.ag/v6/swap"
-            
-            payload = {
-                "quoteResponse": quote,
-                "userPublicKey": str(wallet.pubkey()),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto"
-            }
-            
-            print(f"   Building sell transaction...")
-            resp = requests.post(swap_url, json=payload, timeout=10)
-            if resp.status_code != 200:
-                return {"success": False, "error": f"Swap failed: HTTP {resp.status_code}"}
-            swap_data = resp.json()
-            
-            if "swapTransaction" not in swap_data:
-                return {"success": False, "error": "No swapTransaction"}
-            
-            # Sign and send
-            tx_bytes = base64.b64decode(swap_data["swapTransaction"])
-            raw_tx = VersionedTransaction.from_bytes(tx_bytes)
-            message_bytes = message.to_bytes_versioned(raw_tx.message)
-            signature = wallet.sign_message(message_bytes)
-            signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
-            signed_tx_bytes = bytes(signed_tx)
-            
-            print(f"   Sending sell transaction...")
-            result = self.client.send_raw_transaction(
-                signed_tx_bytes,
-                opts=TxOpts(skip_preflight=True)
-            )
-            txid = str(result.value)
-            print(f"   ✅ Sell TXID: {txid}")
-            
-            return {
-                "success": True,
-                "txid": txid,
-                "sol_received": expected_sol,
-                "explorer": f"https://solscan.io/tx/{txid}"
-            }
+            return {"success": False, "error": "No liquidity found. Try manual sell on DexScreener"}
         except Exception as e:
             print(f"   ❌ Sell failed: {e}")
             return {"success": False, "error": str(e)}
