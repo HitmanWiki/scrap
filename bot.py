@@ -301,7 +301,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Read tokens using getProgramAccounts - works on Helius"""
+    """Read tokens by checking DexScreener pairs against wallet"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return {}
@@ -311,65 +311,88 @@ async def sync_positions_from_wallet(user_id: int):
     
     try:
         import requests as req
-        import base64 as b64
         
-        # Use getProgramAccounts with filters (works on Helius)
-        # Filter by owner address
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getProgramAccounts",
-            "params": [
-                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-                {
-                    "encoding": "jsonParsed",
-                    "filters": [
-                        {"dataSize": 165},  # Token account size
-                        {
-                            "memcmp": {
-                                "offset": 32,  # Owner offset in token account
-                                "bytes": wallet_addr
-                            }
-                        }
-                    ]
-                }
-            ]
-        }
+        # Get known tokens from DB positions
+        known_mints = set()
+        positions = db.get_user_positions(user_id)
+        for pos in positions:
+            known_mints.add(pos['token_address'])
         
-        resp = req.post(SOLANA_RPC, json=payload, timeout=15)
-        data = resp.json()
-        
-        if 'result' in data and data['result']:
-            accounts = data['result']
-            print(f"   Found {len(accounts)} token accounts via getProgramAccounts")
-            
-            for acc in accounts:
-                parsed = acc.get('account', {}).get('data', {}).get('parsed', {})
-                info = parsed.get('info', {})
-                mint = info.get('mint', '')
-                amount = info.get('tokenAmount', {}).get('uiAmount', 0)
+        # Also get tokens from DexScreener by searching wallet
+        print(f"   Searching DexScreener for wallet tokens...")
+        try:
+            # DexScreener doesn't have wallet search, so check each known token
+            for mint in list(known_mints):
+                # Check if this token exists in wallet
+                mint_pubkey = Pubkey.from_string(mint)
+                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
                 
-                if amount > 0:
-                    wallet_tokens[mint] = amount
-                    print(f"   ✅ {mint[:8]}... = {amount:.4f}")
-        else:
-            print(f"   getProgramAccounts returned: {len(data.get('result', []))} accounts")
+                payload = {
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getTokenAccountBalance",
+                    "params": [str(ata)]
+                }
+                resp = req.post(SOLANA_RPC, json=payload, timeout=10)
+                data = resp.json()
+                
+                if 'result' in data and data['result']:
+                    val = data['result']
+                    if isinstance(val, dict):
+                        amount = float(val.get('value', {}).get('uiAmount', 0))
+                    else:
+                        amount = float(val)
+                    
+                    if amount > 0:
+                        wallet_tokens[mint] = amount
+                        print(f"   ✅ {mint[:8]}... = {amount:.4f}")
+                    else:
+                        # Token exists but 0 balance - remove from positions
+                        db.close_position(pos['id'], 'zero-balance')
+        except Exception as e:
+            print(f"   ⚠️ Token check error: {e}")
+        
+        # If no tokens found, try searching recent trades
+        if not wallet_tokens:
+            print(f"   No tokens from positions, checking trade history...")
+            # The buy function saves positions - check if any were saved recently
+            positions = db.get_user_positions(user_id)
+            for pos in positions:
+                if pos.get('buy_txid'):
+                    # Re-verify from transaction
+                    try:
+                        tx_data = req.post(SOLANA_RPC, json={
+                            "jsonrpc": "2.0", "id": 1,
+                            "method": "getTransaction",
+                            "params": [pos['buy_txid'], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                        }, timeout=10).json()
+                        
+                        if 'result' in tx_data and tx_data['result']:
+                            meta = tx_data['result'].get('meta', {})
+                            for token in meta.get('postTokenBalances', []):
+                                mint = token.get('mint', '')
+                                amount = float(token.get('uiTokenAmount', {}).get('uiAmount', 0))
+                                if amount > 0 and mint not in wallet_tokens:
+                                    wallet_tokens[mint] = amount
+                                    print(f"   ✅ From TX: {mint[:8]}... = {amount:.4f}")
+                    except:
+                        pass
+        
+        # Update database
+        if wallet_tokens:
+            for mint, amount in wallet_tokens.items():
+                existing = next((p for p in positions if p['token_address'] == mint), None)
+                if existing:
+                    if abs(existing['amount'] - amount) > 0.0001:
+                        db.update_position_amount(existing['id'], amount)
+                else:
+                    db.add_position(user_id, mint, amount, 0, 'wallet-scan')
             
+            print(f"   ✅ Synced: {len(wallet_tokens)} tokens")
+        else:
+            print(f"   ⚠️ No tokens found in wallet")
+        
     except Exception as e:
         print(f"   ⚠️ Sync error: {e}")
-    
-    # Update DB
-    if wallet_tokens:
-        existing_positions = db.get_user_positions(user_id)
-        for mint, amount in wallet_tokens.items():
-            existing = next((p for p in existing_positions if p['token_address'] == mint), None)
-            if existing:
-                if abs(existing['amount'] - amount) > 0.0001:
-                    db.update_position_amount(existing['id'], amount)
-            else:
-                db.add_position(user_id, mint, amount, 0, 'wallet-scan')
-        
-        print(f"   ✅ Synced: {len(wallet_tokens)} tokens")
     
     return wallet_tokens
 async def debug_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
