@@ -33,16 +33,29 @@ class SniperService:
     
     def _send_raw_transaction(self, signed_tx_bytes: bytes) -> str:
         """Send raw transaction via RPC"""
-        tx_base64 = base64.b64encode(signed_tx_bytes).decode()
+        # Encode as base64 for Jupiter API, but Solana RPC expects base58
+        import base58 as b58
+        
+        # Try base58 first (Solana RPC expects this)
+        tx_encoded = b58.b58encode(signed_tx_bytes).decode()
+        
         result = self._rpc_call("sendTransaction", [
-            tx_base64,
+            tx_encoded,
             {"skipPreflight": True, "preflightCommitment": "processed", "maxRetries": 3}
         ])
         
         if 'result' in result:
             return result['result']
         elif 'error' in result:
-            raise Exception(result['error'].get('message', 'Unknown RPC error'))
+            # If base58 fails, try base64
+            tx_base64 = base64.b64encode(signed_tx_bytes).decode()
+            result2 = self._rpc_call("sendTransaction", [
+                tx_base64,
+                {"encoding": "base64", "skipPreflight": True, "preflightCommitment": "processed"}
+            ])
+            if 'result' in result2:
+                return result2['result']
+            raise Exception(result.get('error', {}).get('message', 'Unknown RPC error'))
         else:
             raise Exception(f"Unexpected RPC response: {result}")
     
