@@ -319,30 +319,22 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         
         tokens_bought = result.get('tokens_bought', 0)
         
-        # If still 0, try one more time with a longer delay
-        if tokens_bought <= 0:
-            await asyncio.sleep(8)  # Wait longer for confirmation
-            try:
-                mint_pubkey = Pubkey.from_string(ca)
-                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                result2 = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
-                if 'result' in result2 and result2['result']:
-                    val = result2['result']
-                    if isinstance(val, dict):
-                        tokens_bought = float(val.get('value', {}).get('uiAmount', 0))
-                        print(f"   📊 Retry balance: {tokens_bought} tokens")
-            except:
-                pass
+        print(f"   📊 Tokens bought: {tokens_bought}")
         
-        # Always save position even if amount is 0 (it will update later)
-        if tokens_bought > 0 or True:  # Save even if 0, will update later
-            position_id = db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
-            if user_id not in bought_tokens:
-                bought_tokens[user_id] = set()
-            bought_tokens[user_id].add(ca)
+        # Always save position
+        if tokens_bought > 0:
+            db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
             print(f"   ✅ Position saved: {tokens_bought:.6f} tokens")
         else:
-            print(f"   ⚠️ Could not determine token amount, but tx was sent")
+            # Save with 0 amount, will update on refresh
+            db.add_position(user_id, ca, 0, result.get('price', 0), result['txid'])
+            print(f"   ⚠️ Position saved with 0 amount (will update on refresh)")
+        
+        if user_id not in bought_tokens:
+            bought_tokens[user_id] = set()
+        bought_tokens[user_id].add(ca)
+        
+        print(f"   🔗 {result['explorer']}")
 
 async def poll_channel_messages(channel_name: str):
     """Poll a channel for new messages"""
@@ -1067,26 +1059,83 @@ async def sell_all_positions(query):
                 db.close_position(pos['id'], result['txid'])
     await query.edit_message_text(f"✅ Sold {success}/{len(positions)}", reply_markup=get_main_keyboard())
     return SELECTING_ACTION
+async def safe_edit_message(query, text, reply_markup=None, parse_mode=None):
+    """Safely edit message, ignoring 'Message not modified' error"""
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        if "Message is not modified" in str(e):
+            # Just ignore this error
+            pass
+        else:
+            print(f"❌ Edit error: {e}")
 
 async def show_positions(query):
     user_id = query.from_user.id
     wallet = await get_user_wallet(user_id)
+    
     if not wallet:
-        await query.edit_message_text("❌ No wallet!", reply_markup=get_main_keyboard())
+        await safe_edit_message(query, "❌ No wallet!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
+    # Get positions from database
     positions = db.get_user_positions(user_id)
+    
+    # Also scan on-chain for any tokens not in DB
+    try:
+        result = sniper_service._rpc_call("getTokenAccountsByOwner", [
+            str(wallet.pubkey()),
+            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+            {"encoding": "jsonParsed"}
+        ])
+        
+        if 'result' in result and result['result']:
+            token_accounts = result['result'].get('value', [])
+            for acc in token_accounts:
+                parsed = acc.get('account', {}).get('data', {}).get('parsed', {})
+                info = parsed.get('info', {})
+                amount = info.get('tokenAmount', {}).get('uiAmount', 0)
+                mint = info.get('mint', '')
+                
+                if amount > 0 and mint != "So11111111111111111111111111111111111111112":
+                    # Check if already in positions
+                    existing = next((p for p in positions if p['token_address'] == mint), None)
+                    if not existing:
+                        # Add to positions
+                        db.add_position(user_id, mint, amount, 0, "on_chain_scan")
+                        positions = db.get_user_positions(user_id)  # Refresh
+    except Exception as e:
+        print(f"   ⚠️ Scan error: {e}")
+    
     if not positions:
-        text = "📊 *No active positions*"
+        text = "📊 No active positions\n\nNo tokens found in your wallet."
     else:
-        text = "📊 *Your Positions*\n\n"
+        text = "📊 Your Positions\n\n"
         for pos in positions:
             if pos['amount'] > 0:
-                text += f"🔹 `{pos['token_address'][:8]}...` — *{pos['amount']:.2f}*\n"
+                token_short = f"{pos['token_address'][:6]}...{pos['token_address'][-4:]}"
+                text += f"🔹 {token_short}\n"
+                text += f"   Amount: {pos['amount']:.4f}\n"
+                
+                # Get current price
+                price = await solana_service.get_token_price(pos['token_address'])
+                if price and price > 0:
+                    value = pos['amount'] * price
+                    text += f"   Value: ${value:.2f}\n"
+                
+                if pos['buy_txid']:
+                    text += f"   [TX](https://solscan.io/tx/{pos['buy_txid']})\n"
+                text += "\n"
     
-    text += f"\n💳 `{str(wallet.pubkey())[:8]}...`"
-    keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="positions")], [InlineKeyboardButton("« Back", callback_data="back_main")]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    wallet_short = f"{str(wallet.pubkey())[:8]}...{str(wallet.pubkey())[-4:]}"
+    text += f"\n💳 {wallet_short}\n🔗 [View Wallet](https://solscan.io/account/{str(wallet.pubkey())})"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Refresh", callback_data="positions")],
+        [InlineKeyboardButton("« Back", callback_data="back_main")]
+    ]
+    
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 
 async def show_settings(query):

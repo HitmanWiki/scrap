@@ -169,12 +169,12 @@ class SniperService:
             return 0
     
     async def execute_buy(self, wallet: Keypair, token_mint: str, amount_sol: float, slippage_bps: int) -> dict:
-        """Execute a buy transaction"""
+        """Execute a buy transaction using Jupiter Lite API"""
         try:
             print(f"   💰 Amount: {amount_sol} SOL | Slippage: {slippage_bps/100}%")
             
-            # 1. Get quote from Jupiter
-            quote_url = "https://quote-api.jup.ag/v6/quote"
+            # 1. Get quote from Jupiter LITE API (more reliable)
+            quote_url = "https://lite-api.jup.ag/swap/v1/quote"
             params = {
                 "inputMint": "So11111111111111111111111111111111111111112",
                 "outputMint": token_mint,
@@ -182,21 +182,20 @@ class SniperService:
                 "slippageBps": slippage_bps,
             }
             
-            print(f"   Getting quote...")
+            print(f"   Getting quote from Lite API...")
             resp = requests.get(quote_url, params=params, timeout=10)
             if resp.status_code != 200:
                 return {"success": False, "error": f"Quote failed: HTTP {resp.status_code}"}
             quote = resp.json()
             
-            # 2. Build swap transaction
-            swap_url = "https://quote-api.jup.ag/v6/swap"
+            # 2. Build swap transaction using Lite API
+            swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             payload = {
                 "quoteResponse": quote,
                 "userPublicKey": str(wallet.pubkey()),
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto",
-                "asLegacyTransaction": False
+                "prioritizationFeeLamports": "auto"
             }
             
             print(f"   Building transaction...")
@@ -208,7 +207,7 @@ class SniperService:
             if "swapTransaction" not in swap_data:
                 return {"success": False, "error": "No swapTransaction in response"}
             
-            # 3. Sign the transaction using solders
+            # 3. Sign the transaction
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             raw_tx = VersionedTransaction.from_bytes(tx_bytes)
             message_bytes = message.to_bytes_versioned(raw_tx.message)
@@ -268,7 +267,7 @@ class SniperService:
             return {"success": False, "error": str(e)}
     
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Execute a sell transaction"""
+        """Execute a sell transaction using Jupiter Lite API"""
         try:
             print(f"   Selling {amount_tokens:.6f} tokens of {token_mint[:8]}...")
             
@@ -276,8 +275,8 @@ class SniperService:
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
-            # 1. Get quote from Jupiter
-            quote_url = "https://quote-api.jup.ag/v6/quote"
+            # 1. Get quote from Jupiter LITE API
+            quote_url = "https://lite-api.jup.ag/swap/v1/quote"
             params = {
                 "inputMint": token_mint,
                 "outputMint": "So11111111111111111111111111111111111111112",
@@ -291,14 +290,13 @@ class SniperService:
             quote = resp.json()
             
             # 2. Build swap transaction
-            swap_url = "https://quote-api.jup.ag/v6/swap"
+            swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             payload = {
                 "quoteResponse": quote,
                 "userPublicKey": str(wallet.pubkey()),
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto",
-                "asLegacyTransaction": False
+                "prioritizationFeeLamports": "auto"
             }
             
             resp = requests.post(swap_url, json=payload, timeout=10)
@@ -319,6 +317,7 @@ class SniperService:
             # 4. Send the transaction
             try:
                 txid = self.client.send_raw_transaction(bytes(signed_tx))
+                print(f"   ✅ TXID: {txid}")
             except Exception as e:
                 return {"success": False, "error": f"Send failed: {str(e)}"}
             
