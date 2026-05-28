@@ -710,10 +710,9 @@ async def refresh_positions(query):
     user_id = query.from_user.id
     wallet = await get_user_wallet(user_id)
     
-    await query.edit_message_text("🔄 *Refreshing positions...*", parse_mode='Markdown')
+    await query.edit_message_text("Refreshing positions...")
     
     try:
-        # Get all token accounts
         result = sniper_service._rpc_call("getTokenAccountsByOwner", [
             str(wallet.pubkey()),
             {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
@@ -734,14 +733,13 @@ async def refresh_positions(query):
                     if existing:
                         db.update_position_amount(existing['id'], amount)
                         updated += 1
-                        print(f"   ✅ Updated {mint[:8]}... to {amount:.6f}")
                     else:
                         db.add_position(user_id, mint, amount, 0, "refresh")
                         updated += 1
         
-        await query.edit_message_text(f"✅ *Positions Refreshed!*\n\nUpdated {updated} positions.", reply_markup=get_main_keyboard(), parse_mode='Markdown')
+        await query.edit_message_text(f"Positions Refreshed!\n\nUpdated {updated} positions.", reply_markup=get_main_keyboard())
     except Exception as e:
-        await query.edit_message_text(f"❌ Refresh failed: {str(e)}", reply_markup=get_main_keyboard())
+        await query.edit_message_text(f"Refresh failed: {str(e)}", reply_markup=get_main_keyboard())
     
     return SELECTING_ACTION
 
@@ -974,21 +972,21 @@ async def initiate_sell(query):
     positions = db.get_user_positions(user_id)
     
     if not positions:
-        text = "📉 *No positions to sell*"
+        text = "No positions to sell"
         await query.edit_message_text(text, reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    text = "📉 *Select Token to Sell*\n\n"
+    text = "Select Token to Sell\n\n"
     keyboard = []
     for pos in positions:
         if pos['amount'] > 0:
-            text += f"• `{pos['token_address'][:8]}...` — *{pos['amount']:.2f}*\n"
+            text += f"• {pos['token_address'][:8]}... - {pos['amount']:.2f}\n"
             keyboard.append([InlineKeyboardButton(f"Sell {pos['token_address'][:8]}...", callback_data=f"sell_{pos['token_address']}")])
     
-    keyboard.append([InlineKeyboardButton("📝 Sell by Address", callback_data="sell_by_address")])
+    keyboard.append([InlineKeyboardButton("Sell by Address", callback_data="sell_by_address")])
     keyboard.append([InlineKeyboardButton("« Back", callback_data="back_main")])
     
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     return SELECTING_ACTION
 
 async def confirm_sell_position(query, token_address):
@@ -996,11 +994,12 @@ async def confirm_sell_position(query, token_address):
     positions = db.get_user_positions(user_id)
     position = next((p for p in positions if p['token_address'] == token_address), None)
     if not position or position['amount'] <= 0:
-        await query.edit_message_text("❌ No tokens to sell!", reply_markup=get_main_keyboard())
+        await query.edit_message_text("No tokens to sell!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
     amount = position['amount']
-    text = f"📉 *Sell {token_address[:8]}...*\n\nBalance: {amount:.2f}\n\nSelect percentage:"
+    text = f"Sell {token_address[:8]}...\n\nBalance: {amount:.2f}\n\nSelect percentage:"
+    
     keyboard = [
         [InlineKeyboardButton("100%", callback_data=f"execute_sell_{token_address}_100"),
          InlineKeyboardButton("50%", callback_data=f"execute_sell_{token_address}_50")],
@@ -1008,7 +1007,8 @@ async def confirm_sell_position(query, token_address):
          InlineKeyboardButton("10%", callback_data=f"execute_sell_{token_address}_10")],
         [InlineKeyboardButton("« Cancel", callback_data="sell")]
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     return SELECTING_ACTION
 
 async def execute_sell_order(query, token_address, percentage):
@@ -1018,13 +1018,14 @@ async def execute_sell_order(query, token_address, percentage):
     positions = db.get_user_positions(user_id)
     position = next((p for p in positions if p['token_address'] == token_address), None)
     if not position:
-        await query.edit_message_text("❌ Position not found!", reply_markup=get_main_keyboard())
+        await query.edit_message_text("Position not found!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
     sell_amount = position['amount'] * (percentage / 100)
     slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
     
-    await query.edit_message_text(f"⏳ *Selling {sell_amount:.2f} tokens...*", parse_mode='Markdown')
+    await query.edit_message_text(f"Selling {sell_amount:.2f} tokens...")
+    
     result = await sniper_service.execute_sell(wallet, token_address, sell_amount, slippage)
     
     if result['success']:
@@ -1033,11 +1034,11 @@ async def execute_sell_order(query, token_address, percentage):
             db.update_position_amount(position['id'], remaining)
         else:
             db.close_position(position['id'], result['txid'])
-        text = f"✅ *Sold!*\n\nAmount: {sell_amount:.2f}\nTX: `{result['txid'][:20]}...`\nSOL: {result['sol_received']:.4f}"
+        text = f"Sold!\n\nAmount: {sell_amount:.2f}\nTX: {result['txid'][:20]}...\nSOL: {result['sol_received']:.4f}"
     else:
-        text = f"❌ *Failed*\n{result['error']}"
+        text = f"Sell failed: {result['error']}"
     
-    await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    await query.edit_message_text(text, reply_markup=get_main_keyboard())
     return SELECTING_ACTION
 
 async def sell_all_positions(query):
