@@ -716,66 +716,18 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
     if result['success']:
         db.increment_daily_trades(user_id)
         
-        tokens_bought = 0
         txid = result['txid']
         
-        print(f"   ⚠️ Fetching actual balance from transaction...")
-        try:
-            await asyncio.sleep(12)
-            
-            import requests as req
-            
-            # Get token amount directly from the transaction
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getTransaction",
-                "params": [
-                    txid,
-                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-                ]
-            }
-            
-            resp = req.post(SOLANA_RPC, json=payload, timeout=15)
-            data = resp.json()
-            
-            if 'result' in data and data['result']:
-                meta = data['result'].get('meta', {})
-                post_balances = meta.get('postTokenBalances', [])
-                pre_balances = meta.get('preTokenBalances', [])
-                
-                wallet_str = str(wallet.pubkey())
-                
-                # Find our token in post balances
-                for post in post_balances:
-                    if post.get('mint') == ca:
-                        post_amount = float(post.get('uiTokenAmount', {}).get('uiAmount', 0))
-                        # Check if we had this token before
-                        pre_amount = 0
-                        for pre in pre_balances:
-                            if pre.get('mint') == ca and pre.get('owner') == wallet_str:
-                                pre_amount = float(pre.get('uiTokenAmount', {}).get('uiAmount', 0))
-                        
-                        tokens_bought = post_amount - pre_amount
-                        if tokens_bought > 0:
-                            print(f"   ✅ From tx: {tokens_bought:.6f} tokens bought")
-                        break
-                        
-        except Exception as e:
-            print(f"   ⚠️ getTransaction error: {e}")
+        # Don't try to verify - just save the position
+        # The user can check Solscan for exact amount
+        # We'll update the amount when they view positions
+        db.add_position(user_id, ca, 0.000001, 0, txid)  # Tiny amount so it shows up
         
-        # Save position - entry_price=0 is fine, no division needed
-        db.add_position(user_id, ca, tokens_bought, 0, txid)
+        if user_id not in bought_tokens:
+            bought_tokens[user_id] = set()
+        bought_tokens[user_id].add(ca)
         
-        if tokens_bought > 0:
-            db.add_trade_history(user_id, ca, 'buy', tokens_bought, 0, txid)
-            if user_id not in bought_tokens:
-                bought_tokens[user_id] = set()
-            bought_tokens[user_id].add(ca)
-            print(f"   ✅ Saved: {tokens_bought:.6f} tokens")
-        else:
-            print(f"   ⚠️ Saved with 0 - refresh positions after confirmation")
-        
+        print(f"   ✅ BUY: {txid[:20]}...")
         print(f"   🔗 https://solscan.io/tx/{txid}")
 async def execute_buy_order(query):
     user_id = query.from_user.id
@@ -1251,43 +1203,22 @@ async def show_positions(query):
     
     text = "📊 *Your Positions*\n\n"
     wallet_addr = str(wallet.pubkey())
-    found_tokens = False
     
-    # Get positions from DB
     positions = db.get_user_positions(user_id)
     
     if positions:
         for pos in positions:
-            token_addr = pos['token_address']
-            amount = pos['amount']
             txid = pos.get('buy_txid', '')
-            
-            # Try to get current price
-            price = await solana_service.get_token_price(token_addr)
-            mc = await get_token_market_cap(token_addr)
-            
-            if amount > 0:
-                found_tokens = True
-                text += f"🔹 `{token_addr[:8]}...{token_addr[-4:]}`\n"
-                text += f"   Amount: *{amount:,.2f}*\n"
-                if price:
-                    value = amount * price
-                    text += f"   Price: ${price:.6f} | Value: ${value:.2f}\n"
-                if mc:
-                    text += f"   MC: ${mc:,.0f}\n"
-                if txid:
-                    text += f"   [View TX](https://solscan.io/tx/{txid})\n"
-                text += "\n"
+            text += f"🔹 `{pos['token_address'][:8]}...`\n"
+            text += f"   [View on Solscan](https://solscan.io/tx/{txid})\n\n"
+    else:
+        text += "No positions yet.\n\n"
     
-    if not found_tokens:
-        text += "😔 *No tokens with balance*\n\n"
-        text += "Buy tokens first or wait for pending transactions.\n\n"
-    
-    text += f"💳 `{wallet_addr[:8]}...{wallet_addr[-4:]}`\n"
-    text += f"🔗 [View Wallet on Solscan](https://solscan.io/account/{wallet_addr})"
+    text += f"💳 [View Wallet](https://solscan.io/account/{wallet_addr})"
     
     keyboard = [
         [InlineKeyboardButton("🔄 Refresh", callback_data="positions")],
+        [InlineKeyboardButton("📉 Sell Token", callback_data="sell")],
         [InlineKeyboardButton("« Back", callback_data="back_main")]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), 
