@@ -1243,6 +1243,8 @@ def run_monitor_in_thread():
     async def _run():
         api_id = os.getenv('MONITOR_API_ID', '')
         api_hash = os.getenv('MONITOR_API_HASH', '')
+        phone = os.getenv('MONITOR_PHONE', '')
+        
         if not api_id or not api_hash:
             print("⚠️ MONITOR_API_ID/HASH not set")
             return
@@ -1250,14 +1252,28 @@ def run_monitor_in_thread():
         from telethon.sessions import StringSession
         session_string = os.getenv('MONITOR_SESSION_STRING', '')
         
-        if session_string:
-            client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
-            await client.start()
-        else:
-            client = TelegramClient('bot_monitor_session', int(api_id), api_hash)
-            await client.start()
-            new_session = client.session.save()
-            print(f"📝 MONITOR_SESSION_STRING={new_session}")
+        try:
+            if session_string and session_string != 'None':
+                print("📝 Using saved session string...")
+                client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+                await client.start()
+            else:
+                print(f"📱 Starting new session...")
+                # Use StringSession so we can save it
+                client = TelegramClient(StringSession(), int(api_id), api_hash)
+                await client.start(phone=phone)
+                # Save session
+                new_session = client.session.save()
+                print(f"\n{'='*60}")
+                print(f"📝 COPY THIS TO HEROKU:")
+                print(f"heroku config:set MONITOR_SESSION_STRING=\"{new_session}\"")
+                print(f"{'='*60}\n")
+        except EOFError:
+            print("❌ Cannot authenticate interactively!")
+            return
+        except Exception as e:
+            print(f"❌ Telethon error: {e}")
+            return
         
         me = await client.get_me()
         print(f"📡 Monitoring as: @{me.username}" if me.username else f"📡 Monitoring as: {me.first_name}")
@@ -1265,6 +1281,7 @@ def run_monitor_in_thread():
         global monitor_client
         monitor_client = client
         
+        # Restore channels
         try:
             channels = db.get_all_active_channels()
             print(f"📋 Restoring {len(channels)} channels...")
@@ -1277,6 +1294,7 @@ def run_monitor_in_thread():
                 if ch['user_id'] not in channel_subscribers[channel_name]:
                     channel_subscribers[channel_name].append(ch['user_id'])
                 asyncio.create_task(poll_channel_messages(channel_name))
+                print(f"🔍 Polling {channel_name}")
         except Exception as e:
             print(f"⚠️ Restore error: {e}")
         
@@ -1291,8 +1309,9 @@ def run_monitor_in_thread():
                         if user_id not in channel_subscribers[channel_name]:
                             channel_subscribers[channel_name].append(user_id)
                         asyncio.create_task(poll_channel_messages(channel_name))
-                except:
-                    pass
+                        print(f"🔍 Started polling {channel_name}")
+                except Exception as e:
+                    print(f"Queue error: {e}")
         
         asyncio.create_task(process_queue())
         asyncio.create_task(auto_sell_monitor())
@@ -1303,7 +1322,6 @@ def run_monitor_in_thread():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_run())
-
 # ============================================
 # HEALTH CHECK SERVER (for Heroku)
 # ============================================
