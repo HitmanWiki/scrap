@@ -163,99 +163,141 @@ class SniperService:
             return 0
     
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Sell using Jupiter direct swap - bypass quote API"""
+        """Sell - EXACT same approach as execute_buy but reversed mints"""
         try:
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
-            print(f"   💱 Selling {amount_tokens:,.2f} tokens via Jupiter direct...")
+            print(f"   💱 Selling {amount_tokens:,.2f} tokens ({amount_raw} raw)...")
             
-            # Use Jupiter Swap API directly (skip quote step)
-            swap_url = "https://lite-api.jup.ag/swap/v1/swap"
-            
-            # Build the swap request directly without quote
-            payload = {
-                "inputMint": token_mint,
-                "outputMint": "So11111111111111111111111111111111111111112",
-                "amount": str(amount_raw),
-                "slippageBps": max(slippage_bps, 5000),
-                "userPublicKey": str(wallet.pubkey()),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto",
-                "asLegacyTransaction": False,
-            }
-            
-            print(f"   Calling Jupiter swap directly...")
-            resp = requests.post(swap_url, json=payload, timeout=15)
-            
-            print(f"   Response: {resp.status_code}")
-            
-            if resp.status_code == 200:
-                swap_data = resp.json()
-                
-                if "swapTransaction" in swap_data:
-                    tx_bytes = base64.b64decode(swap_data["swapTransaction"])
-                    raw_tx = VersionedTransaction.from_bytes(tx_bytes)
-                    msg_bytes = message.to_bytes_versioned(raw_tx.message)
-                    sig = wallet.sign_message(msg_bytes)
-                    signed_tx = VersionedTransaction.populate(raw_tx.message, [sig])
-                    
-                    txid = self.client.send_raw_transaction(bytes(signed_tx))
-                    print(f"   ✅ SELL TXID: {txid}")
-                    
-                    return {
-                        "success": True,
-                        "txid": txid,
-                        "sol_received": 0,
-                        "explorer": f"https://solscan.io/tx/{txid}"
-                    }
-                else:
-                    print(f"   ⚠️ Response: {swap_data}")
-                    return {"success": False, "error": f"No swapTransaction in response: {str(swap_data)[:200]}"}
-            else:
-                print(f"   ❌ HTTP {resp.status_code}: {resp.text[:300]}")
-                
-                # Try v6 API
-                print(f"   Trying v6 API...")
-                v6_url = "https://quote-api.jup.ag/v6/swap"
-                v6_payload = {
+            # Try with increasing slippage
+            for slip in [slippage_bps, 3000, 5000, 10000, 50000]:
+                # Step 1: Get quote (same as buy)
+                quote_url = "https://lite-api.jup.ag/swap/v1/quote"
+                params = {
                     "inputMint": token_mint,
                     "outputMint": "So11111111111111111111111111111111111111112",
-                    "amount": str(amount_raw),
-                    "slippageBps": max(slippage_bps, 5000),
-                    "userPublicKey": str(wallet.pubkey()),
-                    "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": {"autoMultiplier": 2},
+                    "amount": amount_raw,
+                    "slippageBps": slip,
                 }
                 
-                resp = requests.post(v6_url, json=v6_payload, timeout=15)
+                print(f"   Getting quote (slippage {slip/100}%)...")
+                resp = requests.get(quote_url, params=params, timeout=10)
                 
-                if resp.status_code == 200:
-                    swap_data = resp.json()
-                    if "swapTransaction" in swap_data:
-                        tx_bytes = base64.b64decode(swap_data["swapTransaction"])
-                        raw_tx = VersionedTransaction.from_bytes(tx_bytes)
-                        msg_bytes = message.to_bytes_versioned(raw_tx.message)
-                        sig = wallet.sign_message(msg_bytes)
-                        signed_tx = VersionedTransaction.populate(raw_tx.message, [sig])
-                        
-                        txid = self.client.send_raw_transaction(bytes(signed_tx))
-                        print(f"   ✅ V6 SELL TXID: {txid}")
-                        
-                        return {
-                            "success": True,
-                            "txid": txid,
-                            "sol_received": 0,
-                            "explorer": f"https://solscan.io/tx/{txid}"
-                        }
+                if resp.status_code != 200:
+                    continue
                 
-                return {"success": False, "error": f"All APIs failed. HTTP {resp.status_code}"}
+                quote = resp.json()
+                out = quote.get("outputAmount", "0")
                 
+                if out == "0" or not out:
+                    print(f"   ⚠️ Zero output with slippage {slip}")
+                    continue
+                
+                expected_sol = int(out) / 1e9
+                print(f"   ✅ Route: {expected_sol:.6f} SOL")
+                
+                # Step 2: Build swap (same as buy)
+                swap_url = "https://lite-api.jup.ag/swap/v1/swap"
+                payload = {
+                    "quoteResponse": quote,
+                    "userPublicKey": str(wallet.pubkey()),
+                    "wrapAndUnwrapSol": True,
+                    "dynamicComputeUnitLimit": True,
+                    "prioritizationFeeLamports": "auto"
+                }
+                
+                print(f"   Building transaction...")
+                resp = requests.post(swap_url, json=payload, timeout=10)
+                
+                if resp.status_code != 200:
+                    continue
+                
+                swap_data = resp.json()
+                
+                if "swapTransaction" not in swap_data:
+                    continue
+                
+                # Step 3: Sign and send (same as buy)
+                tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+                raw_tx = VersionedTransaction.from_bytes(tx_bytes)
+                msg_bytes = message.to_bytes_versioned(raw_tx.message)
+                sig = wallet.sign_message(msg_bytes)
+                signed_tx = VersionedTransaction.populate(raw_tx.message, [sig])
+                
+                print(f"   Sending transaction...")
+                txid = self.client.send_raw_transaction(bytes(signed_tx))
+                
+                print(f"   ✅ SELL TXID: {txid}")
+                
+                return {
+                    "success": True,
+                    "txid": txid,
+                    "sol_received": expected_sol,
+                    "explorer": f"https://solscan.io/tx/{txid}"
+                }
+            
+            # If all slippage values fail, try smaller amounts
+            for pct in [0.5, 0.25, 0.1]:
+                test_raw = int(amount_raw * pct)
+                if test_raw < 1000:
+                    continue
+                
+                print(f"   Trying {pct*100:.0f}% ({test_raw} raw)...")
+                
+                quote_url = "https://lite-api.jup.ag/swap/v1/quote"
+                params = {
+                    "inputMint": token_mint,
+                    "outputMint": "So11111111111111111111111111111111111111112",
+                    "amount": test_raw,
+                    "slippageBps": 50000,  # 500% slippage
+                }
+                
+                resp = requests.get(quote_url, params=params, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                
+                quote = resp.json()
+                if quote.get("outputAmount", "0") == "0":
+                    continue
+                
+                swap_url = "https://lite-api.jup.ag/swap/v1/swap"
+                payload = {
+                    "quoteResponse": quote,
+                    "userPublicKey": str(wallet.pubkey()),
+                    "wrapAndUnwrapSol": True,
+                    "dynamicComputeUnitLimit": True,
+                    "prioritizationFeeLamports": "auto"
+                }
+                
+                resp = requests.post(swap_url, json=payload, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                
+                swap_data = resp.json()
+                if "swapTransaction" not in swap_data:
+                    continue
+                
+                tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+                raw_tx = VersionedTransaction.from_bytes(tx_bytes)
+                msg_bytes = message.to_bytes_versioned(raw_tx.message)
+                sig = wallet.sign_message(msg_bytes)
+                signed_tx = VersionedTransaction.populate(raw_tx.message, [sig])
+                
+                txid = self.client.send_raw_transaction(bytes(signed_tx))
+                expected_sol = int(quote.get("outputAmount", "0")) / 1e9
+                
+                print(f"   ✅ SELL TXID: {txid}")
+                return {
+                    "success": True, "txid": txid,
+                    "sol_received": expected_sol,
+                    "explorer": f"https://solscan.io/tx/{txid}"
+                }
+            
+            return {"success": False, "error": "No routes found - try selling on jup.ag manually"}
+            
         except Exception as e:
             print(f"   ❌ Sell error: {e}")
-            import traceback
-            traceback.print_exc()
             return {"success": False, "error": str(e)}
     # ============================================
     # BUY METHOD
