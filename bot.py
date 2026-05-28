@@ -718,53 +718,48 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         
         tokens_bought = result.get('tokens_bought', 0)
         
-        # If tokens_bought is 0 from quote, fetch actual balance from chain
+        # ALWAYS fetch actual balance from chain after buy
         if tokens_bought <= 0:
-            print(f"   ⚠️ Quote showed 0 tokens, fetching from chain...")
+            print(f"   ⚠️ Fetching actual balance from wallet...")
             try:
-                # Wait for transaction to confirm
-                await asyncio.sleep(5)
+                await asyncio.sleep(8)  # Wait longer for confirmation
                 
+                # Use direct HTTP call for reliability
+                import requests as req
                 mint_pubkey = Pubkey.from_string(ca)
                 ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
                 
-                # Retry up to 3 times
-                for attempt in range(3):
-                    try:
-                        result2 = sniper_service._rpc_call("getTokenAccountBalance", [str(ata), {"commitment": "confirmed"}])
-                        if 'result' in result2 and result2['result']:
-                            val = result2['result']
-                            if isinstance(val, dict):
-                                tokens_bought = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0)))
-                            else:
-                                tokens_bought = float(val) if val else 0
-                            
-                            if tokens_bought > 0:
-                                print(f"   📊 Chain balance: {tokens_bought:.6f} (attempt {attempt+1})")
-                                break
-                        await asyncio.sleep(3)
-                    except Exception as e:
-                        print(f"   ⚠️ Retry {attempt+1}: {e}")
-                        await asyncio.sleep(3)
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTokenAccountBalance",
+                    "params": [str(ata)]
+                }
+                
+                print(f"   Checking ATA: {str(ata)}")
+                resp = req.post(SOLANA_RPC, json=payload, timeout=10)
+                data = resp.json()
+                print(f"   RPC Response: {data}")
+                
+                if 'result' in data and data['result']:
+                    val = data['result']
+                    if isinstance(val, dict):
+                        tokens_bought = float(val.get('value', {}).get('uiAmount', 0))
+                    print(f"   ✅ Actual balance: {tokens_bought}")
                         
             except Exception as e:
-                print(f"   ⚠️ Balance fetch error: {e}")
+                print(f"   ⚠️ Balance error: {e}")
         
+        # Save position
+        db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
         if tokens_bought > 0:
-            db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
             db.add_trade_history(user_id, ca, 'buy', tokens_bought, result.get('price', 0), result['txid'])
             if user_id not in bought_tokens:
                 bought_tokens[user_id] = set()
             bought_tokens[user_id].add(ca)
-            print(f"   ✅ BUY: {result['txid'][:20]}... ({tokens_bought:.6f})")
-        else:
-            # Still save with TXID so user can track
-            db.add_position(user_id, ca, 0, result.get('price', 0), result['txid'])
-            print(f"   ⚠️ Saved position with 0 balance. Check Solscan for actual amount.")
         
+        print(f"   ✅ Position saved: {tokens_bought:.6f} tokens")
         print(f"   🔗 https://solscan.io/tx/{result['txid']}")
-    else:
-        print(f"   ❌ FAILED: {result['error']}")
 
 async def execute_buy_order(query):
     user_id = query.from_user.id
@@ -1235,22 +1230,61 @@ async def sell_all_positions(query):
 # ============================================
 async def show_positions(query):
     user_id = query.from_user.id
-    positions = db.get_user_positions(user_id)
-    if not positions:
-        text = "📊 *No active positions*"
-    else:
-        text = "📊 *Your Positions*\n\n"
-        for pos in positions:
-            price = await solana_service.get_token_price(pos['token_address'])
-            mc = await get_token_market_cap(pos['token_address'])
-            pnl = "N/A"
-            if price and pos['entry_price']:
-                pnl = f"{((price - pos['entry_price']) / pos['entry_price'] * 100):+.2f}%"
-            text += f"• `{pos['token_address'][:8]}...`\n  {pos['amount']:.4f} | P&L: {pnl}"
-            if mc:
-                text += f" | MC: ${mc:,.0f}"
-            text += "\n\n"
-    keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="positions")], [InlineKeyboardButton("« Back", callback_data="back_main")]]
+    wallet = await get_user_wallet(user_id)
+    
+    if not wallet:
+        await query.edit_message_text("❌ No wallet!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    text = "📊 *Your Positions*\n\n"
+    found_tokens = False
+    
+    try:
+        # Get ALL token accounts from wallet
+        import requests as req
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                str(wallet.pubkey()),
+                {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                {"encoding": "jsonParsed"}
+            ]
+        }
+        resp = req.post(SOLANA_RPC, json=payload, timeout=10)
+        data = resp.json()
+        
+        if 'result' in data and data['result']:
+            tokens = data['result'].get('value', [])
+            for t in tokens:
+                info = t.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
+                mint = info.get('mint', '')
+                amount = info.get('tokenAmount', {}).get('uiAmount', 0)
+                
+                if amount > 0:
+                    found_tokens = True
+                    price = await solana_service.get_token_price(mint)
+                    mc = await get_token_market_cap(mint)
+                    
+                    text += f"• `{mint[:8]}...` — *{amount:,.2f}*"
+                    if price:
+                        text += f" (${amount * price:.2f})"
+                    if mc:
+                        text += f"\n  MC: ${mc:,.0f}"
+                    text += "\n\n"
+                    
+                    # Update position in DB
+                    db.add_position(user_id, mint, amount, 0, 'wallet-scan')
+        
+        if not found_tokens:
+            text += "😔 *No tokens found in wallet*"
+            
+    except Exception as e:
+        text += f"❌ Error: {str(e)}"
+    
+    keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="positions")], 
+                [InlineKeyboardButton("« Back", callback_data="back_main")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 
