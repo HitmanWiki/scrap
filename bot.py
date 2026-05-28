@@ -1236,38 +1236,46 @@ async def show_positions(query):
         await query.edit_message_text("❌ No wallet!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
+    await query.edit_message_text("⏳ *Scanning wallet...*", parse_mode='Markdown')
+    
     text = "📊 *Your Positions*\n\n"
     found_tokens = False
+    found_mints = set()
     
+    wallet_addr = str(wallet.pubkey())
+    
+    # Method 1: Get token accounts by owner
     try:
-        # Get ALL token accounts from wallet
         import requests as req
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getTokenAccountsByOwner",
             "params": [
-                str(wallet.pubkey()),
+                wallet_addr,
                 {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
                 {"encoding": "jsonParsed"}
             ]
         }
-        resp = req.post(SOLANA_RPC, json=payload, timeout=10)
+        resp = req.post(SOLANA_RPC, json=payload, timeout=15)
         data = resp.json()
         
         if 'result' in data and data['result']:
             tokens = data['result'].get('value', [])
+            print(f"   Found {len(tokens)} token accounts")
+            
             for t in tokens:
                 info = t.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
                 mint = info.get('mint', '')
                 amount = info.get('tokenAmount', {}).get('uiAmount', 0)
                 
-                if amount > 0:
+                if amount > 0 and mint not in found_mints:
+                    found_mints.add(mint)
                     found_tokens = True
                     price = await solana_service.get_token_price(mint)
                     mc = await get_token_market_cap(mint)
                     
-                    text += f"• `{mint[:8]}...` — *{amount:,.2f}*"
+                    text += f"• `{mint[:8]}...{mint[-4:]}` — *{amount:,.2f}*"
                     if price:
                         text += f" (${amount * price:.2f})"
                     if mc:
@@ -1276,16 +1284,51 @@ async def show_positions(query):
                     
                     # Update position in DB
                     db.add_position(user_id, mint, amount, 0, 'wallet-scan')
-        
-        if not found_tokens:
-            text += "😔 *No tokens found in wallet*"
-            
+        else:
+            print(f"   RPC Response: {data}")
     except Exception as e:
-        text += f"❌ Error: {str(e)}"
+        print(f"   Method 1 error: {e}")
+    
+    # Method 2: Also check DB positions and verify each
+    if not found_tokens:
+        db_positions = db.get_user_positions(user_id)
+        for pos in db_positions:
+            mint = pos['token_address']
+            if mint not in found_mints:
+                try:
+                    mint_pubkey = Pubkey.from_string(mint)
+                    ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+                    
+                    payload = {
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "getTokenAccountBalance",
+                        "params": [str(ata)]
+                    }
+                    resp = req.post(SOLANA_RPC, json=payload, timeout=10)
+                    data = resp.json()
+                    
+                    if 'result' in data and data['result']:
+                        val = data['result']
+                        amount = float(val.get('value', {}).get('uiAmount', 0)) if isinstance(val, dict) else float(val)
+                        
+                        if amount > 0:
+                            found_mints.add(mint)
+                            found_tokens = True
+                            text += f"• `{mint[:8]}...` — *{amount:,.2f}* (from positions)\n\n"
+                            db.update_position_amount(pos['id'], amount)
+                except:
+                    pass
+    
+    if not found_tokens:
+        text += "😔 *No tokens found*\n\n"
+        text += f"💡 [View wallet on Solscan](https://solscan.io/account/{wallet_addr})"
+    
+    text += f"\n💳 `{wallet_addr[:8]}...{wallet_addr[-4:]}`"
     
     keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="positions")], 
                 [InlineKeyboardButton("« Back", callback_data="back_main")]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), 
+                                   parse_mode='Markdown', disable_web_page_preview=True)
     return SELECTING_ACTION
 
 async def show_settings(query):
