@@ -188,27 +188,34 @@ class SniperService:
             
             print(f"   Selling {amount_tokens} tokens ({amount_raw} raw, {decimals} dec)")
             
-            quote_url = "https://lite-api.jup.ag/swap/v1/quote"
-            params = {
-                "inputMint": token_mint,
-                "outputMint": "So11111111111111111111111111111111111111112",
-                "amount": amount_raw,
-                "slippageBps": slippage_bps,
-            }
+            # Try multiple output mints
+            output_mints = [
+                "So11111111111111111111111111111111111111112",  # SOL
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+            ]
             
-            print(f"   Getting sell quote...")
-            resp = requests.get(quote_url, params=params, timeout=10)
-            
-            if resp.status_code != 200:
-                # Try USDC route
-                print(f"   ⚠️ Trying USDC route...")
-                params["outputMint"] = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            quote = None
+            for output_mint in output_mints:
+                quote_url = "https://lite-api.jup.ag/swap/v1/quote"
+                params = {
+                    "inputMint": token_mint,
+                    "outputMint": output_mint,
+                    "amount": amount_raw,
+                    "slippageBps": slippage_bps,
+                }
+                
+                print(f"   Trying route to {output_mint[:8]}...")
                 resp = requests.get(quote_url, params=params, timeout=10)
+                
+                if resp.status_code == 200:
+                    quote = resp.json()
+                    break
+                else:
+                    print(f"   ⚠️ Failed: {resp.status_code}")
             
-            if resp.status_code != 200:
-                return {"success": False, "error": f"Quote HTTP {resp.status_code}: {resp.text[:200]}"}
-            
-            quote = resp.json()
+            if not quote:
+                return {"success": False, "error": "No routes found for any output token"}
             
             swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             payload = {
@@ -233,7 +240,13 @@ class SniperService:
             signed_tx_bytes = self.sign_transaction(tx_bytes, wallet)
             txid = self._send_raw_transaction(signed_tx_bytes)
             
-            sol_received = float(quote.get("outputAmount", "0")) / 10**9
+            output_mint_used = quote.get('outputMint', '')
+            if output_mint_used == "So11111111111111111111111111111111111111112":
+                sol_received = float(quote.get("outputAmount", "0")) / 10**9
+            elif output_mint_used == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v":
+                sol_received = float(quote.get("outputAmount", "0")) / 10**6  # USDC
+            else:
+                sol_received = float(quote.get("outputAmount", "0")) / 10**6
             
             return {
                 "success": True,

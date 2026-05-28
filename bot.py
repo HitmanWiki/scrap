@@ -776,64 +776,95 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ No wallet!", reply_markup=get_main_keyboard())
             return SELECTING_ACTION
         
-        # Get token balance from chain
+        # Get token balance from chain - try multiple times
+        balance = 0
         try:
             mint_pubkey = Pubkey.from_string(ca)
             ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-            result = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
             
-            if 'result' in result and result['result']:
-                balance = float(result['result'].get('uiAmount', 0))
-                if balance <= 0:
-                    await update.message.reply_text(
-                        f"❌ No tokens to sell!\n\nToken: `{ca}`\nBalance: 0",
-                        reply_markup=get_main_keyboard(),
-                        parse_mode='Markdown'
-                    )
-                    return SELECTING_ACTION
-                
-                # Store for sell
-                context.user_data['sell_token'] = ca
-                context.user_data['sell_amount'] = balance
-                
-                # Show confirmation
-                price = await solana_service.get_token_price(ca)
-                
-                text = f"""
-📉 *Sell Tokens*
-
-*Token:* `{ca[:8]}...`
-*Balance:* {balance:.6f}
-*Price:* ${price:.6f} (Jupiter)
-
-Select percentage to sell:
-"""
-                keyboard = [
-                    [InlineKeyboardButton("100%", callback_data=f"execute_sell_{ca}_100"),
-                     InlineKeyboardButton("50%", callback_data=f"execute_sell_{ca}_50")],
-                    [InlineKeyboardButton("25%", callback_data=f"execute_sell_{ca}_25")],
-                    [InlineKeyboardButton("« Cancel", callback_data="back_main")]
-                ]
-                
-                await update.message.reply_text(
-                    text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode='Markdown'
-                )
-                return SELECTING_ACTION
-            else:
-                await update.message.reply_text(
-                    f"❌ Could not check balance for `{ca[:8]}...`",
-                    reply_markup=get_main_keyboard(),
-                    parse_mode='Markdown'
-                )
-                return SELECTING_ACTION
+            # Try with different commitments
+            for commitment in ["processed", "confirmed", "finalized"]:
+                try:
+                    result = sniper_service._rpc_call("getTokenAccountBalance", [
+                        str(ata), {"commitment": commitment}
+                    ])
+                    if 'result' in result and result['result']:
+                        balance = float(result['result'].get('uiAmount', 0))
+                        if balance > 0:
+                            break
+                except:
+                    continue
+            
+            # Also check if ATA exists
+            if balance == 0:
+                account_info = sniper_service._rpc_call("getAccountInfo", [str(ata)])
+                if 'result' in account_info and account_info['result'] is None:
+                    # ATA doesn't exist - no tokens
+                    pass
+                elif 'result' in account_info and account_info['result']:
+                    # ATA exists but might have 0 balance
+                    token_result = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
+                    if 'result' in token_result and token_result['result']:
+                        balance = float(token_result['result'].get('uiAmount', 0))
+            
+            print(f"   📊 Balance for {ca[:8]}: {balance}")
+            
         except Exception as e:
+            print(f"   ⚠️ Balance check error: {e}")
+        
+        if balance <= 0:
             await update.message.reply_text(
-                f"❌ Error: {str(e)}",
-                reply_markup=get_main_keyboard()
+                f"❌ *No tokens found!*\n\n"
+                f"Token: `{ca}`\n"
+                f"Balance: 0\n\n"
+                f"💡 *Possible reasons:*\n"
+                f"• Buy transaction may still be pending\n"
+                f"• Token might be in a different wallet\n"
+                f"• Check on Solscan: [View](https://solscan.io/account/{str(wallet.pubkey())})",
+                reply_markup=get_main_keyboard(),
+                parse_mode='Markdown',
+                disable_web_page_preview=True
             )
             return SELECTING_ACTION
+        
+        # Store for sell
+        context.user_data['sell_token'] = ca
+        context.user_data['sell_amount'] = balance
+        
+        # Get token info
+        price = await solana_service.get_token_price(ca)
+        decimals = await sniper_service.get_token_decimals(ca)
+        mc = await get_token_market_cap(ca)
+        
+        text = f"""
+📉 *Sell Tokens*
+
+*Token:* `{ca[:8]}...{ca[-4:]}`
+*Balance:* {balance:.{decimals}f}
+*Decimals:* {decimals}
+"""
+        if price:
+            value = balance * price
+            text += f"*Price:* ${price:.8f}\n*Value:* ${value:.2f}"
+        if mc:
+            text += f"\n*MC:* ${mc:,.0f}"
+        
+        text += "\n\nSelect percentage to sell:"
+        
+        keyboard = [
+            [InlineKeyboardButton("💰 100%", callback_data=f"execute_sell_{ca}_100"),
+             InlineKeyboardButton("📊 50%", callback_data=f"execute_sell_{ca}_50")],
+            [InlineKeyboardButton("📉 25%", callback_data=f"execute_sell_{ca}_25"),
+             InlineKeyboardButton("📝 10%", callback_data=f"execute_sell_{ca}_10")],
+            [InlineKeyboardButton("« Cancel", callback_data="back_main")]
+        ]
+        
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return SELECTING_ACTION
     
     # Regular buy flow
     user = db.get_user(user_id)
@@ -845,10 +876,16 @@ Select percentage to sell:
     mc = await get_token_market_cap(ca)
     mc_text = f"\n*MC:* ${mc:,.0f}" if mc else ""
     
+    try:
+        price = await solana_service.get_token_price(ca)
+        price_text = f"\n*Price:* ${price:.8f}" if price else ""
+    except:
+        price_text = ""
+    
     text = f"""
 📈 *Confirm Buy*
 
-*Token:* `{ca}`{mc_text}
+*Token:* `{ca}`{mc_text}{price_text}
 *Amount:* {buy_amount} SOL
 *Slippage:* {slippage/100}%
 
