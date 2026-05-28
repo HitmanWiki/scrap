@@ -301,63 +301,59 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Sync DB positions with actual wallet balances"""
+    """Sync positions by checking each token's ATA directly"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return
     
-    wallet_addr = str(wallet.pubkey())
+    positions = db.get_user_positions(user_id)
     
-    try:
-        # Get ALL token accounts from wallet
-        import requests as req
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                wallet_addr,
-                {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-                {"encoding": "jsonParsed"}
-            ]
-        }
-        resp = req.post(SOLANA_RPC, json=payload, timeout=15)
-        data = resp.json()
-        
-        if 'result' in data and data['result']:
-            tokens = data['result'].get('value', [])
-            actual_tokens = {}
+    for pos in positions:
+        token_addr = pos['token_address']
+        try:
+            mint_pubkey = Pubkey.from_string(token_addr)
+            ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
             
-            for t in tokens:
-                info = t.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
-                mint = info.get('mint', '')
-                amount = info.get('tokenAmount', {}).get('uiAmount', 0)
-                if amount > 0:
-                    actual_tokens[mint] = amount
+            # Direct ATA balance check
+            balance = sniper_service.client.get_token_balance(str(ata))
             
-            # Get existing positions from DB
-            db_positions = db.get_user_positions(user_id)
-            
-            # Update or create positions based on actual wallet
-            for mint, amount in actual_tokens.items():
-                existing = next((p for p in db_positions if p['token_address'] == mint), None)
-                if existing:
-                    # Update if amount changed
-                    if abs(existing['amount'] - amount) > 0.000001:
-                        db.update_position_amount(existing['id'], amount)
+            if balance > 0:
+                # Update if amount changed
+                if abs(pos['amount'] - balance) > 0.0001:
+                    db.update_position_amount(pos['id'], balance)
+                    print(f"   ✅ Updated {token_addr[:8]}...: {balance:.2f}")
+            else:
+                # No balance - check if transaction exists
+                if pos.get('buy_txid'):
+                    # Re-verify from transaction
+                    try:
+                        tx_detail = sniper_service._rpc_call("getTransaction", [
+                            pos['buy_txid'],
+                            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                        ])
+                        if 'result' in tx_detail and tx_detail['result']:
+                            meta = tx_detail['result'].get('meta', {})
+                            for token in meta.get('postTokenBalances', []):
+                                if token.get('mint') == token_addr:
+                                    tx_amount = float(token.get('uiTokenAmount', {}).get('uiAmount', 0))
+                                    if tx_amount > 0:
+                                        db.update_position_amount(pos['id'], tx_amount)
+                                        print(f"   ✅ From TX: {token_addr[:8]}... = {tx_amount:.2f}")
+                                        break
+                    except:
+                        pass
                 else:
-                    # Create new position for token found in wallet
-                    db.add_position(user_id, mint, amount, 0, 'wallet-sync')
-            
-            # Deactivate positions that no longer exist in wallet
-            for pos in db_positions:
-                if pos['token_address'] not in actual_tokens:
-                    db.close_position(pos['id'], 'wallet-sync')
-            
-            print(f"   ✅ Synced {len(actual_tokens)} tokens from wallet")
-            
-    except Exception as e:
-        print(f"   ⚠️ Wallet sync error: {e}")
+                    # No balance and no TXID - remove
+                    db.close_position(pos['id'], 'zero-balance')
+                    print(f"   🗑️ Removed {token_addr[:8]}... (zero balance)")
+                    
+        except Exception as e:
+            print(f"   ⚠️ Sync error for {token_addr[:8]}...: {e}")
+    
+    # Get updated count
+    updated_positions = db.get_user_positions(user_id)
+    active_count = sum(1 for p in updated_positions if p['amount'] > 0)
+    print(f"   ✅ Synced: {active_count} tokens with balance")
 # ============================================
 # ADDRESS VALIDATION & EXTRACTION
 # ============================================
@@ -1533,70 +1529,58 @@ async def show_positions(query):
         await query.edit_message_text("❌ No wallet!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    await query.edit_message_text("⏳ *Checking wallet...*", parse_mode='Markdown')
+    await query.edit_message_text("⏳ *Syncing positions...*", parse_mode='Markdown')
     
-    wallet_addr = str(wallet.pubkey())
-    text = "📊 *Your Positions*\n\n"
-    found_any = False
-    total_value = 0
+    # Sync first
+    await sync_positions_from_wallet(user_id)
     
-    # Get positions from DB
+    # Get updated positions
     positions = db.get_user_positions(user_id)
+    wallet_addr = str(wallet.pubkey())
     
-    if positions:
-        for pos in positions:
-            token_addr = pos['token_address']
+    text = "📊 *Your Positions*\n\n"
+    total_value = 0
+    found_any = False
+    
+    for pos in positions:
+        token_addr = pos['token_address']
+        amount = pos['amount']
+        
+        if amount > 0:
+            found_any = True
+            token_short = f"{token_addr[:6]}...{token_addr[-4:]}"
             
-            # Check actual balance via ATA
-            actual_amount = 0
-            try:
-                mint_pubkey = Pubkey.from_string(token_addr)
-                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                actual_amount = sniper_service.client.get_token_balance(str(ata))
-            except:
-                actual_amount = pos['amount']  # Fallback to DB amount
+            price = await solana_service.get_token_price(token_addr)
+            mc = await get_token_market_cap(token_addr)
+            value = amount * price if price else 0
+            total_value += value
             
-            # Use actual amount if available, otherwise DB amount
-            amount = actual_amount if actual_amount > 0 else pos['amount']
+            pnl = ""
+            if pos.get('entry_price') and pos['entry_price'] > 0 and price and price > 0:
+                pnl_pct = ((price - pos['entry_price']) / pos['entry_price']) * 100
+                emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                pnl = f" {emoji}{pnl_pct:+.1f}%"
             
-            if amount > 0:
-                found_any = True
-                token_short = f"{token_addr[:6]}...{token_addr[-4:]}"
-                
-                price = await solana_service.get_token_price(token_addr)
-                mc = await get_token_market_cap(token_addr)
-                value = amount * price if price else 0
-                total_value += value
-                
-                text += f"🔹 `{token_short}`\n"
-                text += f"   Amount: *{amount:,.2f}*"
-                if value > 0:
-                    text += f" (${value:.2f})"
-                text += "\n"
-                if mc:
-                    text += f"   MC: ${mc:,.0f}\n"
-                text += "\n"
-                
-                # Update DB with actual amount
-                if actual_amount > 0 and abs(actual_amount - pos['amount']) > 0.0001:
-                    db.update_position_amount(pos['id'], actual_amount)
-            else:
-                # No balance - remove from positions
-                db.close_position(pos['id'], 'zero-balance')
+            text += f"🔹 `{token_short}`\n"
+            text += f"   Amount: *{amount:,.2f}*"
+            if value > 0:
+                text += f" (${value:.2f})"
+            text += f"{pnl}\n"
+            if mc:
+                text += f"   MC: ${mc:,.0f}\n"
+            if pos.get('buy_txid'):
+                text += f"   [View TX](https://solscan.io/tx/{pos['buy_txid']})\n"
+            text += "\n"
     
     if not found_any:
-        # Check if we have SOL at least
-        sol_balance = await solana_service.get_balance(wallet_addr)
-        text += "😔 *No tokens found*\n\n"
-        text += f"💰 SOL: {sol_balance:.4f}\n"
-        text += f"💡 Buy tokens to see them here!\n"
-    else:
-        sol_balance = await solana_service.get_balance(wallet_addr)
-        total_value += sol_balance
-        text += f"💰 *SOL:* {sol_balance:.4f}\n"
-        text += f"💎 *Total:* ${total_value:.2f}\n"
+        text += "😔 *No tokens with balance*\n\n"
+        text += "Buy tokens to see them here!\n"
     
-    text += f"\n💳 `{wallet_addr[:8]}...{wallet_addr[-4:]}`"
+    sol_balance = await solana_service.get_balance(wallet_addr)
+    total_value += sol_balance
+    text += f"💰 *SOL:* {sol_balance:.4f} SOL\n"
+    text += f"💎 *Total:* ${total_value:.2f}\n\n"
+    text += f"💳 `{wallet_addr[:8]}...{wallet_addr[-4:]}`"
     text += f"\n🔗 [View on Solscan](https://solscan.io/account/{wallet_addr})"
     
     keyboard = [
@@ -1609,8 +1593,7 @@ async def show_positions(query):
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), 
                                        parse_mode='Markdown', disable_web_page_preview=True)
     except:
-        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), 
-                                        parse_mode='Markdown', disable_web_page_preview=True)
+        pass
     return SELECTING_ACTION
 
 async def show_settings(query):
