@@ -301,7 +301,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Get ALL token balances using Helius DAS API"""
+    """Get token balances using Solscan public API"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return {}
@@ -312,46 +312,44 @@ async def sync_positions_from_wallet(user_id: int):
     try:
         import requests as req
         
-        api_key = os.getenv('HELIUS_API_KEY', '')
+        # Solscan public API - no key needed!
+        url = f"https://api.solscan.io/account/tokens?address={wallet_addr}"
+        headers = {"User-Agent": "Mozilla/5.0"}
         
-        # Helius DAS API - search assets by owner
-        url = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
+        resp = req.get(url, headers=headers, timeout=15)
         
-        # Method 1: getTokenBalances (Helius specific)
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenBalances",
-            "params": [wallet_addr]
-        }
-        
-        resp = req.post(url, json=payload, timeout=15)
-        data = resp.json()
-        
-        print(f"   getTokenBalances response keys: {data.keys()}")
-        
-        if 'result' in data and data['result']:
-            tokens = data['result']
-            if isinstance(tokens, list):
-                for token in tokens:
-                    mint = token.get('mint', '')
-                    amount = token.get('amount', 0)
-                    decimals = token.get('decimals', 6)
-                    
-                    actual = amount / (10 ** decimals)
-                    if actual > 0:
-                        wallet_tokens[mint] = actual
-                        print(f"   ✅ {mint[:8]}... = {actual:.4f}")
-            elif isinstance(tokens, dict):
-                for mint, info in tokens.items():
-                    amount = info.get('amount', 0) if isinstance(info, dict) else info
-                    decimals = info.get('decimals', 6) if isinstance(info, dict) else 6
-                    actual = float(amount) / (10 ** decimals)
-                    if actual > 0:
-                        wallet_tokens[mint] = actual
-                        print(f"   ✅ {mint[:8]}... = {actual:.4f}")
+        if resp.status_code == 200:
+            data = resp.json()
             
-            print(f"   Found {len(wallet_tokens)} tokens")
+            if data.get('success') and data.get('data'):
+                tokens = data['data']
+                print(f"   Solscan: Found {len(tokens)} tokens")
+                
+                for token in tokens:
+                    mint = token.get('tokenAddress', token.get('mint', ''))
+                    amount = float(token.get('tokenAmount', {}).get('uiAmount', 0))
+                    
+                    if amount > 0:
+                        wallet_tokens[mint] = amount
+                        print(f"   ✅ {mint[:8]}... = {amount:.4f}")
+            else:
+                print(f"   Solscan response: {data}")
+        else:
+            # Try alternative SolanaFM API
+            fm_url = f"https://api.solana.fm/v0/accounts/{wallet_addr}/tokens"
+            resp = req.get(fm_url, headers=headers, timeout=15)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                tokens = data.get('result', {}).get('data', data.get('data', []))
+                print(f"   SolanaFM: Found {len(tokens)} tokens")
+                
+                for token in tokens:
+                    mint = token.get('mint', token.get('tokenAddress', ''))
+                    amount = float(token.get('amount', token.get('balance', 0)))
+                    if amount > 0:
+                        wallet_tokens[mint] = amount
+                        print(f"   ✅ {mint[:8]}... = {amount:.4f}")
         
         # Update DB
         if wallet_tokens:
@@ -361,7 +359,7 @@ async def sync_positions_from_wallet(user_id: int):
                 if pos:
                     db.update_position_amount(pos['id'], amount)
                 else:
-                    db.add_position(user_id, mint, amount, 0, 'helius')
+                    db.add_position(user_id, mint, amount, 0, 'solscan')
             
             for pos in existing:
                 if pos['token_address'] not in wallet_tokens:
