@@ -1,5 +1,6 @@
 python-telegram-bot==20.7
 telethon==1.34.0
+solana==0.34.0
 solders==0.18.1
 base58==2.1.1
 requests==2.31.0
