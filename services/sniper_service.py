@@ -255,10 +255,8 @@ class SniperService:
             return {"success": False, "error": str(e)}
     
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        if self.is_pump_fun_token(token_mint):
-            return await self.execute_pump_sell(wallet, token_mint, amount_tokens, slippage_bps)
-        else:
-            return await self.execute_jupiter_sell(wallet, token_mint, amount_tokens, slippage_bps)
+        """Execute sell using Jupiter (works for all tokens)"""
+        return await self.execute_jupiter_sell(wallet, token_mint, amount_tokens, slippage_bps)
     
     # ============================================
     # BUY METHOD
