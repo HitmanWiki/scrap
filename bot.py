@@ -715,19 +715,73 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
     
     if result['success']:
         db.increment_daily_trades(user_id)
-        
         txid = result['txid']
+        tokens_bought = 0
         
-        # Don't try to verify - just save the position
-        # The user can check Solscan for exact amount
-        # We'll update the amount when they view positions
-        db.add_position(user_id, ca, 0.000001, 0, txid)  # Tiny amount so it shows up
+        print(f"   ⚠️ Fetching tokens from transaction...")
+        try:
+            await asyncio.sleep(10)  # Wait for confirmation
+            
+            import requests as req
+            
+            # Get transaction details
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [
+                    txid,
+                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                ]
+            }
+            
+            resp = req.post(SOLANA_RPC, json=payload, timeout=15)
+            data = resp.json()
+            
+            if 'result' in data and data['result']:
+                meta = data['result'].get('meta', {})
+                post_token = meta.get('postTokenBalances', [])
+                pre_token = meta.get('preTokenBalances', [])
+                
+                wallet_str = str(wallet.pubkey())
+                
+                # Check post balances for our wallet and this token
+                for post in post_token:
+                    if post.get('mint') == ca:
+                        post_amt = float(post.get('uiTokenAmount', {}).get('uiAmount', 0))
+                        post_owner = post.get('owner', '')
+                        
+                        # Find pre balance
+                        pre_amt = 0
+                        for pre in pre_token:
+                            if pre.get('mint') == ca and pre.get('owner') == post_owner:
+                                pre_amt = float(pre.get('uiTokenAmount', {}).get('uiAmount', 0))
+                        
+                        diff = post_amt - pre_amt
+                        if diff > 0:
+                            tokens_bought += diff
+                            print(f"   ✅ Found: +{diff:.6f} tokens")
+                
+                print(f"   📊 Total tokens bought: {tokens_bought:.6f}")
+                        
+        except Exception as e:
+            print(f"   ⚠️ getTransaction error: {e}")
+            import traceback
+            traceback.print_exc()
         
-        if user_id not in bought_tokens:
-            bought_tokens[user_id] = set()
-        bought_tokens[user_id].add(ca)
+        # Save position with actual amount
+        if tokens_bought > 0:
+            db.add_position(user_id, ca, tokens_bought, 0, txid)
+            db.add_trade_history(user_id, ca, 'buy', tokens_bought, 0, txid)
+            if user_id not in bought_tokens:
+                bought_tokens[user_id] = set()
+            bought_tokens[user_id].add(ca)
+            print(f"   ✅ Position saved: {tokens_bought:.6f} tokens")
+        else:
+            # Fallback: save with TXID so position exists
+            db.add_position(user_id, ca, 0.000001, 0, txid)
+            print(f"   ⚠️ Saved placeholder - check Solscan for actual amount")
         
-        print(f"   ✅ BUY: {txid[:20]}...")
         print(f"   🔗 https://solscan.io/tx/{txid}")
 async def execute_buy_order(query):
     user_id = query.from_user.id
@@ -748,36 +802,47 @@ async def execute_buy_order(query):
     
     if result['success']:
         db.increment_daily_trades(user_id)
+        txid = result['txid']
+        tokens_bought = 0
         
-        tokens_bought = result.get('tokens_bought', 0)
-        
-        # If 0, fetch from chain
-        if tokens_bought <= 0:
-            await asyncio.sleep(5)
-            try:
-                mint_pubkey = Pubkey.from_string(token_address)
-                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                result2 = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
-                if 'result' in result2 and result2['result']:
-                    val = result2['result']
-                    tokens_bought = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0))) if isinstance(val, dict) else float(val)
-            except:
-                pass
+        # Fetch from transaction
+        try:
+            await asyncio.sleep(10)
+            import requests as req
+            payload = {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTransaction",
+                "params": [txid, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            }
+            resp = req.post(SOLANA_RPC, json=payload, timeout=15)
+            data = resp.json()
+            
+            if 'result' in data and data['result']:
+                meta = data['result'].get('meta', {})
+                for post in meta.get('postTokenBalances', []):
+                    if post.get('mint') == token_address:
+                        post_amt = float(post.get('uiTokenAmount', {}).get('uiAmount', 0))
+                        pre_amt = 0
+                        for pre in meta.get('preTokenBalances', []):
+                            if pre.get('mint') == token_address and pre.get('owner') == post.get('owner'):
+                                pre_amt = float(pre.get('uiTokenAmount', {}).get('uiAmount', 0))
+                        diff = post_amt - pre_amt
+                        if diff > 0:
+                            tokens_bought += diff
+        except:
+            pass
         
         if tokens_bought > 0:
-            db.add_position(user_id, token_address, tokens_bought, result.get('price', 0), result['txid'])
+            db.add_position(user_id, token_address, tokens_bought, 0, txid)
             if user_id not in bought_tokens:
                 bought_tokens[user_id] = set()
             bought_tokens[user_id].add(token_address)
-            text = f"✅ *Bought!*\n\nTX: `{result['txid'][:20]}...`\nTokens: {tokens_bought:,.2f}"
+            text = f"✅ *Bought!*\n\nTX: `{txid[:20]}...`\nTokens: {tokens_bought:,.2f}"
         else:
-            text = f"✅ *TX Sent!*\n\nTX: `{result['txid'][:20]}...`\n⚠️ Check Solscan for amount"
+            db.add_position(user_id, token_address, 0.000001, 0, txid)
+            text = f"✅ *TX Sent!*\n\nTX: `{txid[:20]}...`\n[View on Solscan](https://solscan.io/tx/{txid})"
         
-        text += f"\n🔗 [View on Solscan](https://solscan.io/tx/{result['txid']})"
-    else:
-        text = f"❌ *Failed*\n{result['error']}"
-    
-    await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True)
+        await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True)
     return SELECTING_ACTION
 # ============================================
 # BUY/SELL
