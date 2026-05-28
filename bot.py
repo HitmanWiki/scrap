@@ -717,22 +717,38 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         db.increment_daily_trades(user_id)
         
         tokens_bought = result.get('tokens_bought', 0)
+        
+        # If tokens_bought is 0 from quote, fetch actual balance from chain
         if tokens_bought <= 0:
-            # Try to fetch actual balance from chain
-            wallet = await get_user_wallet(user_id)
-            if wallet:
+            print(f"   ⚠️ Quote showed 0 tokens, fetching from chain...")
+            try:
+                # Wait for transaction to confirm
+                await asyncio.sleep(5)
+                
                 mint_pubkey = Pubkey.from_string(ca)
                 ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                # Use sniper_service to check balance
-                try:
-                    # Wait a moment for transaction to confirm
-                    await asyncio.sleep(3)
-                    result2 = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
-                    if 'result' in result2 and result2['result']:
-                        tokens_bought = float(result2['result'].get('uiAmount', 0))
-                        print(f"   📊 Fetched from chain: {tokens_bought:.6f} tokens")
-                except:
-                    pass
+                
+                # Retry up to 3 times
+                for attempt in range(3):
+                    try:
+                        result2 = sniper_service._rpc_call("getTokenAccountBalance", [str(ata), {"commitment": "confirmed"}])
+                        if 'result' in result2 and result2['result']:
+                            val = result2['result']
+                            if isinstance(val, dict):
+                                tokens_bought = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0)))
+                            else:
+                                tokens_bought = float(val) if val else 0
+                            
+                            if tokens_bought > 0:
+                                print(f"   📊 Chain balance: {tokens_bought:.6f} (attempt {attempt+1})")
+                                break
+                        await asyncio.sleep(3)
+                    except Exception as e:
+                        print(f"   ⚠️ Retry {attempt+1}: {e}")
+                        await asyncio.sleep(3)
+                        
+            except Exception as e:
+                print(f"   ⚠️ Balance fetch error: {e}")
         
         if tokens_bought > 0:
             db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
@@ -742,9 +758,64 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
             bought_tokens[user_id].add(ca)
             print(f"   ✅ BUY: {result['txid'][:20]}... ({tokens_bought:.6f})")
         else:
-            print(f"   ⚠️ Could not determine token amount. Check Solscan.")
+            # Still save with TXID so user can track
+            db.add_position(user_id, ca, 0, result.get('price', 0), result['txid'])
+            print(f"   ⚠️ Saved position with 0 balance. Check Solscan for actual amount.")
         
         print(f"   🔗 https://solscan.io/tx/{result['txid']}")
+    else:
+        print(f"   ❌ FAILED: {result['error']}")
+
+async def execute_buy_order(query):
+    user_id = query.from_user.id
+    user = db.get_user(user_id)
+    wallet = await get_user_wallet(user_id)
+    token_match = re.search(r'`([1-9A-HJ-NP-Za-km-z]{32,44})`', query.message.text)
+    if not token_match:
+        await query.edit_message_text("❌ Token not found!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    token_address = token_match.group(1)
+    if await already_holding(user_id, wallet.pubkey(), token_address):
+        await query.edit_message_text("⏭️ Already holding!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    buy_amount = user.get('default_buy_amount', DEFAULT_BUY_AMOUNT)
+    slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
+    await query.edit_message_text("⏳ *Executing buy...*", parse_mode='Markdown')
+    result = await sniper_service.execute_buy(wallet, token_address, buy_amount, slippage)
+    
+    if result['success']:
+        db.increment_daily_trades(user_id)
+        
+        tokens_bought = result.get('tokens_bought', 0)
+        
+        # If 0, fetch from chain
+        if tokens_bought <= 0:
+            await asyncio.sleep(5)
+            try:
+                mint_pubkey = Pubkey.from_string(token_address)
+                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+                result2 = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
+                if 'result' in result2 and result2['result']:
+                    val = result2['result']
+                    tokens_bought = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0))) if isinstance(val, dict) else float(val)
+            except:
+                pass
+        
+        if tokens_bought > 0:
+            db.add_position(user_id, token_address, tokens_bought, result.get('price', 0), result['txid'])
+            if user_id not in bought_tokens:
+                bought_tokens[user_id] = set()
+            bought_tokens[user_id].add(token_address)
+            text = f"✅ *Bought!*\n\nTX: `{result['txid'][:20]}...`\nTokens: {tokens_bought:,.2f}"
+        else:
+            text = f"✅ *TX Sent!*\n\nTX: `{result['txid'][:20]}...`\n⚠️ Check Solscan for amount"
+        
+        text += f"\n🔗 [View on Solscan](https://solscan.io/tx/{result['txid']})"
+    else:
+        text = f"❌ *Failed*\n{result['error']}"
+    
+    await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True)
+    return SELECTING_ACTION
 # ============================================
 # BUY/SELL
 # ============================================
