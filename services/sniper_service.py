@@ -406,9 +406,11 @@ class SniperService:
     # ============================================
     
     async def execute_buy(self, wallet: Keypair, token_mint: str, amount_sol: float, slippage_bps: int) -> dict:
+        """Execute buy - Read amount from transaction response"""
         try:
             print(f"   Amount: {amount_sol} SOL | Slippage: {slippage_bps/100}%")
             
+            # 1. Quote from Lite API
             quote_url = "https://lite-api.jup.ag/swap/v1/quote"
             params = {
                 "inputMint": "So11111111111111111111111111111111111111112",
@@ -422,6 +424,7 @@ class SniperService:
                 return {"success": False, "error": f"Quote HTTP {resp.status_code}"}
             quote = resp.json()
             
+            # 2. Build swap
             swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             payload = {
                 "quoteResponse": quote,
@@ -438,28 +441,76 @@ class SniperService:
             if "swapTransaction" not in swap_data:
                 return {"success": False, "error": "No swapTransaction"}
             
+            # 3. Sign transaction
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             raw_tx = VersionedTransaction.from_bytes(tx_bytes)
-            msg_bytes = message.to_bytes_versioned(raw_tx.message)
-            signature = wallet.sign_message(msg_bytes)
+            message_bytes = message.to_bytes_versioned(raw_tx.message)
+            signature = wallet.sign_message(message_bytes)
             signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
+            signed_tx_bytes = bytes(signed_tx)
             
+            # 4. Send transaction
             print("   Sending transaction...")
-            txid = self.client.send_raw_transaction(bytes(signed_tx))
+            result = self.client.send_raw_transaction(
+                signed_tx_bytes,
+                opts=TxOpts(skip_preflight=True)
+            )
+            txid = str(result.value)
             print(f"   ✅ TXID: {txid}")
             
-            await asyncio.sleep(8)
+            # 5. Get token amount from the transaction (wait for it to be available)
+            print("   ⏳ Fetching transaction details...")
             
             tokens_bought = 0
+            decimals = 9
+            
+            # Get token decimals first
             try:
-                mint_pubkey = Pubkey.from_string(token_mint)
-                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                balance = self.client.get_token_balance(str(ata))
-                if balance > 0:
-                    tokens_bought = balance
-                    print(f"   📊 Balance: {tokens_bought:.6f}")
+                mint_info = self._rpc_call("getMint", [token_mint])
+                if 'result' in mint_info and mint_info['result']:
+                    decimals = mint_info['result'].get('decimals', 9)
             except:
                 pass
+            
+            # Wait for transaction to be available and parse it
+            for attempt in range(8):
+                await asyncio.sleep(2)
+                try:
+                    tx_detail = self._rpc_call("getTransaction", [
+                        txid,
+                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                    ])
+                    
+                    if 'result' in tx_detail and tx_detail['result']:
+                        meta = tx_detail['result'].get('meta', {})
+                        post_balances = meta.get('postTokenBalances', [])
+                        
+                        # Find the token in post_balances
+                        for token in post_balances:
+                            if token.get('mint') == token_mint:
+                                amount_raw = token.get('uiTokenAmount', {}).get('uiAmount', 0)
+                                tokens_bought = float(amount_raw) if amount_raw else 0
+                                print(f"   📊 Found in transaction: {tokens_bought:.6f} tokens")
+                                break
+                        
+                        if tokens_bought > 0:
+                            break
+                        else:
+                            print(f"   ⏳ Attempt {attempt+1}: Token not in post_balances yet...")
+                    else:
+                        print(f"   ⏳ Attempt {attempt+1}: Transaction not available...")
+                        
+                except Exception as e:
+                    print(f"   ⚠️ Attempt {attempt+1}: {e}")
+            
+            # Fallback: use quote's outputAmount
+            if tokens_bought <= 0:
+                raw_output = quote.get("outputAmount", "0")
+                if raw_output != "0":
+                    tokens_bought = int(raw_output) / 10**decimals
+                    print(f"   📊 Using quote: {tokens_bought:.6f} tokens")
+            
+            print(f"   📊 Final: {tokens_bought:.6f} tokens")
             
             return {
                 "success": True,
