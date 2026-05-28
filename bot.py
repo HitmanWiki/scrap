@@ -718,47 +718,59 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         
         tokens_bought = result.get('tokens_bought', 0)
         
-        # ALWAYS fetch actual balance from chain after buy
         if tokens_bought <= 0:
             print(f"   ⚠️ Fetching actual balance from wallet...")
             try:
-                await asyncio.sleep(8)  # Wait longer for confirmation
+                # Wait longer - 15 seconds for indexing
+                await asyncio.sleep(15)
                 
-                # Use direct HTTP call for reliability
                 import requests as req
-                mint_pubkey = Pubkey.from_string(ca)
-                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
                 
+                # Instead of guessing ATA, scan all token accounts
                 payload = {
                     "jsonrpc": "2.0",
                     "id": 1,
-                    "method": "getTokenAccountBalance",
-                    "params": [str(ata)]
+                    "method": "getTokenAccountsByOwner",
+                    "params": [
+                        str(wallet.pubkey()),
+                        {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                        {"encoding": "jsonParsed"}
+                    ]
                 }
                 
-                print(f"   Checking ATA: {str(ata)}")
-                resp = req.post(SOLANA_RPC, json=payload, timeout=10)
+                resp = req.post(SOLANA_RPC, json=payload, timeout=15)
                 data = resp.json()
-                print(f"   RPC Response: {data}")
                 
                 if 'result' in data and data['result']:
-                    val = data['result']
-                    if isinstance(val, dict):
-                        tokens_bought = float(val.get('value', {}).get('uiAmount', 0))
-                    print(f"   ✅ Actual balance: {tokens_bought}")
+                    for token in data['result'].get('value', []):
+                        info = token.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
+                        mint = info.get('mint', '')
+                        amount = info.get('tokenAmount', {}).get('uiAmount', 0)
                         
+                        if mint == ca and amount > 0:
+                            tokens_bought = amount
+                            print(f"   ✅ Found in wallet: {tokens_bought:.6f}")
+                            break
+                
+                if tokens_bought <= 0:
+                    print(f"   Still 0 after scan. Token might not have arrived yet.")
+                    
             except Exception as e:
                 print(f"   ⚠️ Balance error: {e}")
         
         # Save position
-        db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
         if tokens_bought > 0:
+            db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
             db.add_trade_history(user_id, ca, 'buy', tokens_bought, result.get('price', 0), result['txid'])
             if user_id not in bought_tokens:
                 bought_tokens[user_id] = set()
             bought_tokens[user_id].add(ca)
+            print(f"   ✅ Position saved: {tokens_bought:.6f}")
+        else:
+            # Save with TXID so it's tracked even with 0
+            db.add_position(user_id, ca, 0, result.get('price', 0), result['txid'])
+            print(f"   ⚠️ Saved with 0 balance - refresh positions later")
         
-        print(f"   ✅ Position saved: {tokens_bought:.6f} tokens")
         print(f"   🔗 https://solscan.io/tx/{result['txid']}")
 
 async def execute_buy_order(query):
