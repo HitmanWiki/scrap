@@ -301,7 +301,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Sync positions - properly extract token account address"""
+    """Sync positions - safely check token balances"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return {}
@@ -331,36 +331,38 @@ async def sync_positions_from_wallet(user_id: int):
                 
                 if tx_data.get('result'):
                     meta = tx_data['result'].get('meta', {})
-                    post_balances = meta.get('postTokenBalances', [])
-                    pre_balances = meta.get('preTokenBalances', [])
+                    post_balances = meta.get('postTokenBalances', []) or []
+                    pre_balances = meta.get('preTokenBalances', []) or []
                     
-                    # Find our token in post balances
                     for token in post_balances:
                         if token.get('mint') == mint:
-                            post_amt = float(token.get('uiTokenAmount', {}).get('uiAmount', 0))
+                            # Safe float conversion
+                            ui_data = token.get('uiTokenAmount') or {}
+                            raw_post = ui_data.get('uiAmount', 0)
+                            post_amt = float(raw_post) if raw_post is not None else 0
+                            
                             owner = token.get('owner', '')
                             
-                            # Check if wallet had this token before
+                            # Check pre balance
                             pre_amt = 0
                             for pre in pre_balances:
                                 if pre.get('mint') == mint and pre.get('owner') == owner:
-                                    pre_amt = float(pre.get('uiTokenAmount', {}).get('uiAmount', 0))
+                                    ui_pre = pre.get('uiTokenAmount') or {}
+                                    raw_pre = ui_pre.get('uiAmount', 0)
+                                    pre_amt = float(raw_pre) if raw_pre is not None else 0
                             
-                            # If wallet still has tokens (post > pre), token exists
                             if owner == wallet_addr and post_amt > 0:
-                                # The token exists in wallet now
                                 wallet_tokens[mint] = post_amt
-                                db.update_position_amount(pos['id'], post_amt)
+                                if abs(pos['amount'] - post_amt) > 0.0001:
+                                    db.update_position_amount(pos['id'], post_amt)
                                 print(f"   ✅ {mint[:8]}... = {post_amt:.4f}")
                             elif owner == wallet_addr and post_amt == 0 and pre_amt > 0:
-                                # Was sold
                                 db.close_position(pos['id'], 'sold')
                                 print(f"   🗑️ {mint[:8]}... sold")
                             break
             except Exception as e:
                 print(f"   ⚠️ TX check error for {mint[:8]}: {e}")
         
-        # For positions without TXID, skip them (they stay as-is)
         print(f"   ✅ Synced: {len(wallet_tokens)} tokens with balance")
         
     except Exception as e:
@@ -1438,7 +1440,7 @@ async def execute_sell_order(query, token_address, percentage):
     user = db.get_user(user_id)
     wallet = await get_user_wallet(user_id)
     
-    # Get ACTUAL balance from chain (not just from DB position)
+    # Get ACTUAL balance from chain first
     actual_balance = 0
     try:
         mint_pubkey = Pubkey.from_string(token_address)
@@ -1448,8 +1450,8 @@ async def execute_sell_order(query, token_address, percentage):
     except Exception as e:
         print(f"   ⚠️ Balance check error: {e}")
     
+    # Fallback to DB position amount
     if actual_balance <= 0:
-        # Try DB position as fallback
         positions = db.get_user_positions(user_id)
         position = next((p for p in positions if p['token_address'] == token_address), None)
         if position and position['amount'] > 0:
@@ -1481,40 +1483,92 @@ async def execute_sell_order(query, token_address, percentage):
     result = await sniper_service.execute_sell(wallet, token_address, sell_amount, slippage)
     
     if result['success']:
-        # Update position in DB
-        remaining = actual_balance - sell_amount
-        positions = db.get_user_positions(user_id)
-        position = next((p for p in positions if p['token_address'] == token_address), None)
-        
-        if position:
-            if remaining > 0.000001:
-                db.update_position_amount(position['id'], remaining)
-            else:
-                db.close_position(position['id'], result['txid'])
-        
-        # Record trade
+        txid = result['txid']
         sol_received = result.get('sol_received', 0)
-        db.add_trade_history(user_id, token_address, 'sell', sell_amount, sol_received, result['txid'])
         
-        # Success message
-        text = f"""
+        # VERIFY transaction succeeded on-chain before updating positions
+        tx_verified = False
+        try:
+            await asyncio.sleep(8)  # Wait for confirmation
+            
+            tx_check = sniper_service._rpc_call("getTransaction", [
+                txid,
+                {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+            ])
+            
+            if tx_check.get('result'):
+                meta = tx_check['result'].get('meta', {})
+                err = meta.get('err')
+                
+                if err is None:
+                    tx_verified = True
+                    print(f"   ✅ Sell verified on-chain")
+                    
+                    # Get actual SOL received from transaction
+                    pre_sol = 0
+                    post_sol = 0
+                    for bal in meta.get('preBalances', []):
+                        pre_sol += bal
+                    for bal in meta.get('postBalances', []):
+                        post_sol += bal
+                    if post_sol > pre_sol:
+                        sol_received = (post_sol - pre_sol) / 1e9
+                else:
+                    print(f"   ❌ Sell failed on-chain: {err}")
+        except Exception as e:
+            print(f"   ⚠️ Verification error: {e}")
+        
+        if tx_verified:
+            # Update position in DB
+            remaining = actual_balance - sell_amount
+            positions = db.get_user_positions(user_id)
+            position = next((p for p in positions if p['token_address'] == token_address), None)
+            
+            if position:
+                if remaining > 0.000001:
+                    db.update_position_amount(position['id'], remaining)
+                    print(f"   📊 Updated position: {remaining:.6f} remaining")
+                else:
+                    db.close_position(position['id'], txid)
+                    print(f"   🗑️ Position closed - fully sold")
+            
+            # Record trade
+            db.add_trade_history(user_id, token_address, 'sell', sell_amount, sol_received, txid)
+            
+            # Send notification
+            await send_sell_notification(user_id, token_address, sell_amount, sol_received, txid)
+            
+            text = f"""
 ✅ *Sold!*
 
 *Amount:* {sell_amount:,.2f}
 *SOL Received:* {sol_received:.4f} SOL
-*TX:* `{result['txid'][:20]}...`
+*TX:* `{txid[:20]}...`
 🔗 [View on Solscan]({result['explorer']})
 """
+        else:
+            # Transaction failed on-chain - DON'T update positions
+            text = f"""
+❌ *Sell Failed On-Chain*
+
+The transaction was sent but failed.
+Your tokens are still in your wallet.
+
+*TX:* `{txid[:20]}...`
+🔗 [View on Solscan]({result['explorer']})
+
+💡 Try:
+• Smaller amount (25% or 50%)
+• Higher slippage in Settings
+"""
+        
         await query.edit_message_text(
             text,
             reply_markup=get_main_keyboard(),
             parse_mode='Markdown',
             disable_web_page_preview=True
         )
-        
-        # SEND SELL NOTIFICATION
-        await send_sell_notification(user_id, token_address, sell_amount, sol_received, result['txid'])
-        
+    
     else:
         error_msg = result.get('error', 'Unknown error')
         text = f"""
