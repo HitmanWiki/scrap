@@ -787,3 +787,19 @@ class Database:
         except Exception as e:
             print(f"❌ Error updating position: {e}")
             return False
+    def get_user_position_by_token(self, user_id: int, token_address: str) -> Optional[Dict]:
+        try:
+            with self.lock:
+                conn = self.get_connection()
+                cursor = self.get_cursor(conn)
+                ph = self.placeholder()
+                cursor.execute(f'''
+                    SELECT * FROM positions 
+                    WHERE user_id = {ph} AND token_address = {ph} AND is_active = true
+                ''', (user_id, token_address))
+                row = cursor.fetchone()
+                conn.close()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"❌ Error getting position: {e}")
+            return None

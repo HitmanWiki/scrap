@@ -207,12 +207,13 @@ def get_main_keyboard():
         [InlineKeyboardButton("📈 Buy Token", callback_data="buy"),
          InlineKeyboardButton("📉 Sell Token", callback_data="sell")],
         [InlineKeyboardButton("📊 Positions", callback_data="positions"),
-         InlineKeyboardButton("📋 Channels", callback_data="channels")],
-        [InlineKeyboardButton("➕ Add Channel", callback_data="add_channel"),
-         InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-        [InlineKeyboardButton("🔑 Export Key", callback_data="export_key"),
-         InlineKeyboardButton("🔐 TG Auth", callback_data="telegram_auth_setup")],
-        [InlineKeyboardButton("⚡ Actions", callback_data="actions")],
+         InlineKeyboardButton("🔄 Refresh Pos", callback_data="refresh_positions")],  # New button
+        [InlineKeyboardButton("📋 Channels", callback_data="channels"),
+         InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
+         InlineKeyboardButton("🔑 Export Key", callback_data="export_key")],
+        [InlineKeyboardButton("🔐 TG Auth", callback_data="telegram_auth_setup"),
+         InlineKeyboardButton("⚡ Actions", callback_data="actions")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -312,14 +313,15 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
     
     processing_tokens[user_id].discard(ca)
     
+    # In process_channel_message, after successful buy:
     if result['success']:
         db.increment_daily_trades(user_id)
         
         tokens_bought = result.get('tokens_bought', 0)
         
-        # Try to get actual token amount if 0
+        # If still 0, try one more time with a longer delay
         if tokens_bought <= 0:
-            await asyncio.sleep(3)
+            await asyncio.sleep(8)  # Wait longer for confirmation
             try:
                 mint_pubkey = Pubkey.from_string(ca)
                 ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
@@ -328,19 +330,19 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
                     val = result2['result']
                     if isinstance(val, dict):
                         tokens_bought = float(val.get('value', {}).get('uiAmount', 0))
+                        print(f"   📊 Retry balance: {tokens_bought} tokens")
             except:
                 pass
         
-        if tokens_bought > 0:
-            db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
+        # Always save position even if amount is 0 (it will update later)
+        if tokens_bought > 0 or True:  # Save even if 0, will update later
+            position_id = db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
             if user_id not in bought_tokens:
                 bought_tokens[user_id] = set()
             bought_tokens[user_id].add(ca)
-            print(f"   ✅ Bought {tokens_bought:.6f} tokens")
-        
-        print(f"   🔗 https://solscan.io/tx/{result['txid']}")
-    else:
-        print(f"   ❌ Buy failed: {result.get('error', 'Unknown error')}")
+            print(f"   ✅ Position saved: {tokens_bought:.6f} tokens")
+        else:
+            print(f"   ⚠️ Could not determine token amount, but tx was sent")
 
 async def poll_channel_messages(channel_name: str):
     """Poll a channel for new messages"""
@@ -494,6 +496,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "balance": return await show_balance(query)
     elif action == "telegram_auth_setup": return await telegram_auth_setup(query)
     elif action == "actions": return await show_actions(query)
+    elif action == "refresh_positions":return await refresh_positions(query)
     elif action == "back_main": return await back_to_main(query)
     
     # Settings
@@ -711,6 +714,44 @@ async def remove_channel_menu(query):
     keyboard.append([InlineKeyboardButton("« Back", callback_data="channels")])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
+async def refresh_positions(query):
+    user_id = query.from_user.id
+    wallet = await get_user_wallet(user_id)
+    
+    await query.edit_message_text("🔄 *Refreshing positions...*", parse_mode='Markdown')
+    
+    try:
+        # Get all token accounts
+        result = sniper_service._rpc_call("getTokenAccountsByOwner", [
+            str(wallet.pubkey()),
+            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+            {"encoding": "jsonParsed"}
+        ])
+        
+        updated = 0
+        if 'result' in result and result['result']:
+            token_accounts = result['result'].get('value', [])
+            for acc in token_accounts:
+                parsed = acc.get('account', {}).get('data', {}).get('parsed', {})
+                info = parsed.get('info', {})
+                amount = info.get('tokenAmount', {}).get('uiAmount', 0)
+                mint = info.get('mint', '')
+                
+                if amount > 0 and mint != "So11111111111111111111111111111111111111112":
+                    existing = db.get_user_position_by_token(user_id, mint)
+                    if existing:
+                        db.update_position_amount(existing['id'], amount)
+                        updated += 1
+                        print(f"   ✅ Updated {mint[:8]}... to {amount:.6f}")
+                    else:
+                        db.add_position(user_id, mint, amount, 0, "refresh")
+                        updated += 1
+        
+        await query.edit_message_text(f"✅ *Positions Refreshed!*\n\nUpdated {updated} positions.", reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    except Exception as e:
+        await query.edit_message_text(f"❌ Refresh failed: {str(e)}", reply_markup=get_main_keyboard())
+    
+    return SELECTING_ACTION
 
 async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_name = update.message.text.strip()
@@ -832,30 +873,110 @@ async def execute_buy_order(query):
     user_id = query.from_user.id
     user = db.get_user(user_id)
     wallet = await get_user_wallet(user_id)
+    
+    # Extract token address from the message
     token_match = re.search(r'`([1-9A-HJ-NP-Za-km-z]{32,44})`', query.message.text)
     if not token_match:
         await query.edit_message_text("❌ Token not found!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
+    
     token_address = token_match.group(1)
+    
+    # Check if already holding
     if await already_holding(user_id, wallet.pubkey(), token_address):
         await query.edit_message_text("⏭️ Already holding!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
+    
     buy_amount = user.get('default_buy_amount', DEFAULT_BUY_AMOUNT)
     slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
+    
     await query.edit_message_text("⏳ *Executing buy...*", parse_mode='Markdown')
+    
+    # Execute the buy
     result = await sniper_service.execute_buy(wallet, token_address, buy_amount, slippage)
+    
     if result['success']:
         db.increment_daily_trades(user_id)
-        db.add_position(user_id, token_address, result['tokens_bought'], result.get('price', 0), result['txid'])
+        
+        tokens_bought = result.get('tokens_bought', 0)
+        
+        # If tokens_bought is 0, try to fetch from blockchain
+        if tokens_bought <= 0:
+            print(f"   ⚠️ Tokens bought is 0, fetching from blockchain...")
+            await asyncio.sleep(5)  # Wait for confirmation
+            
+            try:
+                from solders.pubkey import Pubkey
+                from solders.token.associated import get_associated_token_address
+                
+                mint_pubkey = Pubkey.from_string(token_address)
+                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+                
+                # Try multiple times
+                for attempt in range(3):
+                    try:
+                        balance_result = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
+                        if 'result' in balance_result and balance_result['result']:
+                            val = balance_result['result']
+                            if isinstance(val, dict):
+                                ui_amount = val.get('value', {}).get('uiAmount', 0)
+                                if ui_amount > 0:
+                                    tokens_bought = ui_amount
+                                    print(f"   ✅ Retrieved balance: {tokens_bought} tokens")
+                                    break
+                    except:
+                        pass
+                    await asyncio.sleep(2)
+            except Exception as e:
+                print(f"   ⚠️ Balance fetch error: {e}")
+        
+        # If still 0, try getting from transaction
+        if tokens_bought <= 0:
+            try:
+                tx_detail = sniper_service._rpc_call("getTransaction", [
+                    result['txid'],
+                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                ])
+                
+                if 'result' in tx_detail and tx_detail['result']:
+                    meta = tx_detail['result'].get('meta', {})
+                    post_balances = meta.get('postTokenBalances', [])
+                    pre_balances = meta.get('preTokenBalances', [])
+                    
+                    wallet_str = str(wallet.pubkey())
+                    
+                    for post in post_balances:
+                        if post.get('mint') == token_address:
+                            post_amount = float(post.get('uiTokenAmount', {}).get('uiAmount', 0))
+                            pre_amount = 0
+                            for pre in pre_balances:
+                                if pre.get('mint') == token_address and pre.get('owner') == wallet_str:
+                                    pre_amount = float(pre.get('uiTokenAmount', {}).get('uiAmount', 0))
+                            tokens_bought = post_amount - pre_amount
+                            if tokens_bought > 0:
+                                print(f"   ✅ From tx: {tokens_bought} tokens")
+                            break
+            except Exception as e:
+                print(f"   ⚠️ Transaction parse error: {e}")
+        
+        # Save position (even if 0, it will update later)
+        position_id = db.add_position(user_id, token_address, tokens_bought, result.get('price', 0), result['txid'])
+        
         if user_id not in bought_tokens:
             bought_tokens[user_id] = set()
         bought_tokens[user_id].add(token_address)
-        text = f"✅ *Bought!*\n\nTX: `{result['txid'][:20]}...`\nTokens: {result['tokens_bought']:.4f}"
+        
+        # Show appropriate message
+        if tokens_bought > 0:
+            text = f"✅ *Bought!*\n\n📦 Token: `{token_address[:8]}...`\n📊 Amount: {tokens_bought:.6f}\n🔗 [View TX](https://solscan.io/tx/{result['txid']})"
+        else:
+            text = f"✅ *Transaction Sent!*\n\n📦 Token: `{token_address[:8]}...`\n🔗 [View TX](https://solscan.io/tx/{result['txid']})\n\n⚠️ Check Solscan for exact amount"
+        
     else:
-        text = f"❌ *Failed*\n{result['error']}"
-    await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+        text = f"❌ *Buy Failed*\n\n{result['error']}"
+    
+    await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True)
     return SELECTING_ACTION
-
 async def initiate_sell(query):
     user_id = query.from_user.id
     positions = db.get_user_positions(user_id)
