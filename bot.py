@@ -301,54 +301,84 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Read ALL tokens from wallet and create/update positions"""
+    """Read ALL tokens from wallet using Helius enhanced API"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
-        return
+        return {}
     
     wallet_addr = str(wallet.pubkey())
+    wallet_tokens = {}
     
     try:
         import requests as req
         
-        # Use Helius API to get all token accounts
-        rpc_url = SOLANA_RPC
+        # Method 1: Use Helius getAssetsByOwner (more reliable)
+        api_key = os.getenv('HELIUS_API_KEY', '')
+        if api_key:
+            helius_url = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
+        else:
+            helius_url = SOLANA_RPC
         
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                wallet_addr,
-                {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-                {"encoding": "jsonParsed"}
-            ]
-        }
-        
-        resp = req.post(rpc_url, json=payload, timeout=15)
-        data = resp.json()
-        
-        print(f"   RPC Response: {str(data.keys()) if data else 'None'}")
-        
-        if 'result' in data and data['result']:
-            tokens = data['result'].get('value', [])
-            print(f"   Found {len(tokens)} token accounts in wallet")
+        # Try getTokenAccountsByOwner with different commitment
+        for commitment in ["confirmed", "finalized", "processed"]:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    wallet_addr,
+                    {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                    {"encoding": "jsonParsed", "commitment": commitment}
+                ]
+            }
             
-            wallet_tokens = {}
+            resp = req.post(helius_url, json=payload, timeout=15)
+            data = resp.json()
             
-            for t in tokens:
-                info = t.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
-                mint = info.get('mint', '')
-                amount = info.get('tokenAmount', {}).get('uiAmount', 0)
+            if 'result' in data and data['result']:
+                tokens = data['result'].get('value', [])
+                print(f"   Found {len(tokens)} tokens with {commitment}")
                 
-                if amount > 0:
-                    wallet_tokens[mint] = amount
-                    print(f"   Token: {mint[:8]}... = {amount:.4f}")
+                if len(tokens) > 0:
+                    for t in tokens:
+                        info = t.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
+                        mint = info.get('mint', '')
+                        amount = info.get('tokenAmount', {}).get('uiAmount', 0)
+                        if amount > 0:
+                            wallet_tokens[mint] = amount
+                    break
+        
+        # Method 2: If still 0, check each DB position's ATA directly
+        if not wallet_tokens:
+            print(f"   Trying direct ATA checks...")
+            positions = db.get_user_positions(user_id)
             
-            # Get existing positions
+            for pos in positions:
+                mint = pos['token_address']
+                try:
+                    mint_pubkey = Pubkey.from_string(mint)
+                    ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+                    
+                    bal_payload = {
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "getTokenAccountBalance",
+                        "params": [str(ata)]
+                    }
+                    bal_resp = req.post(helius_url, json=bal_payload, timeout=10)
+                    bal_data = bal_resp.json()
+                    
+                    if 'result' in bal_data and bal_data['result']:
+                        val = bal_data['result']
+                        amount = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0))) if isinstance(val, dict) else float(val)
+                        if amount > 0:
+                            wallet_tokens[mint] = amount
+                            print(f"   ✅ {mint[:8]}... = {amount:.4f}")
+                except Exception as e:
+                    print(f"   ⚠️ {mint[:8]}... error: {e}")
+        
+        # Update DB
+        if wallet_tokens:
             existing_positions = db.get_user_positions(user_id)
-            
-            # Update or create positions
             for mint, amount in wallet_tokens.items():
                 existing = next((p for p in existing_positions if p['token_address'] == mint), None)
                 if existing:
@@ -357,35 +387,12 @@ async def sync_positions_from_wallet(user_id: int):
                 else:
                     db.add_position(user_id, mint, amount, 0, 'wallet-scan')
             
-            # Remove positions not in wallet
-            for pos in existing_positions:
-                if pos['token_address'] not in wallet_tokens:
-                    db.close_position(pos['id'], 'sold')
-            
             print(f"   ✅ Synced: {len(wallet_tokens)} tokens")
-            return wallet_tokens
-            
-        else:
-            print(f"   ⚠️ No result in RPC response. Error: {data.get('error', 'None')}")
-            
-            # Fallback: Try alternative RPC method
-            print(f"   Trying alternative method...")
-            
-            # Try getting SOL balance first to verify RPC works
-            sol_test = req.post(rpc_url, json={
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getBalance",
-                "params": [wallet_addr]
-            }, timeout=10)
-            sol_data = sol_test.json()
-            print(f"   SOL balance test: {sol_data}")
-            
+        
     except Exception as e:
-        print(f"   ⚠️ Wallet sync error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"   ⚠️ Sync error: {e}")
     
-    return {}
+    return wallet_tokens
 # ============================================
 # ADDRESS VALIDATION & EXTRACTION
 # ============================================
