@@ -163,141 +163,91 @@ class SniperService:
             return 0
     
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Sell - EXACT same approach as execute_buy but reversed mints"""
+        """Sell via PumpSwap AMM (what Phantom uses for pump tokens)"""
         try:
+            from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+            import base64
+            
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
-            print(f"   💱 Selling {amount_tokens:,.2f} tokens ({amount_raw} raw)...")
+            print(f"   💱 PumpSwap sell: {amount_tokens:,.2f} tokens...")
             
-            # Try with increasing slippage
-            for slip in [slippage_bps, 3000, 5000, 10000, 50000]:
-                # Step 1: Get quote (same as buy)
-                quote_url = "https://lite-api.jup.ag/swap/v1/quote"
-                params = {
-                    "inputMint": token_mint,
-                    "outputMint": "So11111111111111111111111111111111111111112",
-                    "amount": amount_raw,
-                    "slippageBps": slip,
-                }
-                
-                print(f"   Getting quote (slippage {slip/100}%)...")
-                resp = requests.get(quote_url, params=params, timeout=10)
-                
-                if resp.status_code != 200:
-                    continue
-                
-                quote = resp.json()
-                out = quote.get("outputAmount", "0")
-                
-                if out == "0" or not out:
-                    print(f"   ⚠️ Zero output with slippage {slip}")
-                    continue
-                
-                expected_sol = int(out) / 1e9
-                print(f"   ✅ Route: {expected_sol:.6f} SOL")
-                
-                # Step 2: Build swap (same as buy)
-                swap_url = "https://lite-api.jup.ag/swap/v1/swap"
-                payload = {
-                    "quoteResponse": quote,
-                    "userPublicKey": str(wallet.pubkey()),
-                    "wrapAndUnwrapSol": True,
-                    "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": "auto"
-                }
-                
-                print(f"   Building transaction...")
-                resp = requests.post(swap_url, json=payload, timeout=10)
-                
-                if resp.status_code != 200:
-                    continue
-                
-                swap_data = resp.json()
-                
-                if "swapTransaction" not in swap_data:
-                    continue
-                
-                # Step 3: Sign and send (same as buy)
-                tx_bytes = base64.b64decode(swap_data["swapTransaction"])
-                raw_tx = VersionedTransaction.from_bytes(tx_bytes)
-                msg_bytes = message.to_bytes_versioned(raw_tx.message)
-                sig = wallet.sign_message(msg_bytes)
-                signed_tx = VersionedTransaction.populate(raw_tx.message, [sig])
-                
-                print(f"   Sending transaction...")
-                txid = self.client.send_raw_transaction(bytes(signed_tx))
-                
-                print(f"   ✅ SELL TXID: {txid}")
-                
-                return {
-                    "success": True,
-                    "txid": txid,
-                    "sol_received": expected_sol,
-                    "explorer": f"https://solscan.io/tx/{txid}"
-                }
+            # PumpSwap AMM program
+            PUMP_SWAP_PROGRAM = Pubkey.from_string("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwRh52yfVVHy")
             
-            # If all slippage values fail, try smaller amounts
-            for pct in [0.5, 0.25, 0.1]:
-                test_raw = int(amount_raw * pct)
-                if test_raw < 1000:
-                    continue
-                
-                print(f"   Trying {pct*100:.0f}% ({test_raw} raw)...")
-                
-                quote_url = "https://lite-api.jup.ag/swap/v1/quote"
-                params = {
-                    "inputMint": token_mint,
-                    "outputMint": "So11111111111111111111111111111111111111112",
-                    "amount": test_raw,
-                    "slippageBps": 50000,  # 500% slippage
-                }
-                
-                resp = requests.get(quote_url, params=params, timeout=10)
-                if resp.status_code != 200:
-                    continue
-                
-                quote = resp.json()
-                if quote.get("outputAmount", "0") == "0":
-                    continue
-                
-                swap_url = "https://lite-api.jup.ag/swap/v1/swap"
-                payload = {
-                    "quoteResponse": quote,
-                    "userPublicKey": str(wallet.pubkey()),
-                    "wrapAndUnwrapSol": True,
-                    "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": "auto"
-                }
-                
-                resp = requests.post(swap_url, json=payload, timeout=10)
-                if resp.status_code != 200:
-                    continue
-                
-                swap_data = resp.json()
-                if "swapTransaction" not in swap_data:
-                    continue
-                
-                tx_bytes = base64.b64decode(swap_data["swapTransaction"])
-                raw_tx = VersionedTransaction.from_bytes(tx_bytes)
-                msg_bytes = message.to_bytes_versioned(raw_tx.message)
-                sig = wallet.sign_message(msg_bytes)
-                signed_tx = VersionedTransaction.populate(raw_tx.message, [sig])
-                
-                txid = self.client.send_raw_transaction(bytes(signed_tx))
-                expected_sol = int(quote.get("outputAmount", "0")) / 1e9
-                
-                print(f"   ✅ SELL TXID: {txid}")
-                return {
-                    "success": True, "txid": txid,
-                    "sol_received": expected_sol,
-                    "explorer": f"https://solscan.io/tx/{txid}"
-                }
+            mint = Pubkey.from_string(token_mint)
+            user_ata = get_associated_token_address(wallet.pubkey(), mint)
             
-            return {"success": False, "error": "No routes found - try selling on jup.ag manually"}
+            # Derive pool address
+            SOL_MINT = Pubkey.from_string("So11111111111111111111111111111111111111112")
+            
+            # Pool seeds for PumpSwap
+            pool_seeds = [b"pool", bytes(mint), bytes(SOL_MINT)]
+            pool_address, _ = Pubkey.find_program_address(pool_seeds, PUMP_SWAP_PROGRAM)
+            
+            # Token vault for the pool
+            token_vault_seeds = [b"token_vault", bytes(pool_address), bytes(mint)]
+            token_vault, _ = Pubkey.find_program_address(token_vault_seeds, PUMP_SWAP_PROGRAM)
+            
+            # SOL vault for the pool
+            sol_vault_seeds = [b"spl_vault", bytes(pool_address), bytes(SOL_MINT)]
+            sol_vault, _ = Pubkey.find_program_address(sol_vault_seeds, PUMP_SWAP_PROGRAM)
+            
+            # Build swap instruction
+            SWAP_DISCRIMINATOR = 0x2a7b5c2e1f3d4a6b  # PumpSwap swap discriminator
+            
+            data = bytearray()
+            data.extend(SWAP_DISCRIMINATOR.to_bytes(8, 'little'))
+            data.extend(amount_raw.to_bytes(8, 'little'))
+            data.extend(int(0).to_bytes(8, 'little'))  # min_output
+            
+            swap_ix = Instruction(
+                program_id=PUMP_SWAP_PROGRAM,
+                accounts=[
+                    AccountMeta(pool_address, False, True),
+                    AccountMeta(token_vault, False, True),
+                    AccountMeta(sol_vault, False, True),
+                    AccountMeta(user_ata, False, True),
+                    AccountMeta(wallet.pubkey(), True, True),
+                    AccountMeta(SYSTEM_PROGRAM_ID, False, False),
+                ],
+                data=bytes(data)
+            )
+            
+            instructions = [
+                set_compute_unit_limit(200000),
+                set_compute_unit_price(100000),
+                swap_ix,
+            ]
+            
+            blockhash_str = self.client.get_latest_blockhash()
+            blockhash = Hash.from_string(blockhash_str)
+            
+            msg = MessageV0.try_compile(
+                payer=wallet.pubkey(),
+                instructions=instructions,
+                address_lookup_table_accounts=[],
+                recent_blockhash=blockhash,
+            )
+            tx = VersionedTransaction(msg, [wallet])
+            
+            tx_base64 = base64.b64encode(bytes(tx)).decode()
+            result = self._rpc_call("sendTransaction", [
+                tx_base64,
+                {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}
+            ])
+            
+            if 'error' in result:
+                return {"success": False, "error": str(result['error'])}
+            
+            txid = result.get('result', '')
+            print(f"   ✅ PumpSwap SELL: {txid}")
+            
+            return {"success": True, "txid": txid, "sol_received": 0, "explorer": f"https://solscan.io/tx/{txid}"}
             
         except Exception as e:
-            print(f"   ❌ Sell error: {e}")
+            print(f"   ❌ PumpSwap error: {e}")
             return {"success": False, "error": str(e)}
     # ============================================
     # BUY METHOD
