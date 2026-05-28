@@ -773,9 +773,17 @@ async def telegram_auth_setup(query):
     user_id = query.from_user.id
     user = db.get_user(user_id)
     status = "✅ Configured" if user.get('telegram_api_id') else "❌ Not configured"
-    text = f"🔐 *Telegram Auth*\nStatus: {status}\n\nRequired for private channels.\nGet API credentials at my.telegram.org"
+    text = f"""
+🔐 *Telegram Auth*
+
+Status: {status}
+
+⚠️ Private channel monitoring is only available on local deployment.
+
+📋 *Public channels* work automatically on Heroku!
+"""
     keyboard = [
-        [InlineKeyboardButton("🔄 Setup", callback_data="start_auth"), InlineKeyboardButton("🔌 Connect", callback_data="connect_session")],
+        [InlineKeyboardButton("🔄 Setup Credentials", callback_data="start_auth")],
         [InlineKeyboardButton("« Back", callback_data="back_main")]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
