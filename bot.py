@@ -1195,29 +1195,35 @@ async def execute_sell_order(query, token_address, percentage):
     user = db.get_user(user_id)
     wallet = await get_user_wallet(user_id)
     
-    # Get ACTUAL balance from chain
+    # Get ACTUAL balance from chain (not just from DB position)
     actual_balance = 0
     try:
         mint_pubkey = Pubkey.from_string(token_address)
         ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-        result = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
-        if 'result' in result and result['result']:
-            val = result['result']
-            if isinstance(val, dict):
-                actual_balance = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0)))
-            else:
-                actual_balance = float(val) if val else 0
-    except:
-        pass
+        actual_balance = sniper_service.client.get_token_balance(str(ata))
+        print(f"   📊 Actual balance: {actual_balance:.6f}")
+    except Exception as e:
+        print(f"   ⚠️ Balance check error: {e}")
     
     if actual_balance <= 0:
-        await query.edit_message_text("❌ No tokens to sell!", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
+        # Try DB position as fallback
+        positions = db.get_user_positions(user_id)
+        position = next((p for p in positions if p['token_address'] == token_address), None)
+        if position and position['amount'] > 0:
+            actual_balance = position['amount']
+            print(f"   📊 Using DB balance: {actual_balance:.6f}")
+        else:
+            await query.edit_message_text(
+                "❌ *No tokens to sell!*\n\nCheck on Solscan if you have this token.",
+                reply_markup=get_main_keyboard(),
+                parse_mode='Markdown'
+            )
+            return SELECTING_ACTION
     
     sell_amount = actual_balance * (percentage / 100)
     slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
     
-    # Get token price before selling
+    # Get token price for display
     token_price = await solana_service.get_token_price(token_address)
     estimated_value = sell_amount * token_price if token_price else 0
     
@@ -1236,23 +1242,18 @@ async def execute_sell_order(query, token_address, percentage):
         remaining = actual_balance - sell_amount
         positions = db.get_user_positions(user_id)
         position = next((p for p in positions if p['token_address'] == token_address), None)
+        
         if position:
-            if remaining > 0:
+            if remaining > 0.000001:
                 db.update_position_amount(position['id'], remaining)
             else:
                 db.close_position(position['id'], result['txid'])
         
         # Record trade
-        db.add_trade_history(
-            user_id, token_address, 'sell', 
-            sell_amount, 
-            result.get('sol_received', 0), 
-            result['txid']
-        )
-        
         sol_received = result.get('sol_received', 0)
+        db.add_trade_history(user_id, token_address, 'sell', sell_amount, sol_received, result['txid'])
         
-        # Build success message
+        # Success message
         text = f"""
 ✅ *Sold!*
 
@@ -1261,22 +1262,15 @@ async def execute_sell_order(query, token_address, percentage):
 *TX:* `{result['txid'][:20]}...`
 🔗 [View on Solscan]({result['explorer']})
 """
-        
         await query.edit_message_text(
-            text, 
-            reply_markup=get_main_keyboard(), 
+            text,
+            reply_markup=get_main_keyboard(),
             parse_mode='Markdown',
             disable_web_page_preview=True
         )
         
         # SEND SELL NOTIFICATION
-        await send_sell_notification(
-            user_id,
-            token_address,
-            sell_amount,
-            sol_received,
-            result['txid']
-        )
+        await send_sell_notification(user_id, token_address, sell_amount, sol_received, result['txid'])
         
     else:
         error_msg = result.get('error', 'Unknown error')
@@ -1285,12 +1279,17 @@ async def execute_sell_order(query, token_address, percentage):
 
 *Error:* {error_msg[:200]}
 
-Try:
+💡 *Try:*
 • Smaller amount (25% or 50%)
 • Higher slippage in Settings
-• Check liquidity on Jupiter
+• Check liquidity on [Jupiter](https://jup.ag)
 """
-        await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+        await query.edit_message_text(
+            text,
+            reply_markup=get_main_keyboard(),
+            parse_mode='Markdown',
+            disable_web_page_preview=True
+        )
     
     return SELECTING_ACTION
 
@@ -1734,7 +1733,66 @@ def run_monitor_in_thread():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_run())
+def start_health_server():
+    """Simple HTTP server for Heroku health checks"""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Bot is running!')
+        def log_message(self, format, *args):
+            pass  # Suppress logs
+    
+    port = int(os.environ.get('PORT', 5000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    print(f"🏥 Health server on port {port}")
+    server.serve_forever()
+async def start_auth_process(query):
+    """Start Telegram auth setup"""
+    await query.edit_message_text(
+        "🔐 *Step 1/3*\n\nEnter your *API ID* (from my.telegram.org):\n\nType *cancel* to abort.",
+        reply_markup=get_back_keyboard(),
+        parse_mode='Markdown'
+    )
+    return ENTER_API_ID
+async def handle_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.lower() == 'cancel':
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    try:
+        context.user_data['api_id'] = int(text)
+        await update.message.reply_text("🔐 *Step 2/3*\n\nEnter your *API Hash*:", reply_markup=get_back_keyboard(), parse_mode='Markdown')
+        return ENTER_API_HASH
+    except:
+        await update.message.reply_text("❌ Invalid number!", reply_markup=get_back_keyboard())
+        return ENTER_API_ID
 
+async def handle_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.lower() == 'cancel':
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    context.user_data['api_hash'] = text
+    await update.message.reply_text("🔐 *Step 3/3*\n\nEnter your *Phone* (+1234567890):", reply_markup=get_back_keyboard(), parse_mode='Markdown')
+    return ENTER_PHONE
+
+async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text.strip()
+    user_id = update.effective_user.id
+    if phone.lower() == 'cancel':
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    db.update_user_settings(user_id, 
+        telegram_api_id=context.user_data.get('api_id'),
+        telegram_api_hash=context.user_data.get('api_hash'),
+        telegram_phone=phone
+    )
+    await update.message.reply_text("✅ Auth saved!", reply_markup=get_main_keyboard())
+    return SELECTING_ACTION
 # ============================================
 # SETTINGS INPUT HANDLER
 # ============================================
@@ -1775,16 +1833,27 @@ def main():
     
     db.initialize()
     
+    global channel_queue, application
+    channel_queue = asyncio.Queue()
+    
     import threading
     import time
     
-    # Monitor thread
+    # CREATE APPLICATION FIRST so notifications work in monitor thread
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Health check server
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    
+    # Monitor thread (application is now available)
     monitor_thread = threading.Thread(target=run_monitor_in_thread, daemon=True)
     monitor_thread.start()
     
     time.sleep(3)
     
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Add handlers
+    application.add_handler(CallbackQueryHandler(start_auth_process, pattern="^start_auth$"))
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
