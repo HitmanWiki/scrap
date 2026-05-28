@@ -1398,7 +1398,7 @@ async def initiate_sell(query):
     text += f"✅ *{len(active_positions)} tokens found in wallet*"
     
     await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), 
-                             parse_mode='Markdown', disable_web_page_preview=True)
+                             parse_mode='Markdown')
     return SELECTING_ACTION
 
 async def confirm_sell_position(query, token_address):
@@ -1546,15 +1546,21 @@ async def sell_all_positions(query):
     await query.edit_message_text(f"✅ Sold {success}/{len(positions)}", reply_markup=get_main_keyboard())
     return SELECTING_ACTION
 async def safe_edit_message(query, text, reply_markup=None, parse_mode=None):
-    """Safely edit message, ignoring 'Message not modified' error"""
+    """Safely edit a message, send new if edit fails"""
     try:
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        await query.edit_message_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
     except Exception as e:
-        if "Message is not modified" in str(e):
-            # Just ignore this error
-            pass
-        else:
-            print(f"❌ Edit error: {e}")
+        # If edit fails (message not modified or too old), send new
+        if "not modified" not in str(e).lower():
+            await query.message.reply_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
 
 async def show_positions(query):
     user_id = query.from_user.id
@@ -1671,7 +1677,7 @@ async def show_positions(query):
     ]
     
     await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), 
-                             parse_mode='Markdown', disable_web_page_preview=True)
+                             parse_mode='Markdown')
     return SELECTING_ACTION
 
 async def show_settings(query):
