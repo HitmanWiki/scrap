@@ -348,19 +348,21 @@ class Database:
             return None
     
     def update_user_settings(self, user_id: int, **kwargs) -> bool:
+        """Update user settings with proper boolean casting for PostgreSQL"""
         try:
             with self.lock:
                 conn = self.get_connection()
                 cursor = self.get_cursor(conn)
-                ph = self.placeholder()
                 
                 user_fields = ['default_buy_amount', 'default_slippage', 'max_daily_trades',
-                              'telegram_api_id', 'telegram_api_hash', 'telegram_phone', 
-                              'telegram_session', 'public_key']
+                            'telegram_api_id', 'telegram_api_hash', 'telegram_phone', 
+                            'telegram_session', 'public_key']
                 
                 settings_fields = ['auto_snipe', 'auto_sell_enabled', 'take_profit_percent',
-                                  'target_mc', 'stop_loss_percent', 'max_slippage',
-                                  'buy_gas_fee', 'sell_gas_fee', 'notifications_enabled']
+                                'target_mc', 'stop_loss_percent', 'max_slippage',
+                                'buy_gas_fee', 'sell_gas_fee', 'notifications_enabled']
+                
+                boolean_fields = ['auto_snipe', 'auto_sell_enabled', 'notifications_enabled']
                 
                 user_updates = []
                 user_values = []
@@ -369,22 +371,42 @@ class Database:
                 
                 for key, value in kwargs.items():
                     if key in user_fields:
-                        user_updates.append(f"{key} = {ph}")
+                        user_updates.append(f"{key} = {self.placeholder()}")
                         user_values.append(value)
                     elif key in settings_fields:
-                        settings_updates.append(f"{key} = {ph}")
-                        settings_values.append(value)
+                        if key in boolean_fields:
+                            # Cast boolean for PostgreSQL
+                            if self.db_type == 'postgres':
+                                bool_val = 'TRUE' if value else 'FALSE'
+                                settings_updates.append(f"{key} = {bool_val}")
+                            else:
+                                settings_updates.append(f"{key} = {self.placeholder()}")
+                                settings_values.append(1 if value else 0)
+                        else:
+                            settings_updates.append(f"{key} = {self.placeholder()}")
+                            settings_values.append(value)
                 
+                # Update users table
                 if user_updates:
+                    user_updates.append("updated_at = CURRENT_TIMESTAMP")
                     user_values.append(user_id)
-                    query = f"UPDATE users SET {', '.join(user_updates)}, updated_at = CURRENT_TIMESTAMP WHERE user_id = {ph}"
+                    query = f"UPDATE users SET {', '.join(user_updates)} WHERE user_id = {self.placeholder()}"
                     cursor.execute(query, user_values)
                 
+                # Update settings table
                 if settings_updates:
-                    cursor.execute(f'INSERT INTO user_settings (user_id) VALUES ({ph}) ON CONFLICT (user_id) DO NOTHING', (user_id,))
-                    settings_values.append(user_id)
-                    query = f"UPDATE user_settings SET {', '.join(settings_updates)}, updated_at = CURRENT_TIMESTAMP WHERE user_id = {ph}"
-                    cursor.execute(query, settings_values)
+                    cursor.execute(f'INSERT INTO user_settings (user_id) VALUES ({self.placeholder()}) ON CONFLICT (user_id) DO NOTHING', (user_id,))
+                    
+                    if self.db_type == 'postgres':
+                        # For PostgreSQL, build query with boolean values directly
+                        set_clause = ', '.join(settings_updates)
+                        query = f"UPDATE user_settings SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE user_id = {self.placeholder()}"
+                        cursor.execute(query, (user_id,))
+                    else:
+                        settings_updates.append("updated_at = CURRENT_TIMESTAMP")
+                        settings_values.append(user_id)
+                        query = f"UPDATE user_settings SET {', '.join(settings_updates)} WHERE user_id = {self.placeholder()}"
+                        cursor.execute(query, settings_values)
                 
                 conn.commit()
                 conn.close()
