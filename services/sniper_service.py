@@ -34,7 +34,6 @@ class SniperService:
     
     def _send_raw_transaction(self, signed_tx_bytes: bytes) -> str:
         """Send raw transaction via RPC - matching single-user bot"""
-        # Encode as base58 (matching solana-py behavior)
         tx_base58 = b58.b58encode(signed_tx_bytes).decode()
         
         result = self._rpc_call("sendTransaction", [
@@ -55,17 +54,8 @@ class SniperService:
             raise Exception(f"Unexpected RPC response: {result}")
     
     async def get_token_decimals(self, token_mint: str) -> int:
-        """Fetch token decimals"""
-        try:
-            url = f"https://tokens.jup.ag/token/{token_mint}"
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                if 'decimals' in data:
-                    return int(data['decimals'])
-        except:
-            pass
-        
+        """Fetch token decimals - try on-chain first, then Jupiter"""
+        # Try on-chain first (most reliable)
         try:
             result = self._rpc_call("getAccountInfo", [token_mint, {"encoding": "jsonParsed"}])
             if 'result' in result and result['result']:
@@ -73,10 +63,27 @@ class SniperService:
                 if value and 'data' in value:
                     parsed = value['data'].get('parsed', {})
                     if parsed and 'info' in parsed:
-                        return parsed['info'].get('decimals', 9)
+                        decimals = parsed['info'].get('decimals', 0)
+                        if decimals > 0:
+                            print(f"   ℹ️ On-chain decimals: {decimals}")
+                            return decimals
         except:
             pass
         
+        # Try Jupiter token list
+        try:
+            url = f"https://tokens.jup.ag/token/{token_mint}"
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if 'decimals' in data:
+                    decimals = int(data['decimals'])
+                    print(f"   ℹ️ Jupiter decimals: {decimals}")
+                    return decimals
+        except:
+            pass
+        
+        # Default for most memecoins
         print("   ℹ️ Default decimals: 6")
         return 6
     
@@ -99,7 +106,6 @@ class SniperService:
         try:
             print(f"   💰 Amount: {amount_sol} SOL | Slippage: {slippage_bps/100}%")
             
-            # Step 1: Get quote from Jupiter
             quote_url = "https://lite-api.jup.ag/swap/v1/quote"
             params = {
                 "inputMint": "So11111111111111111111111111111111111111112",
@@ -115,9 +121,8 @@ class SniperService:
                 return {"success": False, "error": f"Quote HTTP {resp.status_code}"}
             
             quote = resp.json()
-            print(f"   📊 Output: {quote.get('outputAmount', '0')} | Price: {quote.get('priceImpactPct', '?')}%")
+            print(f"   📊 Output: {quote.get('outputAmount', '0')} | Impact: {quote.get('priceImpactPct', '?')}%")
             
-            # Step 2: Build swap
             swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             payload = {
                 "quoteResponse": quote,
@@ -138,7 +143,6 @@ class SniperService:
             if "swapTransaction" not in swap_data:
                 return {"success": False, "error": "No swapTransaction"}
             
-            # Step 3: Sign and send
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             
             print("   Signing transaction...")
@@ -148,10 +152,15 @@ class SniperService:
             txid = self._send_raw_transaction(signed_tx_bytes)
             print(f"   ✅ TXID: {txid}")
             
-            # Step 4: Calculate tokens
             token_decimals = await self.get_token_decimals(token_mint)
             raw_output = quote.get("outputAmount", "0")
-            tokens_bought = float(raw_output) / (10 ** token_decimals) if raw_output != "0" else 0
+            
+            if raw_output and raw_output != "0":
+                tokens_bought = float(raw_output) / (10 ** token_decimals)
+            else:
+                tokens_bought = 0
+            
+            print(f"   📊 Decimals: {token_decimals}, Raw: {raw_output}, Tokens: {tokens_bought:.9f}")
             
             return {
                 "success": True,
@@ -177,6 +186,8 @@ class SniperService:
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
+            print(f"   Selling {amount_tokens} tokens ({amount_raw} raw, {decimals} dec)")
+            
             quote_url = "https://lite-api.jup.ag/swap/v1/quote"
             params = {
                 "inputMint": token_mint,
@@ -189,7 +200,13 @@ class SniperService:
             resp = requests.get(quote_url, params=params, timeout=10)
             
             if resp.status_code != 200:
-                return {"success": False, "error": f"Quote HTTP {resp.status_code}"}
+                # Try USDC route
+                print(f"   ⚠️ Trying USDC route...")
+                params["outputMint"] = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                resp = requests.get(quote_url, params=params, timeout=10)
+            
+            if resp.status_code != 200:
+                return {"success": False, "error": f"Quote HTTP {resp.status_code}: {resp.text[:200]}"}
             
             quote = resp.json()
             
@@ -205,7 +222,7 @@ class SniperService:
             resp = requests.post(swap_url, json=payload, timeout=10)
             
             if resp.status_code != 200:
-                return {"success": False, "error": f"Swap HTTP {resp.status_code}"}
+                return {"success": False, "error": f"Swap HTTP {resp.status_code}: {resp.text[:200]}"}
             
             swap_data = resp.json()
             
@@ -237,8 +254,7 @@ class SniperService:
             
             result = self._rpc_call("getTokenAccountBalance", [str(ata)])
             if 'result' in result and result['result'] is not None:
-                amount = result['result'].get('uiAmount', 0)
-                return amount > 0
+                return result['result'].get('uiAmount', 0) > 0
             return False
         except:
             return False

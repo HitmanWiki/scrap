@@ -676,12 +676,17 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
     
     if result['success']:
         db.increment_daily_trades(user_id)
-        db.add_position(user_id, ca, result['tokens_bought'], result.get('price', 0), result['txid'])
-        db.add_trade_history(user_id, ca, 'buy', result['tokens_bought'], result.get('price', 0), result['txid'])
-        bought_tokens[user_id].add(ca)
-        print(f"   ✅ BUY: {result['txid'][:20]}... ({result['tokens_bought']:.4f})")
-    else:
-        print(f"   ❌ FAILED: {result['error']}")
+        
+        tokens_bought = result.get('tokens_bought', 0)
+        if tokens_bought > 0:
+            db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
+            db.add_trade_history(user_id, ca, 'buy', tokens_bought, result.get('price', 0), result['txid'])
+            bought_tokens[user_id].add(ca)
+            print(f"   ✅ BUY: {result['txid'][:20]}... ({tokens_bought:.9f})")
+        else:
+            print(f"   ⚠️ Buy TX sent but token amount unknown. Check Solscan.")
+        
+        print(f"   🔗 https://solscan.io/tx/{result['txid']}")
 
 # ============================================
 # BUY/SELL

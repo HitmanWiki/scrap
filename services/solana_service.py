@@ -4,7 +4,7 @@ Uses raw HTTP RPC calls - NO solana package needed
 """
 
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional
 from solders.pubkey import Pubkey
 from solders.token.associated import get_associated_token_address
 
@@ -65,15 +65,3 @@ class SolanaService:
         except:
             pass
         return None
-    
-    async def get_token_decimals(self, token_mint: str) -> int:
-        """Get token decimals from Jupiter"""
-        try:
-            url = f"https://tokens.jup.ag/token/{token_mint}"
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get('decimals', 9)
-        except:
-            pass
-        return 9
