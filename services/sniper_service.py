@@ -449,28 +449,16 @@ class SniperService:
             signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
             signed_tx_bytes = bytes(signed_tx)
             
-            # 4. Send transaction
+            # 4. Send transaction (FIXED - no TxOpts)
             print("   Sending transaction...")
-            result = self.client.send_raw_transaction(
-                signed_tx_bytes,
-                opts=TxOpts(skip_preflight=True)
-            )
-            txid = str(result.value)
+            txid = self.client.send_raw_transaction(signed_tx_bytes)
             print(f"   ✅ TXID: {txid}")
             
-            # 5. Get token amount from the transaction (wait for it to be available)
+            # 5. Get token amount from the transaction
             print("   ⏳ Fetching transaction details...")
             
             tokens_bought = 0
-            decimals = 9
-            
-            # Get token decimals first
-            try:
-                mint_info = self._rpc_call("getMint", [token_mint])
-                if 'result' in mint_info and mint_info['result']:
-                    decimals = mint_info['result'].get('decimals', 9)
-            except:
-                pass
+            decimals = await self.get_token_decimals(token_mint)
             
             # Wait for transaction to be available and parse it
             for attempt in range(8):
@@ -485,20 +473,17 @@ class SniperService:
                         meta = tx_detail['result'].get('meta', {})
                         post_balances = meta.get('postTokenBalances', [])
                         
-                        # Find the token in post_balances
                         for token in post_balances:
                             if token.get('mint') == token_mint:
                                 amount_raw = token.get('uiTokenAmount', {}).get('uiAmount', 0)
                                 tokens_bought = float(amount_raw) if amount_raw else 0
-                                print(f"   📊 Found in transaction: {tokens_bought:.6f} tokens")
+                                print(f"   📊 Attempt {attempt+1}: {tokens_bought:.6f} tokens")
                                 break
                         
                         if tokens_bought > 0:
                             break
-                        else:
-                            print(f"   ⏳ Attempt {attempt+1}: Token not in post_balances yet...")
                     else:
-                        print(f"   ⏳ Attempt {attempt+1}: Transaction not available...")
+                        print(f"   ⏳ Attempt {attempt+1}: Not available yet...")
                         
                 except Exception as e:
                     print(f"   ⚠️ Attempt {attempt+1}: {e}")
