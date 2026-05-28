@@ -252,13 +252,19 @@ class SniperService:
             return {"success": False, "error": str(e)}
         
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Execute sell"""
+        """Execute sell - FIXED: Proper decimal handling"""
         try:
-            print(f"   Selling {amount_tokens:.6f} tokens...")
+            print(f"   Selling {amount_tokens:.6f} tokens of {token_mint[:8]}...")
             
+            # Get token decimals FIRST (critical!)
             decimals = await self.get_token_decimals(token_mint)
-            amount_raw = int(amount_tokens * 10**decimals)
+            print(f"   📊 Token decimals: {decimals}")
             
+            # Convert to raw units (with decimals)
+            amount_raw = int(amount_tokens * 10**decimals)
+            print(f"   📊 Raw amount: {amount_raw}")
+            
+            # 1. Get quote from Jupiter
             quote_url = "https://lite-api.jup.ag/swap/v1/quote"
             params = {
                 "inputMint": token_mint,
@@ -266,11 +272,21 @@ class SniperService:
                 "amount": amount_raw,
                 "slippageBps": slippage_bps,
             }
+            
+            print(f"   Getting sell quote...")
             resp = requests.get(quote_url, params=params, timeout=10)
             if resp.status_code != 200:
-                return {"success": False, "error": f"Quote HTTP {resp.status_code}"}
+                return {"success": False, "error": f"Quote failed: HTTP {resp.status_code}"}
             quote = resp.json()
             
+            # Check if quote has output
+            if "outputAmount" not in quote or quote["outputAmount"] == "0":
+                return {"success": False, "error": "No liquidity or price impact too high"}
+            
+            expected_sol = int(quote["outputAmount"]) / 1e9
+            print(f"   📊 Expected SOL: {expected_sol:.6f}")
+            
+            # 2. Build swap transaction
             swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             payload = {
                 "quoteResponse": quote,
@@ -279,13 +295,17 @@ class SniperService:
                 "dynamicComputeUnitLimit": True,
                 "prioritizationFeeLamports": "auto"
             }
+            
+            print(f"   Building sell transaction...")
             resp = requests.post(swap_url, json=payload, timeout=10)
             if resp.status_code != 200:
-                return {"success": False, "error": f"Swap HTTP {resp.status_code}"}
+                return {"success": False, "error": f"Swap failed: HTTP {resp.status_code}"}
             swap_data = resp.json()
+            
             if "swapTransaction" not in swap_data:
                 return {"success": False, "error": "No swapTransaction"}
             
+            # 3. Sign transaction
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             raw_tx = VersionedTransaction.from_bytes(tx_bytes)
             message_bytes = message.to_bytes_versioned(raw_tx.message)
@@ -293,13 +313,17 @@ class SniperService:
             signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
             signed_tx_bytes = bytes(signed_tx)
             
-            result = self.client.send_raw_transaction(signed_tx_bytes, opts=TxOpts(skip_preflight=True))
+            # 4. Send transaction
+            print(f"   Sending sell transaction...")
+            result = self.client.send_raw_transaction(
+                signed_tx_bytes,
+                opts=TxOpts(skip_preflight=True)
+            )
             txid = str(result.value)
+            print(f"   ✅ Sell TXID: {txid}")
             
-            sol_received = 0
-            raw_output = quote.get("outputAmount", "0")
-            if raw_output != "0":
-                sol_received = int(raw_output) / 1e9
+            # 5. Get SOL received
+            sol_received = expected_sol
             
             return {
                 "success": True,
@@ -308,4 +332,5 @@ class SniperService:
                 "explorer": f"https://solscan.io/tx/{txid}"
             }
         except Exception as e:
+            print(f"   ❌ Sell failed: {e}")
             return {"success": False, "error": str(e)}
