@@ -301,7 +301,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Sync positions by checking actual token balances from transactions"""
+    """Sync positions - properly check if tokens still exist"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return {}
@@ -312,17 +312,46 @@ async def sync_positions_from_wallet(user_id: int):
     try:
         import requests as req
         
-        # Get positions from DB that have a buy_txid
         positions = db.get_user_positions(user_id)
         
         for pos in positions:
+            mint = pos['token_address']
             txid = pos.get('buy_txid', '')
+            
             if not txid or txid == 'wallet-sync':
+                # No transaction to verify - check ATA directly
+                try:
+                    mint_pubkey = Pubkey.from_string(mint)
+                    ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+                    
+                    bal_resp = req.post(SOLANA_RPC, json={
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "getTokenAccountBalance",
+                        "params": [str(ata)]
+                    }, timeout=10)
+                    bal_data = bal_resp.json()
+                    
+                    print(f"   ATA check for {mint[:8]}: {bal_data}")
+                    
+                    if 'result' in bal_data and bal_data['result']:
+                        val = bal_data['result']
+                        amount = float(val.get('value', {}).get('uiAmount', 0)) if isinstance(val, dict) else float(val)
+                        
+                        if amount > 0:
+                            wallet_tokens[mint] = amount
+                            db.update_position_amount(pos['id'], amount)
+                        else:
+                            db.close_position(pos['id'], 'sold')
+                            print(f"   🗑️ {mint[:8]}... has 0 balance - marking sold")
+                    elif 'error' in bal_data:
+                        # ATA doesn't exist = token sold
+                        db.close_position(pos['id'], 'sold')
+                        print(f"   🗑️ {mint[:8]}... ATA not found - marking sold")
+                except Exception as e:
+                    print(f"   ⚠️ ATA error for {mint[:8]}: {e}")
                 continue
             
-            mint = pos['token_address']
-            
-            # Check the transaction for current balance
+            # For positions with TXID, verify from transaction
             try:
                 tx_resp = req.post(SOLANA_RPC, json={
                     "jsonrpc": "2.0", "id": 1,
@@ -335,14 +364,13 @@ async def sync_positions_from_wallet(user_id: int):
                     account_keys = tx_data['result'].get('transaction', {}).get('message', {}).get('accountKeys', [])
                     meta = tx_data['result'].get('meta', {})
                     
-                    # Find token balance for our mint
+                    found = False
                     for token in meta.get('postTokenBalances', []):
                         if token.get('mint') == mint:
                             token_acct_idx = token.get('accountIndex')
                             if isinstance(token_acct_idx, int) and token_acct_idx < len(account_keys):
                                 token_account = account_keys[token_acct_idx]
                                 
-                                # Check current balance of this token account
                                 bal_resp = req.post(SOLANA_RPC, json={
                                     "jsonrpc": "2.0", "id": 1,
                                     "method": "getTokenAccountBalance",
@@ -350,26 +378,26 @@ async def sync_positions_from_wallet(user_id: int):
                                 }, timeout=10)
                                 bal_data = bal_resp.json()
                                 
-                                if bal_data.get('result'):
+                                print(f"   Balance check for {mint[:8]} at {str(token_account)[:12]}: {bal_data}")
+                                
+                                if 'result' in bal_data and bal_data['result']:
                                     val = bal_data['result']
                                     amount = float(val.get('value', {}).get('uiAmount', 0)) if isinstance(val, dict) else float(val)
                                     
                                     if amount > 0:
                                         wallet_tokens[mint] = amount
+                                        db.update_position_amount(pos['id'], amount)
+                                        found = True
                                         print(f"   ✅ {mint[:8]}... = {amount:.4f}")
-                                        
-                                        # Update position amount if changed
-                                        if abs(pos['amount'] - amount) > 0.0001:
-                                            db.update_position_amount(pos['id'], amount)
-                                    else:
-                                        # Token sold - mark as inactive
-                                        db.close_position(pos['id'], txid)
-                                        print(f"   🗑️ {mint[:8]}... sold (0 balance)")
+                                    break
+                    
+                    if not found:
+                        db.close_position(pos['id'], 'sold')
+                        print(f"   🗑️ {mint[:8]}... sold (0 balance in token account)")
             except Exception as e:
-                print(f"   ⚠️ Check error for {mint[:8]}: {e}")
+                print(f"   ⚠️ TX check error for {mint[:8]}: {e}")
         
-        if wallet_tokens:
-            print(f"   ✅ Synced: {len(wallet_tokens)} active tokens")
+        print(f"   ✅ Synced: {len(wallet_tokens)} tokens with balance")
         
     except Exception as e:
         print(f"   ⚠️ Sync error: {e}")
