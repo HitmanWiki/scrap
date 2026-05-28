@@ -22,6 +22,15 @@ class SniperService:
         self.rpc_url = rpc_url
         self.client = Client(rpc_url)
     
+    def _rpc_call(self, method: str, params: list) -> dict:
+        """Make raw RPC call - used by show_positions"""
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        try:
+            response = requests.post(self.rpc_url, json=payload, timeout=30)
+            return response.json()
+        except Exception as e:
+            return {"error": {"message": str(e)}}
+    
     async def get_token_decimals(self, token_mint: str) -> int:
         """Get token decimals from Jupiter token list"""
         try:
@@ -110,6 +119,18 @@ class SniperService:
         try:
             response = self.client.get_balance(wallet_pubkey, "processed")
             return response.value / 1e9
+        except:
+            return 0
+    
+    async def get_token_balance(self, wallet_pubkey: Pubkey, token_mint: str) -> float:
+        """Get token balance - added for show_positions"""
+        try:
+            mint_pubkey = Pubkey.from_string(token_mint)
+            ata = get_associated_token_address(wallet_pubkey, mint_pubkey)
+            response = self.client.get_token_account_balance(ata, "confirmed")
+            if response.value:
+                return response.value.ui_amount
+            return 0
         except:
             return 0
     
