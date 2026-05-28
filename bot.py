@@ -278,7 +278,7 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
     
     # Check daily limit
     daily_trades = user.get('daily_trades', 0)
-    max_trades = user.get('max_daily_trades', 10)
+    max_trades = user.get('max_daily_trades', 100)
     if daily_trades >= max_trades:
         print(f"   ⏭️ User {user_id} reached daily limit")
         return
