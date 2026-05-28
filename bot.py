@@ -400,35 +400,32 @@ async def debug_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     results = [f"🔍 Wallet: `{wallet_addr}`"]
     
-    # Get recent transactions
-    payload = {
-        "jsonrpc": "2.0", "id": 1,
-        "method": "getSignaturesForAddress",
-        "params": [wallet_addr, {"limit": 5}]
-    }
-    resp = req.post(SOLANA_RPC, json=payload, timeout=10)
-    data = resp.json()
+    # Check HOPPY token (2RWndXkx...)
+    hop_mint = "2RWndXkxWkaKhGjE7dZivVbK5qXtpwnCZJ1jpnxapump"
     
-    sigs = data.get('result', []) or []
-    results.append(f"Recent TXs: {len(sigs)}")
+    # Derive ATA
+    mint_pubkey = Pubkey.from_string(hop_mint)
+    ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+    results.append(f"HOPPY ATA: `{str(ata)}`")
     
-    # Check each transaction for token balances
-    for sig in sigs[:3]:
-        sig_str = sig.get('signature', '') if isinstance(sig, dict) else str(sig)
-        tx_data = req.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getTransaction",
-            "params": [sig_str, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-        }, timeout=10).json()
-        
-        if tx_data.get('result'):
-            meta = tx_data['result'].get('meta', {}) or {}
-            for token in (meta.get('postTokenBalances', []) or []):
-                mint = token.get('mint', '')
-                ui_data = token.get('uiTokenAmount', {}) or {}
-                amt = ui_data.get('uiAmount', 0) or 0
-                if amt and amt > 0:
-                    results.append(f"Token: `{mint[:8]}...` = {amt:.4f}")
+    # Check ATA exists
+    r1 = req.post(SOLANA_RPC, json={
+        "jsonrpc":"2.0","id":1,
+        "method":"getAccountInfo",
+        "params":[str(ata)]
+    }, timeout=10)
+    info = r1.json()
+    exists = info.get('result', {}).get('value') is not None
+    results.append(f"ATA exists: {exists}")
+    
+    # Check balance
+    r2 = req.post(SOLANA_RPC, json={
+        "jsonrpc":"2.0","id":1,
+        "method":"getTokenAccountBalance",
+        "params":[str(ata)]
+    }, timeout=10)
+    bal = r2.json()
+    results.append(f"Balance: {bal}")
     
     await update.message.reply_text("\n".join(results), parse_mode='Markdown')
 
