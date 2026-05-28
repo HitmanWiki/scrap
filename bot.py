@@ -2114,7 +2114,8 @@ def main():
     monitor_thread.start()
     
     time.sleep(3)
-    
+    # ADD DEBUG HANDLER HERE
+    application.add_handler(CommandHandler('debug', debug_wallet))
     # Add handlers
     application.add_handler(CallbackQueryHandler(start_auth_process, pattern="^start_auth$"))
     
