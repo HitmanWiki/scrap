@@ -301,7 +301,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Get token balances using Solscan public API"""
+    """Get token balances by checking the latest buy transaction"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return {}
@@ -312,58 +312,65 @@ async def sync_positions_from_wallet(user_id: int):
     try:
         import requests as req
         
-        # Solscan public API - no key needed!
-        url = f"https://api.solscan.io/account/tokens?address={wallet_addr}"
-        headers = {"User-Agent": "Mozilla/5.0"}
+        # Get positions from DB that have a buy_txid
+        positions = db.get_user_positions(user_id)
         
-        resp = req.get(url, headers=headers, timeout=15)
-        
-        if resp.status_code == 200:
-            data = resp.json()
+        for pos in positions:
+            txid = pos.get('buy_txid', '')
+            if not txid:
+                continue
             
-            if data.get('success') and data.get('data'):
-                tokens = data['data']
-                print(f"   Solscan: Found {len(tokens)} tokens")
+            mint = pos['token_address']
+            
+            # Check the transaction for current balance
+            try:
+                tx_resp = req.post(SOLANA_RPC, json={
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getTransaction",
+                    "params": [txid, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                }, timeout=10)
+                tx_data = tx_resp.json()
                 
-                for token in tokens:
-                    mint = token.get('tokenAddress', token.get('mint', ''))
-                    amount = float(token.get('tokenAmount', {}).get('uiAmount', 0))
+                if tx_data.get('result'):
+                    # Get the account keys from the transaction
+                    account_keys = tx_data['result'].get('transaction', {}).get('message', {}).get('accountKeys', [])
+                    meta = tx_data['result'].get('meta', {})
                     
-                    if amount > 0:
-                        wallet_tokens[mint] = amount
-                        print(f"   ✅ {mint[:8]}... = {amount:.4f}")
-            else:
-                print(f"   Solscan response: {data}")
-        else:
-            # Try alternative SolanaFM API
-            fm_url = f"https://api.solana.fm/v0/accounts/{wallet_addr}/tokens"
-            resp = req.get(fm_url, headers=headers, timeout=15)
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                tokens = data.get('result', {}).get('data', data.get('data', []))
-                print(f"   SolanaFM: Found {len(tokens)} tokens")
-                
-                for token in tokens:
-                    mint = token.get('mint', token.get('tokenAddress', ''))
-                    amount = float(token.get('amount', token.get('balance', 0)))
-                    if amount > 0:
-                        wallet_tokens[mint] = amount
-                        print(f"   ✅ {mint[:8]}... = {amount:.4f}")
+                    # Find token balance change for our mint
+                    for token in meta.get('postTokenBalances', []):
+                        if token.get('mint') == mint:
+                            token_acct_idx = token.get('accountIndex')
+                            if isinstance(token_acct_idx, int) and token_acct_idx < len(account_keys):
+                                token_account = account_keys[token_acct_idx]
+                                
+                                # Check current balance of this token account
+                                bal_resp = req.post(SOLANA_RPC, json={
+                                    "jsonrpc": "2.0", "id": 1,
+                                    "method": "getTokenAccountBalance",
+                                    "params": [str(token_account)]
+                                }, timeout=10)
+                                bal_data = bal_resp.json()
+                                
+                                if bal_data.get('result'):
+                                    val = bal_data['result']
+                                    amount = float(val.get('value', {}).get('uiAmount', 0)) if isinstance(val, dict) else float(val)
+                                    
+                                    if amount > 0:
+                                        wallet_tokens[mint] = amount
+                                        print(f"   ✅ {mint[:8]}... = {amount:.4f}")
+                                    else:
+                                        # Token was sold - remove position
+                                        db.close_position(pos['id'], 'sold')
+                                        print(f"   🗑️ {mint[:8]}... sold (0 balance)")
+            except Exception as e:
+                print(f"   ⚠️ Check error for {mint[:8]}: {e}")
         
-        # Update DB
+        # Update DB with found tokens
         if wallet_tokens:
-            existing = db.get_user_positions(user_id)
             for mint, amount in wallet_tokens.items():
-                pos = next((p for p in existing if p['token_address'] == mint), None)
-                if pos:
-                    db.update_position_amount(pos['id'], amount)
-                else:
-                    db.add_position(user_id, mint, amount, 0, 'solscan')
-            
-            for pos in existing:
-                if pos['token_address'] not in wallet_tokens:
-                    db.close_position(pos['id'], 'sold')
+                existing = next((p for p in positions if p['token_address'] == mint), None)
+                if existing and abs(existing['amount'] - amount) > 0.0001:
+                    db.update_position_amount(existing['id'], amount)
             
             print(f"   ✅ Synced: {len(wallet_tokens)} tokens")
         
