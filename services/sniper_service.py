@@ -194,29 +194,47 @@ class SniperService:
             return {"success": False, "error": str(e)}
     
     async def execute_jupiter_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Sell regular tokens using Jupiter"""
+        """Sell tokens using Jupiter with multiple fallback routes"""
         try:
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
-            for percentage in [1.0, 0.5, 0.25, 0.1]:
-                test_raw = int(amount_raw * percentage)
-                if test_raw < 1000:
-                    continue
+            # Try multiple output tokens (SOL, USDC, USDT)
+            output_mints = [
+                ("So11111111111111111111111111111111111111112", 9),   # SOL
+                ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 6),  # USDC
+                ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", 6),  # USDT
+            ]
+            
+            for output_mint, output_decimals in output_mints:
+                print(f"   Trying route to {output_mint[:8]}...")
                 
-                quote_url = "https://lite-api.jup.ag/swap/v1/quote"
-                params = {
-                    "inputMint": token_mint,
-                    "outputMint": "So11111111111111111111111111111111111111112",
-                    "amount": test_raw,
-                    "slippageBps": slippage_bps,
-                }
-                
-                resp = requests.get(quote_url, params=params, timeout=10)
-                if resp.status_code == 200:
-                    quote = resp.json()
-                    if "outputAmount" in quote and quote["outputAmount"] != "0":
-                        expected_sol = int(quote["outputAmount"]) / 1e9
+                # Try different percentages of the amount
+                for percentage in [1.0, 0.75, 0.5, 0.25, 0.1, 0.05]:
+                    test_raw = int(amount_raw * percentage)
+                    if test_raw < 100:  # Too small
+                        continue
+                    
+                    quote_url = "https://lite-api.jup.ag/swap/v1/quote"
+                    params = {
+                        "inputMint": token_mint,
+                        "outputMint": output_mint,
+                        "amount": test_raw,
+                        "slippageBps": max(slippage_bps, 5000),  # Min 50% slippage
+                    }
+                    
+                    try:
+                        resp = requests.get(quote_url, params=params, timeout=10)
+                        if resp.status_code != 200:
+                            continue
+                        
+                        quote = resp.json()
+                        
+                        if "outputAmount" not in quote or quote.get("outputAmount", "0") == "0":
+                            continue
+                        
+                        expected_output = int(quote["outputAmount"]) / (10 ** output_decimals)
+                        print(f"   ✅ Route found! Expected: {expected_output:.6f}")
                         
                         swap_url = "https://lite-api.jup.ag/swap/v1/swap"
                         payload = {
@@ -230,27 +248,77 @@ class SniperService:
                         resp = requests.post(swap_url, json=payload, timeout=10)
                         if resp.status_code != 200:
                             continue
+                        
                         swap_data = resp.json()
                         if "swapTransaction" not in swap_data:
                             continue
                         
+                        # Sign and send
                         tx_bytes = base64.b64decode(swap_data["swapTransaction"])
                         raw_tx = VersionedTransaction.from_bytes(tx_bytes)
-                        message_bytes = message.to_bytes_versioned(raw_tx.message)
-                        signature = wallet.sign_message(message_bytes)
+                        msg_bytes = message.to_bytes_versioned(raw_tx.message)
+                        signature = wallet.sign_message(msg_bytes)
                         signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
-                        signed_tx_bytes = bytes(signed_tx)
                         
-                        txid = self.client.send_raw_transaction(signed_tx_bytes)
+                        txid = self.client.send_raw_transaction(bytes(signed_tx))
+                        print(f"   ✅ SELL TXID: {txid}")
                         
                         return {
                             "success": True,
                             "txid": txid,
-                            "sol_received": expected_sol,
+                            "sol_received": expected_output,
                             "explorer": f"https://solscan.io/tx/{txid}"
                         }
+                        
+                    except Exception as e:
+                        print(f"   ⚠️ Attempt failed: {e}")
+                        continue
             
-            return {"success": False, "error": "No working amount found"}
+            # If all routes fail, try Jupiter API v6
+            print(f"   Trying Jupiter v6 API...")
+            try:
+                v6_url = "https://quote-api.jup.ag/v6/quote"
+                params = {
+                    "inputMint": token_mint,
+                    "outputMint": "So11111111111111111111111111111111111111112",
+                    "amount": amount_raw,
+                    "slippageBps": max(slippage_bps, 5000),
+                }
+                resp = requests.get(v6_url, params=params, timeout=10)
+                if resp.status_code == 200:
+                    quote = resp.json()
+                    if quote.get("outAmount") and quote["outAmount"] != "0":
+                        # Build swap using v6
+                        swap_url = "https://quote-api.jup.ag/v6/swap"
+                        payload = {
+                            "quoteResponse": quote,
+                            "userPublicKey": str(wallet.pubkey()),
+                            "wrapAndUnwrapSol": True,
+                            "dynamicComputeUnitLimit": True,
+                        }
+                        resp = requests.post(swap_url, json=payload, timeout=10)
+                        if resp.status_code == 200:
+                            swap_data = resp.json()
+                            if "swapTransaction" in swap_data:
+                                tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+                                raw_tx = VersionedTransaction.from_bytes(tx_bytes)
+                                msg_bytes = message.to_bytes_versioned(raw_tx.message)
+                                signature = wallet.sign_message(msg_bytes)
+                                signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
+                                
+                                txid = self.client.send_raw_transaction(bytes(signed_tx))
+                                print(f"   ✅ V6 SELL TXID: {txid}")
+                                return {
+                                    "success": True,
+                                    "txid": txid,
+                                    "sol_received": float(quote.get("outAmount", 0)) / 1e9,
+                                    "explorer": f"https://solscan.io/tx/{txid}"
+                                }
+            except Exception as e:
+                print(f"   ⚠️ V6 failed: {e}")
+            
+            return {"success": False, "error": "No routes found - try smaller amount or check liquidity"}
+            
         except Exception as e:
             return {"success": False, "error": str(e)}
     
