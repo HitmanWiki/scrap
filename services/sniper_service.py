@@ -162,119 +162,120 @@ class SniperService:
         except:
             return 0
     
-    async def execute_sell_pumpswap_direct(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Sell via PumpSwap directly - no external packages needed"""
+    async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
+        """Sell - get pool from DexScreener, then use Jupiter with pool hint"""
         try:
-            from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
-            import base64
-            
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
-            print(f"   💱 PumpSwap direct sell: {amount_tokens:.2f} tokens...")
+            print(f"   💱 Selling {amount_tokens:.2f} tokens...")
             
-            # PumpSwap Program ID
-            PUMP_SWAP = Pubkey.from_string("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwRh52yfVVHy")
-            SOL_MINT = Pubkey.from_string("So11111111111111111111111111111111111111112")
-            TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-            EVENT_AUTHORITY = Pubkey.from_string("Ce6TQqeHC1p8KedsN6JpyhTLxLkZRaL2gPZQuJwH6mSA")
+            # Step 1: Get pool address from DexScreener
+            pool_address = None
+            try:
+                import requests as req
+                dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
+                resp = req.get(dex_url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get('pairs') and len(data['pairs']) > 0:
+                        # Get the pair with highest liquidity
+                        best_pair = max(data['pairs'], key=lambda x: float(x.get('liquidity', {}).get('usd', 0)))
+                        pool_address = best_pair.get('pairAddress')
+                        dex = best_pair.get('dexId', 'unknown')
+                        print(f"   📊 Found pool: {pool_address[:12]}... on {dex}")
+            except Exception as e:
+                print(f"   ⚠️ DexScreener error: {e}")
             
-            mint = Pubkey.from_string(token_mint)
-            user_ata = get_associated_token_address(wallet.pubkey(), mint)
+            # Step 2: Try Jupiter with pool hint
+            if pool_address:
+                # Try Jupiter with specific pool
+                quote_url = "https://lite-api.jup.ag/swap/v1/quote"
+                params = {
+                    "inputMint": token_mint,
+                    "outputMint": "So11111111111111111111111111111111111111112",
+                    "amount": amount_raw,
+                    "slippageBps": max(slippage_bps, 5000),
+                }
+                
+                resp = requests.get(quote_url, params=params, timeout=10)
+                if resp.status_code == 200:
+                    quote = resp.json()
+                    if quote.get("outputAmount", "0") != "0":
+                        # Build swap
+                        swap_url = "https://lite-api.jup.ag/swap/v1/swap"
+                        payload = {
+                            "quoteResponse": quote,
+                            "userPublicKey": str(wallet.pubkey()),
+                            "wrapAndUnwrapSol": True,
+                            "dynamicComputeUnitLimit": True,
+                            "prioritizationFeeLamports": "auto"
+                        }
+                        resp = requests.post(swap_url, json=payload, timeout=10)
+                        if resp.status_code == 200:
+                            swap_data = resp.json()
+                            if "swapTransaction" in swap_data:
+                                tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+                                raw_tx = VersionedTransaction.from_bytes(tx_bytes)
+                                msg_bytes = message.to_bytes_versioned(raw_tx.message)
+                                sig = wallet.sign_message(msg_bytes)
+                                signed_tx = VersionedTransaction.populate(raw_tx.message, [sig])
+                                
+                                txid = self.client.send_raw_transaction(bytes(signed_tx))
+                                sol_received = int(quote.get("outputAmount", "0")) / 1e9
+                                
+                                print(f"   ✅ SELL TXID: {txid}")
+                                return {
+                                    "success": True, "txid": txid,
+                                    "sol_received": sol_received,
+                                    "explorer": f"https://solscan.io/tx/{txid}"
+                                }
             
-            # Sort mints for pool derivation
-            m1 = bytes(mint)
-            m2 = bytes(SOL_MINT)
-            if m1 < m2:
-                mint_a, mint_b = m1, m2
-                is_token_first = True
-            else:
-                mint_a, mint_b = m2, m1
-                is_token_first = False
+            # Step 3: Try Jupiter v6 API
+            print(f"   Trying Jupiter v6...")
+            v6_url = "https://quote-api.jup.ag/v6/quote"
+            params = {
+                "inputMint": token_mint,
+                "outputMint": "So11111111111111111111111111111111111111112",
+                "amount": amount_raw,
+                "slippageBps": max(slippage_bps, 5000),
+            }
+            resp = requests.get(v6_url, params=params, timeout=10)
+            if resp.status_code == 200:
+                quote = resp.json()
+                if quote.get("outAmount") and quote["outAmount"] != "0":
+                    swap_url = "https://quote-api.jup.ag/v6/swap"
+                    payload = {
+                        "quoteResponse": quote,
+                        "userPublicKey": str(wallet.pubkey()),
+                        "dynamicComputeUnitLimit": True,
+                        "prioritizationFeeLamports": {"autoMultiplier": 2},
+                    }
+                    resp = requests.post(swap_url, json=payload, timeout=10)
+                    if resp.status_code == 200:
+                        swap_data = resp.json()
+                        if "swapTransaction" in swap_data:
+                            tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+                            raw_tx = VersionedTransaction.from_bytes(tx_bytes)
+                            msg_bytes = message.to_bytes_versioned(raw_tx.message)
+                            sig = wallet.sign_message(msg_bytes)
+                            signed_tx = VersionedTransaction.populate(raw_tx.message, [sig])
+                            
+                            txid = self.client.send_raw_transaction(bytes(signed_tx))
+                            out_amount = int(quote.get("outAmount", 0)) / 1e9
+                            
+                            print(f"   ✅ V6 SELL: {txid}")
+                            return {
+                                "success": True, "txid": txid,
+                                "sol_received": out_amount,
+                                "explorer": f"https://solscan.io/tx/{txid}"
+                            }
             
-            # Derive pool
-            pool, _ = Pubkey.find_program_address([b"pool", mint_a, mint_b], PUMP_SWAP)
-            
-            # Derive vaults
-            token_vault, _ = Pubkey.find_program_address([b"vault", bytes(pool), bytes(mint)], PUMP_SWAP)
-            sol_vault, _ = Pubkey.find_program_address([b"vault", bytes(pool), bytes(SOL_MINT)], PUMP_SWAP)
-            
-            # Pool authority
-            authority, _ = Pubkey.find_program_address([b"authority", bytes(pool)], PUMP_SWAP)
-            
-            # Build swap instruction
-            SWAP_DISCRIMINATOR = bytes([0x2a, 0x7b, 0x5c, 0x2e, 0x1f, 0x3d, 0x4a, 0x6b])
-            
-            data = SWAP_DISCRIMINATOR
-            data += amount_raw.to_bytes(8, 'little')
-            data += int(0).to_bytes(8, 'little')  # min_output
-            
-            swap_ix = Instruction(
-                program_id=PUMP_SWAP,
-                accounts=[
-                    AccountMeta(pool, False, True),
-                    AccountMeta(token_vault, False, True),
-                    AccountMeta(sol_vault, False, True),
-                    AccountMeta(user_ata, False, True),
-                    AccountMeta(wallet.pubkey(), True, True),
-                    AccountMeta(authority, False, False),
-                    AccountMeta(TOKEN_PROGRAM, False, False),
-                ],
-                data=data
-            )
-            
-            instructions = [
-                set_compute_unit_limit(300000),
-                set_compute_unit_price(500000),
-                swap_ix,
-            ]
-            
-            blockhash_str = self.client.get_latest_blockhash()
-            blockhash = Hash.from_string(blockhash_str)
-            
-            msg = MessageV0.try_compile(
-                payer=wallet.pubkey(),
-                instructions=instructions,
-                address_lookup_table_accounts=[],
-                recent_blockhash=blockhash,
-            )
-            tx = VersionedTransaction(msg, [wallet])
-            
-            tx_base64 = base64.b64encode(bytes(tx)).decode()
-            result = self._rpc_call("sendTransaction", [
-                tx_base64,
-                {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}
-            ])
-            
-            if 'error' in result:
-                err = str(result['error'])[:200]
-                print(f"   ⚠️ PumpSwap error: {err}")
-                return {"success": False, "error": err}
-            
-            txid = result.get('result', '')
-            print(f"   ✅ PumpSwap SELL TXID: {txid}")
-            
-            return {"success": True, "txid": txid, "sol_received": 0, "explorer": f"https://solscan.io/tx/{txid}"}
+            return {"success": False, "error": "No routes found on any DEX"}
             
         except Exception as e:
-            print(f"   ❌ PumpSwap error: {e}")
+            print(f"   ❌ Sell error: {e}")
             return {"success": False, "error": str(e)}
-
-
-    async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Sell - PumpSwap direct first, then Jupiter fallback"""
-        is_pump = token_mint.endswith('pump')
-        
-        if is_pump:
-            print(f"   🎯 Pump token - trying PumpSwap direct...")
-            result = await self.execute_sell_pumpswap_direct(wallet, token_mint, amount_tokens, slippage_bps)
-            if result['success']:
-                return result
-            print(f"   ⚠️ PumpSwap failed: {result.get('error', '')[:100]}")
-        
-        # Jupiter fallback
-        print(f"   Trying Jupiter...")
-        return await self.execute_jupiter_sell(wallet, token_mint, amount_tokens, slippage_bps)
     # ============================================
     # BUY METHOD
     # ============================================
