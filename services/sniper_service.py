@@ -33,7 +33,6 @@ class SniperService:
             return {"error": {"message": str(e)}}
         
     async def get_token_decimals(self, token_mint: str) -> int:
-        """Get token decimals from Jupiter token list"""
         try:
             url = f"https://tokens.jup.ag/token/{token_mint}"
             resp = requests.get(url, timeout=5)
@@ -136,9 +135,24 @@ class SniperService:
             return 0
     
     async def execute_buy(self, wallet: Keypair, token_mint: str, amount_sol: float, slippage_bps: int) -> dict:
-        """Execute buy - FIXED: Retry until transaction is found"""
+        """Execute buy - Check balance directly (most reliable)"""
         try:
             print(f"   Amount: {amount_sol} SOL | Slippage: {slippage_bps/100}%")
+            
+            # Get balance BEFORE buy
+            mint_pubkey = Pubkey.from_string(token_mint)
+            ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+            
+            balance_before = 0
+            try:
+                balance_result = self._rpc_call("getTokenAccountBalance", [str(ata)])
+                if 'result' in balance_result and balance_result['result']:
+                    value_data = balance_result['result'].get('value', {})
+                    if value_data:
+                        balance_before = float(value_data.get('uiAmount', 0))
+                print(f"   📊 Balance before: {balance_before:.6f}")
+            except:
+                pass
             
             # 1. Quote from Lite API
             quote_url = "https://lite-api.jup.ag/swap/v1/quote"
@@ -188,76 +202,40 @@ class SniperService:
             txid = str(result.value)
             print(f"   ✅ TXID: {txid}")
             
-            # 5. Wait and retry until transaction is found
-            print("   ⏳ Waiting for transaction confirmation...")
+            # 5. Wait and check balance after
+            print("   ⏳ Waiting for confirmation...")
+            await asyncio.sleep(10)
             
             tokens_bought = 0
-            decimals = 9
             
-            # Get token decimals first
-            try:
-                mint_pubkey = Pubkey.from_string(token_mint)
-                mint_info = self._rpc_call("getMint", [str(mint_pubkey)])
-                if 'result' in mint_info and mint_info['result']:
-                    decimals = mint_info['result'].get('decimals', 9)
-                    print(f"   📊 Token decimals: {decimals}")
-            except:
-                pass
-            
-            # Retry up to 10 times (30 seconds total)
-            for attempt in range(10):
-                await asyncio.sleep(3)
-                
+            # Check balance after (retry multiple times)
+            for attempt in range(5):
                 try:
-                    tx_detail = self._rpc_call("getTransaction", [
-                        txid,
-                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-                    ])
-                    
-                    if 'result' in tx_detail and tx_detail['result']:
-                        meta = tx_detail['result'].get('meta', {})
-                        post_token_balances = meta.get('postTokenBalances', [])
-                        pre_token_balances = meta.get('preTokenBalances', [])
-                        wallet_str = str(wallet.pubkey())
-                        
-                        # Find our token in post balances
-                        for post in post_token_balances:
-                            if post.get('mint') == token_mint:
-                                post_amount = float(post.get('uiTokenAmount', {}).get('uiAmount', 0))
-                                
-                                # Subtract pre-existing balance
-                                pre_amount = 0
-                                for pre in pre_token_balances:
-                                    if pre.get('mint') == token_mint and pre.get('owner') == wallet_str:
-                                        pre_amount = float(pre.get('uiTokenAmount', {}).get('uiAmount', 0))
-                                        break
-                                
-                                tokens_bought = post_amount - pre_amount
-                                print(f"   📊 Transaction found! Tokens: {tokens_bought:.6f}")
-                                break
-                        
-                        if tokens_bought > 0:
-                            break
-                        else:
-                            print(f"   ⏳ Attempt {attempt+1}: Transaction found but no token change yet...")
-                    else:
-                        print(f"   ⏳ Attempt {attempt+1}: Transaction not indexed yet...")
-                        
-                except Exception as e:
-                    print(f"   ⚠️ Attempt {attempt+1} error: {e}")
-            
-            # Fallback: try balance check if transaction parsing failed
-            if tokens_bought <= 0:
-                try:
-                    ata = get_associated_token_address(wallet.pubkey(), Pubkey.from_string(token_mint))
                     balance_result = self._rpc_call("getTokenAccountBalance", [str(ata)])
                     if 'result' in balance_result and balance_result['result']:
                         value_data = balance_result['result'].get('value', {})
                         if value_data:
-                            tokens_bought = float(value_data.get('uiAmount', 0))
-                            print(f"   📊 From balance: {tokens_bought:.6f} tokens")
+                            balance_after = float(value_data.get('uiAmount', 0))
+                            tokens_bought = balance_after - balance_before
+                            print(f"   📊 Attempt {attempt+1}: After={balance_after:.6f}, Bought={tokens_bought:.6f}")
+                            if tokens_bought > 0:
+                                break
                 except Exception as e:
-                    print(f"   ⚠️ Balance fetch error: {e}")
+                    print(f"   ⚠️ Attempt {attempt+1}: {e}")
+                
+                if attempt < 4:
+                    await asyncio.sleep(3)
+            
+            # If still 0, try getting from quote
+            if tokens_bought <= 0:
+                try:
+                    token_decimals = await self.get_token_decimals(token_mint)
+                    raw_output = quote.get("outputAmount", "0")
+                    if raw_output != "0":
+                        tokens_bought = int(raw_output) / 10**token_decimals
+                        print(f"   📊 From quote: {tokens_bought:.6f} tokens")
+                except:
+                    pass
             
             print(f"   📊 Final tokens: {tokens_bought:.6f}")
             
