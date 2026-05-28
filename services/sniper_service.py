@@ -153,6 +153,10 @@ class SniperService:
                 return {"success": False, "error": f"Quote HTTP {resp.status_code}"}
             quote = resp.json()
             
+            # Debug: print raw output
+            raw_output = quote.get("outputAmount", "0")
+            print(f"   📊 Raw output from quote: {raw_output}")
+            
             # 2. Build swap
             swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             payload = {
@@ -170,7 +174,7 @@ class SniperService:
             if "swapTransaction" not in swap_data:
                 return {"success": False, "error": "No swapTransaction"}
             
-            # 3. Sign transaction (using solders 0.18.1 compatible method)
+            # 3. Sign transaction
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             raw_tx = VersionedTransaction.from_bytes(tx_bytes)
             message_bytes = message.to_bytes_versioned(raw_tx.message)
@@ -187,10 +191,46 @@ class SniperService:
             txid = str(result.value)
             print(f"   ✅ TXID: {txid}")
             
-            # 5. Calculate tokens bought
+            # 5. Calculate tokens bought - FIXED
             token_decimals = await self.get_token_decimals(token_mint)
-            raw_output = quote.get("outputAmount", "0")
-            tokens_bought = int(raw_output) / 10**token_decimals if raw_output != "0" else 0
+            tokens_bought = 0
+            
+            # Method 1: Use quote's outputAmount
+            if raw_output != "0":
+                tokens_bought = int(raw_output) / 10**token_decimals
+                print(f"   📊 From quote: {tokens_bought:.6f} tokens")
+            
+            # Method 2: Wait a bit and check actual balance (most reliable)
+            if tokens_bought <= 0:
+                await asyncio.sleep(3)
+                try:
+                    mint_pubkey = Pubkey.from_string(token_mint)
+                    ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+                    balance_result = self.client.get_token_account_balance(ata, "confirmed")
+                    if balance_result.value:
+                        tokens_bought = balance_result.value.ui_amount
+                        print(f"   📊 From balance: {tokens_bought:.6f} tokens")
+                except Exception as e:
+                    print(f"   ⚠️ Could not fetch balance: {e}")
+            
+            # Method 3: If still 0, try from transaction (fallback)
+            if tokens_bought <= 0:
+                try:
+                    tx_detail = self._rpc_call("getTransaction", [
+                        txid,
+                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                    ])
+                    if 'result' in tx_detail and tx_detail['result']:
+                        meta = tx_detail['result'].get('meta', {})
+                        post_balances = meta.get('postTokenBalances', [])
+                        wallet_str = str(wallet.pubkey())
+                        for post in post_balances:
+                            if post.get('mint') == token_mint:
+                                tokens_bought = float(post.get('uiTokenAmount', {}).get('uiAmount', 0))
+                                print(f"   📊 From tx: {tokens_bought:.6f} tokens")
+                                break
+                except Exception as e:
+                    print(f"   ⚠️ Transaction parse error: {e}")
             
             return {
                 "success": True,
