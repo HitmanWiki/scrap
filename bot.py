@@ -404,33 +404,34 @@ async def debug_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     results = [f"🔍 Wallet: `{wallet_addr}`"]
     
-    # Get all token mints from recent transactions
-    # Check last 10 transactions for token mints
+    # Get recent transactions
     payload = {
         "jsonrpc": "2.0", "id": 1,
         "method": "getSignaturesForAddress",
-        "params": [wallet_addr, {"limit": 10}]
+        "params": [wallet_addr, {"limit": 5}]
     }
     resp = req.post(SOLANA_RPC, json=payload, timeout=10)
     data = resp.json()
     
-    sigs = data.get('result', [])
+    sigs = data.get('result', []) or []
     results.append(f"Recent TXs: {len(sigs)}")
     
-    # Check each transaction for token info
+    # Check each transaction for token balances
     for sig in sigs[:3]:
+        sig_str = sig.get('signature', '') if isinstance(sig, dict) else str(sig)
         tx_data = req.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getTransaction",
-            "params": [sig['signature'], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            "params": [sig_str, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
         }, timeout=10).json()
         
-        if 'result' in tx_data and tx_data['result']:
-            meta = tx_data['result'].get('meta', {})
-            for token in meta.get('postTokenBalances', []):
+        if tx_data.get('result'):
+            meta = tx_data['result'].get('meta', {}) or {}
+            for token in (meta.get('postTokenBalances', []) or []):
                 mint = token.get('mint', '')
-                amt = token.get('uiTokenAmount', {}).get('uiAmount', 0)
-                if amt > 0:
+                ui_data = token.get('uiTokenAmount', {}) or {}
+                amt = ui_data.get('uiAmount', 0) or 0
+                if amt and amt > 0:
                     results.append(f"Token: `{mint[:8]}...` = {amt:.4f}")
     
     await update.message.reply_text("\n".join(results), parse_mode='Markdown')
