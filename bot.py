@@ -417,8 +417,7 @@ async def debug_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get from recent transactions on Solscan
     await update.message.reply_text(f"🔗 [View on Solscan](https://solscan.io/account/{wallet_addr})", parse_mode='Markdown', disable_web_page_preview=True)
 
-# Add this in main():
-application.add_handler(CommandHandler('debug', debug_wallet))
+
 # ============================================
 # ADDRESS VALIDATION & EXTRACTION
 # ============================================
