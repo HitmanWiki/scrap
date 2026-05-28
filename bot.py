@@ -56,6 +56,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 SOLANA_RPC = os.getenv('SOLANA_RPC')
 DEFAULT_SLIPPAGE = int(os.getenv('SLIPPAGE_BPS', 1000))
 DEFAULT_BUY_AMOUNT = float(os.getenv('BUY_AMOUNT_SOL', 0.01))
+application = None  # Will be set in main()
 
 # Conversation states
 SELECTING_ACTION = 0
@@ -111,7 +112,98 @@ async def get_user_wallet(user_id: int) -> Optional[Keypair]:
     except Exception as e:
         print(f"❌ Wallet derivation error: {e}")
         return None
+async def send_buy_notification(user_id: int, token_address: str, tokens_bought: float, txid: str, price: float = 0):
+    """Send buy notification to user"""
+    try:
+        # Get token info
+        mc = await get_token_market_cap(token_address)
+        token_price = await solana_service.get_token_price(token_address)
+        
+        value = tokens_bought * token_price if token_price else 0
+        
+        text = f"""
+🟢 *BUY EXECUTED!*
 
+*Token:* `{token_address[:8]}...{token_address[-4:]}`
+*Amount:* {tokens_bought:,.2f}
+*Value:* ${value:.2f}
+*TX:* [{txid[:15]}...](https://solscan.io/tx/{txid})
+"""
+        if mc:
+            text += f"*MC:* ${mc:,.0f}\n"
+        
+        text += f"\n📊 Check /start → Positions"
+        
+        # Send to user
+        await application.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode='Markdown',
+            disable_web_page_preview=True
+        )
+        
+        # Pin the position update
+        positions = db.get_user_positions(user_id)
+        if positions:
+            pos_text = "📌 *Your Positions*\n\n"
+            for pos in positions[:5]:
+                addr = pos['token_address']
+                amt = pos['amount']
+                price_now = await solana_service.get_token_price(addr)
+                val = amt * price_now if price_now else 0
+                pos_text += f"• `{addr[:8]}...` — *{amt:,.2f}* (${val:.2f})\n"
+            
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=pos_text,
+                parse_mode='Markdown'
+            )
+            
+    except Exception as e:
+        print(f"   ⚠️ Notification error: {e}")
+async def send_sell_notification(user_id: int, token_address: str, amount_sold: float, sol_received: float, txid: str):
+    """Send sell notification to user"""
+    try:
+        # Get token price for value calculation
+        token_price = await solana_service.get_token_price(token_address)
+        value = amount_sold * token_price if token_price else 0
+        
+        text = f"""
+🔴 *SOLD!*
+
+*Token:* `{token_address[:8]}...{token_address[-4:]}`
+*Amount:* {amount_sold:,.2f}
+*Value:* ${value:.2f}
+*SOL Received:* {sol_received:.4f} SOL
+*TX:* [{txid[:15]}...](https://solscan.io/tx/{txid})
+
+📊 /start → Positions
+"""
+        await application.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode='Markdown',
+            disable_web_page_preview=True
+        )
+        
+        # Pin updated positions after sell
+        positions = db.get_user_positions(user_id)
+        if positions:
+            pos_text = "📌 *Updated Positions*\n\n"
+            for pos in positions[:10]:
+                addr = pos['token_address']
+                amt = pos['amount']
+                price_now = await solana_service.get_token_price(addr)
+                val = amt * price_now if price_now else 0
+                pos_text += f"• `{addr[:8]}...` — *{amt:,.2f}* (${val:.2f})\n"
+            
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=pos_text,
+                parse_mode='Markdown'
+            )
+    except Exception as e:
+        print(f"   ⚠️ Notification error: {e}")
 # ============================================
 # ADDRESS VALIDATION & EXTRACTION
 # ============================================
@@ -309,25 +401,36 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
     
     print(f"   🔥 SNIPING {ca[:8]}... ({buy_amount} SOL)")
     
+    # Send "buying" notification
+    try:
+        await application.bot.send_message(
+            chat_id=user_id,
+            text=f"🔥 *Sniping token!*\n\n`{ca[:8]}...`\nAmount: {buy_amount} SOL\n\n⏳ Executing buy...",
+            parse_mode='Markdown'
+        )
+    except:
+        pass
+    
     result = await sniper_service.execute_buy(wallet=wallet, token_mint=ca, amount_sol=buy_amount, slippage_bps=slippage)
     
     processing_tokens[user_id].discard(ca)
     
-    # In process_channel_message, after successful buy:
+    # After successful buy:
     if result['success']:
         db.increment_daily_trades(user_id)
         
         tokens_bought = result.get('tokens_bought', 0)
+        txid = result.get('txid', '')
         
         print(f"   📊 Tokens bought: {tokens_bought}")
         
         # Always save position
         if tokens_bought > 0:
-            db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
+            db.add_position(user_id, ca, tokens_bought, result.get('price', 0), txid)
+            db.add_trade_history(user_id, ca, 'buy', tokens_bought, result.get('price', 0), txid)
             print(f"   ✅ Position saved: {tokens_bought:.6f} tokens")
         else:
-            # Save with 0 amount, will update on refresh
-            db.add_position(user_id, ca, 0, result.get('price', 0), result['txid'])
+            db.add_position(user_id, ca, 0, result.get('price', 0), txid)
             print(f"   ⚠️ Position saved with 0 amount (will update on refresh)")
         
         if user_id not in bought_tokens:
@@ -335,6 +438,74 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         bought_tokens[user_id].add(ca)
         
         print(f"   🔗 {result['explorer']}")
+        
+        # SEND BUY NOTIFICATION with position pin
+        try:
+            # Get token info for notification
+            mc = await get_token_market_cap(ca)
+            token_price = await solana_service.get_token_price(ca)
+            value = tokens_bought * token_price if token_price else 0
+            
+            buy_text = f"""
+🟢 *BUY EXECUTED!*
+
+*Token:* `{ca[:8]}...{ca[-4:]}`
+*Amount:* {tokens_bought:,.2f}
+*Value:* ${value:.2f}
+*TX:* [{txid[:15]}...](https://solscan.io/tx/{txid})
+"""
+            if mc:
+                buy_text += f"*MC:* ${mc:,.0f}\n"
+            
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=buy_text,
+                parse_mode='Markdown',
+                disable_web_page_preview=True
+            )
+            
+            # Pin positions
+            positions = db.get_user_positions(user_id)
+            if positions:
+                pos_text = "📌 *Your Positions*\n\n"
+                total_value = 0
+                for pos in positions[:10]:
+                    addr = pos['token_address']
+                    amt = pos['amount']
+                    price_now = await solana_service.get_token_price(addr)
+                    val = amt * price_now if price_now else 0
+                    total_value += val
+                    
+                    pnl = ""
+                    if pos.get('entry_price') and pos['entry_price'] > 0 and price_now:
+                        pnl_pct = ((price_now - pos['entry_price']) / pos['entry_price']) * 100
+                        emoji = "🟢" if pnl_pct > 0 else "🔴"
+                        pnl = f" {emoji}{pnl_pct:+.1f}%"
+                    
+                    pos_text += f"• `{addr[:8]}...` — *{amt:,.2f}* (${val:.2f}){pnl}\n"
+                
+                if total_value > 0:
+                    sol_balance = await solana_service.get_balance(user['public_key'])
+                    pos_text += f"\n💎 *Total Value:* ${total_value + sol_balance:.2f}"
+                
+                await application.bot.send_message(
+                    chat_id=user_id,
+                    text=pos_text,
+                    parse_mode='Markdown'
+                )
+        except Exception as e:
+            print(f"   ⚠️ Notification error: {e}")
+    
+    else:
+        # Buy failed - notify user
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ *Buy Failed*\n\nToken: `{ca[:8]}...`\nError: {result.get('error', 'Unknown')[:200]}",
+                parse_mode='Markdown'
+            )
+        except:
+            pass
 
 async def poll_channel_messages(channel_name: str):
     """Poll a channel for new messages"""
@@ -1023,30 +1194,104 @@ async def execute_sell_order(query, token_address, percentage):
     user_id = query.from_user.id
     user = db.get_user(user_id)
     wallet = await get_user_wallet(user_id)
-    positions = db.get_user_positions(user_id)
-    position = next((p for p in positions if p['token_address'] == token_address), None)
-    if not position:
-        await query.edit_message_text("Position not found!", reply_markup=get_main_keyboard())
+    
+    # Get ACTUAL balance from chain
+    actual_balance = 0
+    try:
+        mint_pubkey = Pubkey.from_string(token_address)
+        ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+        result = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
+        if 'result' in result and result['result']:
+            val = result['result']
+            if isinstance(val, dict):
+                actual_balance = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0)))
+            else:
+                actual_balance = float(val) if val else 0
+    except:
+        pass
+    
+    if actual_balance <= 0:
+        await query.edit_message_text("❌ No tokens to sell!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    sell_amount = position['amount'] * (percentage / 100)
+    sell_amount = actual_balance * (percentage / 100)
     slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
     
-    await query.edit_message_text(f"Selling {sell_amount:.2f} tokens...")
+    # Get token price before selling
+    token_price = await solana_service.get_token_price(token_address)
+    estimated_value = sell_amount * token_price if token_price else 0
+    
+    await query.edit_message_text(
+        f"⏳ *Selling...*\n\n"
+        f"Amount: {sell_amount:,.2f}\n"
+        f"Est. Value: ${estimated_value:.2f}\n"
+        f"Slippage: {slippage/100}%",
+        parse_mode='Markdown'
+    )
     
     result = await sniper_service.execute_sell(wallet, token_address, sell_amount, slippage)
     
     if result['success']:
-        remaining = position['amount'] - sell_amount
-        if remaining > 0:
-            db.update_position_amount(position['id'], remaining)
-        else:
-            db.close_position(position['id'], result['txid'])
-        text = f"Sold!\n\nAmount: {sell_amount:.2f}\nTX: {result['txid'][:20]}...\nSOL: {result['sol_received']:.4f}"
+        # Update position in DB
+        remaining = actual_balance - sell_amount
+        positions = db.get_user_positions(user_id)
+        position = next((p for p in positions if p['token_address'] == token_address), None)
+        if position:
+            if remaining > 0:
+                db.update_position_amount(position['id'], remaining)
+            else:
+                db.close_position(position['id'], result['txid'])
+        
+        # Record trade
+        db.add_trade_history(
+            user_id, token_address, 'sell', 
+            sell_amount, 
+            result.get('sol_received', 0), 
+            result['txid']
+        )
+        
+        sol_received = result.get('sol_received', 0)
+        
+        # Build success message
+        text = f"""
+✅ *Sold!*
+
+*Amount:* {sell_amount:,.2f}
+*SOL Received:* {sol_received:.4f} SOL
+*TX:* `{result['txid'][:20]}...`
+🔗 [View on Solscan]({result['explorer']})
+"""
+        
+        await query.edit_message_text(
+            text, 
+            reply_markup=get_main_keyboard(), 
+            parse_mode='Markdown',
+            disable_web_page_preview=True
+        )
+        
+        # SEND SELL NOTIFICATION
+        await send_sell_notification(
+            user_id,
+            token_address,
+            sell_amount,
+            sol_received,
+            result['txid']
+        )
+        
     else:
-        text = f"Sell failed: {result['error']}"
+        error_msg = result.get('error', 'Unknown error')
+        text = f"""
+❌ *Sell Failed*
+
+*Error:* {error_msg[:200]}
+
+Try:
+• Smaller amount (25% or 50%)
+• Higher slippage in Settings
+• Check liquidity on Jupiter
+"""
+        await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     
-    await query.edit_message_text(text, reply_markup=get_main_keyboard())
     return SELECTING_ACTION
 
 async def sell_all_positions(query):
