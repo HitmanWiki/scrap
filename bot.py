@@ -301,7 +301,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Find token mints from transactions, then check current ATA balance"""
+    """Find actual token accounts from transactions"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return {}
@@ -312,18 +312,16 @@ async def sync_positions_from_wallet(user_id: int):
     try:
         import requests as req
         
-        # Step 1: Find token mints from recent transactions
-        found_mints = set()
-        
-        sig_payload = {
+        # Get recent signatures
+        sig_resp = req.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getSignaturesForAddress",
             "params": [wallet_addr, {"limit": 10}]
-        }
-        sig_resp = req.post(SOLANA_RPC, json=sig_payload, timeout=10)
+        }, timeout=10)
         sig_data = sig_resp.json()
         
-        for sig in (sig_data.get('result', []) or [])[:5]:
+        # Check the most recent transaction for token accounts
+        for sig in (sig_data.get('result', []) or [])[:3]:
             sig_str = sig.get('signature', '')
             if not sig_str:
                 continue
@@ -337,55 +335,56 @@ async def sync_positions_from_wallet(user_id: int):
             
             if tx_data.get('result'):
                 meta = tx_data['result'].get('meta', {}) or {}
-                for token in (meta.get('postTokenBalances', []) or []):
+                post_balances = meta.get('postTokenBalances', []) or []
+                
+                for token in post_balances:
                     mint = token.get('mint', '')
-                    if mint and mint != "So11111111111111111111111111111111111111112":
-                        found_mints.add(mint)
-        
-        print(f"   Found {len(found_mints)} token mints from transactions")
-        
-        # Step 2: Check current balance of each mint via ATA
-        for mint in found_mints:
-            try:
-                mint_pubkey = Pubkey.from_string(mint)
-                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                
-                bal_resp = req.post(SOLANA_RPC, json={
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "getTokenAccountBalance",
-                    "params": [str(ata)]
-                }, timeout=10)
-                bal_data = bal_resp.json()
-                
-                if bal_data.get('result'):
-                    val = bal_data['result']
-                    amount = float(val.get('value', {}).get('uiAmount', 0)) if isinstance(val, dict) else float(val)
+                    owner = token.get('owner', '')
+                    token_account = token.get('accountIndex')  # This gives the account index
                     
-                    if amount > 0:
-                        wallet_tokens[mint] = amount
-                        print(f"   ✅ {mint[:8]}... = {amount:.4f}")
-                    else:
-                        print(f"   ⚠️ {mint[:8]}... = 0 (sold)")
-            except Exception as e:
-                print(f"   ⚠️ {mint[:8]}... error: {e}")
+                    # Only check tokens owned by our wallet
+                    if owner == wallet_addr and mint != "So11111111111111111111111111111111111111112":
+                        ui_data = token.get('uiTokenAmount', {}) or {}
+                        amount = ui_data.get('uiAmount', 0) or 0
+                        
+                        if amount > 0:
+                            # Get the actual token account address from the transaction
+                            accounts = tx_data['result'].get('transaction', {}).get('message', {}).get('accountKeys', [])
+                            if isinstance(token_account, int) and token_account < len(accounts):
+                                actual_ata = accounts[token_account]
+                                print(f"   Token: {mint[:8]}... at {actual_ata[:8]}... = {amount:.4f}")
+                                
+                                # Check if this account still has tokens
+                                bal_resp = req.post(SOLANA_RPC, json={
+                                    "jsonrpc": "2.0", "id": 1,
+                                    "method": "getTokenAccountBalance",
+                                    "params": [actual_ata]
+                                }, timeout=10)
+                                bal_data = bal_resp.json()
+                                
+                                if bal_data.get('result'):
+                                    val = bal_data['result']
+                                    current = float(val.get('value', {}).get('uiAmount', 0)) if isinstance(val, dict) else float(val)
+                                    if current > 0:
+                                        wallet_tokens[mint] = current
+                                        print(f"   ✅ Current: {current:.4f}")
+                                        break  # Found it, stop checking
+            
+            if wallet_tokens:
+                break  # Found tokens, stop checking more transactions
         
-        # Step 3: Update database
+        # Update DB
         if wallet_tokens:
             existing = db.get_user_positions(user_id)
             for mint, amount in wallet_tokens.items():
                 pos = next((p for p in existing if p['token_address'] == mint), None)
                 if pos:
-                    if abs(pos['amount'] - amount) > 0.0001:
-                        db.update_position_amount(pos['id'], amount)
+                    db.update_position_amount(pos['id'], amount)
                 else:
                     db.add_position(user_id, mint, amount, 0, 'tx-scan')
-            
-            # Remove tokens no longer held
-            for pos in existing:
-                if pos['token_address'] not in wallet_tokens:
-                    db.close_position(pos['id'], 'sold')
-            
             print(f"   ✅ Synced: {len(wallet_tokens)} tokens")
+        else:
+            print(f"   ⚠️ No tokens with balance found")
         
     except Exception as e:
         print(f"   ⚠️ Sync error: {e}")
