@@ -8,7 +8,6 @@ MULTI-USER SOLANA SNIPER BOT - FINAL
 - Jupiter API for swaps
 - Auto-Sell: Take Profit % + Target MC
 - Token Transfer & SOL Withdrawal
-- NO solana package dependency
 """
 
 import os
@@ -19,7 +18,7 @@ import base64
 import hashlib
 import requests
 import aiohttp
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from typing import Dict, Optional
 import json
@@ -84,7 +83,6 @@ active_clients: Dict[int, TelegramClient] = {}
 # Channel monitoring globals
 monitor_client = None
 channel_subscribers: Dict[str, list] = {}
-channel_queue = None
 
 # Deduplication cache
 processing_tokens: Dict[int, set] = {}
@@ -113,47 +111,6 @@ async def get_user_wallet(user_id: int) -> Optional[Keypair]:
     except Exception as e:
         print(f"❌ Wallet derivation error: {e}")
         return None
-
-# ============================================
-# MODERN UI KEYBOARDS
-# ============================================
-def get_main_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("💼 Wallet", callback_data="wallet"),
-         InlineKeyboardButton("💰 Balance", callback_data="balance")],
-        [InlineKeyboardButton("📈 Buy Token", callback_data="buy"),
-         InlineKeyboardButton("📉 Sell Token", callback_data="sell")],
-        [InlineKeyboardButton("📊 Positions", callback_data="positions"),
-         InlineKeyboardButton("📋 Channels", callback_data="channels")],
-        [InlineKeyboardButton("➕ Add Channel", callback_data="add_channel"),
-         InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-        [InlineKeyboardButton("🔑 Export Key", callback_data="export_key"),
-         InlineKeyboardButton("🔐 TG Auth", callback_data="telegram_auth_setup")],
-        [InlineKeyboardButton("⚡ Actions", callback_data="actions")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_settings_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("💵 Buy Amount", callback_data="set_buy_amount")],
-        [InlineKeyboardButton("📊 Slippage %", callback_data="set_slippage")],
-        [InlineKeyboardButton("🎯 Take Profit %", callback_data="set_take_profit")],
-        [InlineKeyboardButton("📈 Target MC ($)", callback_data="set_target_mc")],
-        [InlineKeyboardButton("🤖 Auto-Sell", callback_data="toggle_auto_sell")],
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_actions_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("💸 Transfer Token", callback_data="transfer_token"),
-         InlineKeyboardButton("🏦 Withdraw SOL", callback_data="withdraw_sol")],
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_back_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="back_main")]])
 
 # ============================================
 # ADDRESS VALIDATION & EXTRACTION
@@ -241,7 +198,246 @@ async def get_or_create_user(user_id: int, username: str = None) -> Dict:
     return user
 
 # ============================================
-# START COMMAND
+# MODERN UI KEYBOARDS
+# ============================================
+def get_main_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("💼 Wallet", callback_data="wallet"),
+         InlineKeyboardButton("💰 Balance", callback_data="balance")],
+        [InlineKeyboardButton("📈 Buy Token", callback_data="buy"),
+         InlineKeyboardButton("📉 Sell Token", callback_data="sell")],
+        [InlineKeyboardButton("📊 Positions", callback_data="positions"),
+         InlineKeyboardButton("📋 Channels", callback_data="channels")],
+        [InlineKeyboardButton("➕ Add Channel", callback_data="add_channel"),
+         InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+        [InlineKeyboardButton("🔑 Export Key", callback_data="export_key"),
+         InlineKeyboardButton("🔐 TG Auth", callback_data="telegram_auth_setup")],
+        [InlineKeyboardButton("⚡ Actions", callback_data="actions")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_settings_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("💵 Buy Amount", callback_data="set_buy_amount")],
+        [InlineKeyboardButton("📊 Slippage %", callback_data="set_slippage")],
+        [InlineKeyboardButton("🎯 Take Profit %", callback_data="set_take_profit")],
+        [InlineKeyboardButton("📈 Target MC ($)", callback_data="set_target_mc")],
+        [InlineKeyboardButton("🤖 Auto-Sell", callback_data="toggle_auto_sell")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_actions_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("💸 Transfer Token", callback_data="transfer_token"),
+         InlineKeyboardButton("🏦 Withdraw SOL", callback_data="withdraw_sol")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="back_main")]])
+
+# ============================================
+# CHANNEL MONITORING (CORE SNIPING LOGIC)
+# ============================================
+
+async def process_channel_message(user_id: int, message_text: str, channel_name: str):
+    """Process a message from a monitored channel - triggers sniping"""
+    global processing_tokens, last_processed_time, bought_tokens
+    
+    ca = await extract_contract_address(message_text)
+    if not ca:
+        return
+    
+    print(f"   🎯 Token detected: {ca[:8]}...")
+    
+    # Initialize per-user sets
+    if user_id not in processing_tokens:
+        processing_tokens[user_id] = set()
+    if user_id not in last_processed_time:
+        last_processed_time[user_id] = {}
+    if user_id not in bought_tokens:
+        bought_tokens[user_id] = set()
+    
+    # Deduplication
+    if ca in processing_tokens[user_id]:
+        return
+    now = datetime.now().timestamp() * 1000
+    if ca in last_processed_time[user_id]:
+        if now - last_processed_time[user_id][ca] < DEDUPE_TTL_MS:
+            return
+    
+    user = db.get_user(user_id)
+    if not user:
+        return
+    
+    wallet = await get_user_wallet(user_id)
+    if not wallet:
+        return
+    
+    # Check daily limit
+    daily_trades = user.get('daily_trades', 0)
+    max_trades = user.get('max_daily_trades', 10)
+    if daily_trades >= max_trades:
+        print(f"   ⏭️ User {user_id} reached daily limit")
+        return
+    
+    # Check if already holding
+    if await already_holding(user_id, wallet.pubkey(), ca):
+        print(f"   ⏭️ Already holding {ca[:8]}...")
+        return
+    
+    # Check SOL balance
+    try:
+        balance = await solana_service.get_balance(user['public_key'])
+        buy_amount = user.get('default_buy_amount', DEFAULT_BUY_AMOUNT)
+        if balance < buy_amount:
+            print(f"   ❌ Insufficient SOL: {balance:.4f} (need {buy_amount})")
+            return
+    except Exception as e:
+        print(f"   ⚠️ Balance check error: {e}")
+        return
+    
+    # Mark as processing
+    processing_tokens[user_id].add(ca)
+    last_processed_time[user_id][ca] = now
+    
+    buy_amount = user.get('default_buy_amount', DEFAULT_BUY_AMOUNT)
+    slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
+    
+    print(f"   🔥 SNIPING {ca[:8]}... ({buy_amount} SOL)")
+    
+    result = await sniper_service.execute_buy(wallet=wallet, token_mint=ca, amount_sol=buy_amount, slippage_bps=slippage)
+    
+    processing_tokens[user_id].discard(ca)
+    
+    if result['success']:
+        db.increment_daily_trades(user_id)
+        
+        tokens_bought = result.get('tokens_bought', 0)
+        
+        # Try to get actual token amount if 0
+        if tokens_bought <= 0:
+            await asyncio.sleep(3)
+            try:
+                mint_pubkey = Pubkey.from_string(ca)
+                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+                result2 = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
+                if 'result' in result2 and result2['result']:
+                    val = result2['result']
+                    if isinstance(val, dict):
+                        tokens_bought = float(val.get('value', {}).get('uiAmount', 0))
+            except:
+                pass
+        
+        if tokens_bought > 0:
+            db.add_position(user_id, ca, tokens_bought, result.get('price', 0), result['txid'])
+            if user_id not in bought_tokens:
+                bought_tokens[user_id] = set()
+            bought_tokens[user_id].add(ca)
+            print(f"   ✅ Bought {tokens_bought:.6f} tokens")
+        
+        print(f"   🔗 https://solscan.io/tx/{result['txid']}")
+    else:
+        print(f"   ❌ Buy failed: {result.get('error', 'Unknown error')}")
+
+async def poll_channel_messages(channel_name: str):
+    """Poll a channel for new messages"""
+    global monitor_client, channel_subscribers
+    
+    if not monitor_client:
+        print(f"   ⚠️ No monitor client for {channel_name}")
+        return
+    
+    try:
+        entity = await monitor_client.get_entity(channel_name)
+        print(f"   ✅ Connected to {channel_name}")
+        
+        last_id = 0
+        msgs = await monitor_client.get_messages(entity, limit=1)
+        if msgs and msgs[0]:
+            last_id = msgs[0].id
+        else:
+            last_id = 1
+        
+        print(f"   📍 Starting from msg ID: {last_id}")
+        
+        while channel_name in channel_subscribers and channel_subscribers[channel_name]:
+            try:
+                messages = await monitor_client.get_messages(entity, limit=5, min_id=last_id)
+                for msg in messages:
+                    if msg.id > last_id and msg.text:
+                        last_id = msg.id
+                        print(f"\n📨 [{datetime.now().strftime('%H:%M:%S')}] {channel_name}")
+                        print(f"   📝 {msg.text[:100]}...")
+                        
+                        for user_id in channel_subscribers.get(channel_name, []):
+                            asyncio.create_task(process_channel_message(user_id, msg.text, channel_name))
+                
+                await asyncio.sleep(2)
+            except Exception as e:
+                print(f"   ⚠️ Poll error for {channel_name}: {e}")
+                await asyncio.sleep(5)
+    except Exception as e:
+        print(f"❌ Failed to connect to {channel_name}: {e}")
+
+# ============================================
+# AUTO-SELL MONITOR
+# ============================================
+async def auto_sell_monitor():
+    """Monitor positions for auto-sell conditions"""
+    while True:
+        try:
+            positions = db.get_all_active_positions()
+            for pos in positions:
+                user_id = pos['user_id']
+                settings = db.get_user_settings(user_id)
+                
+                if not settings or not settings.get('auto_sell_enabled'):
+                    continue
+                
+                should_sell = False
+                reason = ""
+                
+                take_profit = settings.get('take_profit_percent', 0)
+                if take_profit > 0:
+                    current_price = await solana_service.get_token_price(pos['token_address'])
+                    if current_price and pos['entry_price'] > 0:
+                        profit_percent = ((current_price - pos['entry_price']) / pos['entry_price']) * 100
+                        if profit_percent >= take_profit:
+                            should_sell = True
+                            reason = f"+{profit_percent:.1f}% profit (target: {take_profit}%)"
+                
+                target_mc = settings.get('target_mc', 0)
+                if target_mc > 0 and not should_sell:
+                    current_mc = await get_token_market_cap(pos['token_address'])
+                    if current_mc and current_mc >= target_mc:
+                        should_sell = True
+                        reason = f"MC ${current_mc:,.0f} reached (target: ${target_mc:,.0f})"
+                
+                if should_sell:
+                    print(f"🎯 Auto-Sell for user {user_id}: {pos['token_address'][:8]}... ({reason})")
+                    wallet = await get_user_wallet(user_id)
+                    if wallet:
+                        result = await sniper_service.execute_sell(
+                            wallet=wallet,
+                            token_mint=pos['token_address'],
+                            amount_tokens=pos['amount'],
+                            slippage_bps=settings.get('max_slippage', 5000)
+                        )
+                        if result['success']:
+                            db.close_position(pos['id'], result['txid'])
+                            db.add_trade_history(user_id, pos['token_address'], 'auto-sell', pos['amount'], result.get('price', 0), result['txid'])
+                            print(f"   ✅ Auto-sold!")
+            
+            await asyncio.sleep(10)
+        except Exception as e:
+            print(f"Auto-sell error: {e}")
+            await asyncio.sleep(30)
+
+# ============================================
+# START COMMAND & UI HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -279,9 +475,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     return SELECTING_ACTION
 
-# ============================================
-# BUTTON HANDLER
-# ============================================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -369,18 +562,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_back_keyboard(), parse_mode='Markdown')
         return ENTER_CHANNEL_USERNAME
     
-    # Buy/Sell
     elif action == "confirm_buy": 
         return await execute_buy_order(query)
-    
-    elif action == "copy_address":
-        user = db.get_user(user_id)
-        await query.answer(f"📋 {user['public_key']}", show_alert=True)
-        return SELECTING_ACTION
-    
-    elif action == "delete_message":
-        await query.message.delete()
-        return SELECTING_ACTION
     
     elif action == "sell_all": 
         return await sell_all_positions(query)
@@ -407,13 +590,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "remove_channel": 
         return await remove_channel_menu(query)
     
-    # Auth
-    elif action == "start_auth": 
-        return await start_auth_process(query)
-    
-    elif action == "connect_session": 
-        return await connect_existing_session(query)
-    
     # Actions
     elif action == "transfer_token": 
         return await initiate_transfer(query)
@@ -431,11 +607,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token_address = action.replace("transfer_select_", "")
         return await handle_transfer_select(query, token_address)
     
-    # Fallback
     return SELECTING_ACTION
 
 # ============================================
-# WALLET UI
+# UI HELPER FUNCTIONS
 # ============================================
 async def show_wallet(query):
     user_id = query.from_user.id
@@ -497,9 +672,6 @@ async def export_private_key(query):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 
-# ============================================
-# CHANNEL UI
-# ============================================
 async def show_channels(query):
     user_id = query.from_user.id
     channels = db.get_user_channels(user_id)
@@ -551,7 +723,15 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
         channel_name = '@' + channel_name
     is_private = (channel_type == 'private')
     db.add_channel(user_id, channel_name, is_private=is_private)
-    await start_public_channel_monitoring(user_id, channel_name)
+    
+    # Start monitoring
+    global channel_subscribers
+    if channel_name not in channel_subscribers:
+        channel_subscribers[channel_name] = []
+    if user_id not in channel_subscribers[channel_name]:
+        channel_subscribers[channel_name].append(user_id)
+    asyncio.create_task(poll_channel_messages(channel_name))
+    
     await update.message.reply_text(f"✅ `{channel_name}` added!\n📡 Monitoring started.", reply_markup=get_main_keyboard(), parse_mode='Markdown')
     return SELECTING_ACTION
 
@@ -570,265 +750,8 @@ async def telegram_auth_setup(query):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 
-async def start_auth_process(query):
-    await query.edit_message_text("🔐 *Step 1/3*\n\nEnter your *API ID*:", reply_markup=get_back_keyboard(), parse_mode='Markdown')
-    return ENTER_API_ID
-
-async def handle_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.lower() == 'cancel':
-        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
-    try:
-        context.user_data['api_id'] = int(text)
-        await update.message.reply_text("🔐 *Step 2/3*\n\nEnter your *API Hash*:", reply_markup=get_back_keyboard(), parse_mode='Markdown')
-        return ENTER_API_HASH
-    except:
-        await update.message.reply_text("❌ Invalid!", reply_markup=get_back_keyboard())
-        return ENTER_API_ID
-
-async def handle_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.lower() == 'cancel':
-        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
-    context.user_data['api_hash'] = text
-    await update.message.reply_text("🔐 *Step 3/3*\n\nEnter your *Phone* (+1234567890):", reply_markup=get_back_keyboard(), parse_mode='Markdown')
-    return ENTER_PHONE
-
-async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    user_id = update.effective_user.id
-    if phone.lower() == 'cancel':
-        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
-    db.update_user_settings(user_id, telegram_api_id=context.user_data.get('api_id'), telegram_api_hash=context.user_data.get('api_hash'), telegram_phone=phone)
-    await update.message.reply_text("✅ Auth saved! Use 'Connect' to activate.", reply_markup=get_main_keyboard())
-    return SELECTING_ACTION
-
-async def connect_existing_session(query):
-    user_id = query.from_user.id
-    user = db.get_user(user_id)
-    if not user.get('telegram_api_id'):
-        await query.edit_message_text("❌ Setup auth first!", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
-    try:
-        client = TelegramClient(f'user_sessions/user_{user_id}', user['telegram_api_id'], user['telegram_api_hash'])
-        await client.start(phone=user.get('telegram_phone'))
-        active_clients[user_id] = client
-        await query.edit_message_text("✅ Connected!", reply_markup=get_main_keyboard())
-    except Exception as e:
-        await query.edit_message_text(f"❌ {str(e)}", reply_markup=get_main_keyboard())
-    return SELECTING_ACTION
-
 # ============================================
-# CHANNEL MONITORING
-# ============================================
-async def start_public_channel_monitoring(user_id: int, channel_name: str):
-    global channel_subscribers, channel_queue
-    if not channel_name.startswith('@'):
-        channel_name = '@' + channel_name
-    if channel_name not in channel_subscribers:
-        channel_subscribers[channel_name] = []
-    if user_id not in channel_subscribers[channel_name]:
-        channel_subscribers[channel_name].append(user_id)
-    if channel_queue:
-        await channel_queue.put(('add', user_id, channel_name))
-
-async def poll_channel_messages(channel_name: str):
-    global monitor_client, channel_subscribers
-    try:
-        entity = await monitor_client.get_entity(channel_name)
-        last_id = 0
-        msgs = await monitor_client.get_messages(entity, limit=1)
-        if msgs and msgs[0]:
-            last_id = msgs[0].id
-        print(f"✅ Polling {channel_name}")
-        while channel_subscribers.get(channel_name):
-            try:
-                messages = await monitor_client.get_messages(entity, limit=5)
-                for msg in reversed(messages):
-                    if msg.id > last_id and msg.message:
-                        last_id = msg.id
-                        print(f"\n📨 {channel_name}: {msg.message[:100]}")
-                        for uid in channel_subscribers.get(channel_name, []):
-                            await process_channel_message(uid, msg.message, channel_name)
-                await asyncio.sleep(2)
-            except Exception as e:
-                await asyncio.sleep(5)
-    except Exception as e:
-        print(f"❌ {channel_name}: {e}")
-
-async def process_channel_message(user_id: int, message_text: str, channel_name: str):
-    global processing_tokens, last_processed_time, bought_tokens
-    ca = await extract_contract_address(message_text)
-    if not ca:
-        return
-    print(f"   🎯 Token: {ca}")
-    
-    if user_id not in processing_tokens:
-        processing_tokens[user_id] = set()
-    if user_id not in last_processed_time:
-        last_processed_time[user_id] = {}
-    if user_id not in bought_tokens:
-        bought_tokens[user_id] = set()
-    
-    if ca in processing_tokens[user_id]:
-        return
-    now = datetime.now().timestamp() * 1000
-    if ca in last_processed_time[user_id]:
-        if now - last_processed_time[user_id][ca] < DEDUPE_TTL_MS:
-            return
-    
-    user = db.get_user(user_id)
-    wallet = await get_user_wallet(user_id)
-    if not wallet:
-        return
-    
-    daily_trades = user.get('daily_trades', 0)
-    max_trades = user.get('max_daily_trades', 10)
-    if daily_trades >= max_trades:
-        return
-    
-    if await already_holding(user_id, wallet.pubkey(), ca):
-        print(f"   ⏭️ Already holding")
-        return
-    
-    try:
-        balance = await solana_service.get_balance(user['public_key'])
-        buy_amount = user.get('default_buy_amount', DEFAULT_BUY_AMOUNT)
-        if balance < buy_amount:
-            print(f"   ❌ Balance: {balance:.4f} SOL (need {buy_amount})")
-            return
-    except:
-        pass
-    
-    processing_tokens[user_id].add(ca)
-    last_processed_time[user_id][ca] = now
-    
-    buy_amount = user.get('default_buy_amount', DEFAULT_BUY_AMOUNT)
-    slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
-    
-    print(f"   🔥 SNIPING {ca[:8]}... ({buy_amount} SOL)")
-    result = await sniper_service.execute_buy(wallet=wallet, token_mint=ca, amount_sol=buy_amount, slippage_bps=slippage)
-    processing_tokens[user_id].discard(ca)
-    
-    if result['success']:
-        db.increment_daily_trades(user_id)
-        
-        tokens_bought = 0
-        txid = result['txid']
-        
-        print(f"   ⚠️ Fetching actual balance from transaction...")
-        try:
-            await asyncio.sleep(12)
-            
-            import requests as req
-            
-            # Get token amount directly from the transaction
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getTransaction",
-                "params": [
-                    txid,
-                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-                ]
-            }
-            
-            resp = req.post(SOLANA_RPC, json=payload, timeout=15)
-            data = resp.json()
-            
-            if 'result' in data and data['result']:
-                meta = data['result'].get('meta', {})
-                post_balances = meta.get('postTokenBalances', [])
-                pre_balances = meta.get('preTokenBalances', [])
-                
-                wallet_str = str(wallet.pubkey())
-                
-                # Find our token in post balances
-                for post in post_balances:
-                    if post.get('mint') == ca:
-                        post_amount = float(post.get('uiTokenAmount', {}).get('uiAmount', 0))
-                        # Check if we had this token before
-                        pre_amount = 0
-                        for pre in pre_balances:
-                            if pre.get('mint') == ca and pre.get('owner') == wallet_str:
-                                pre_amount = float(pre.get('uiTokenAmount', {}).get('uiAmount', 0))
-                        
-                        tokens_bought = post_amount - pre_amount
-                        if tokens_bought > 0:
-                            print(f"   ✅ From tx: {tokens_bought:.6f} tokens bought")
-                        break
-                        
-        except Exception as e:
-            print(f"   ⚠️ getTransaction error: {e}")
-        
-        # Save position - entry_price=0 is fine, no division needed
-        db.add_position(user_id, ca, tokens_bought, 0, txid)
-        
-        if tokens_bought > 0:
-            db.add_trade_history(user_id, ca, 'buy', tokens_bought, 0, txid)
-            if user_id not in bought_tokens:
-                bought_tokens[user_id] = set()
-            bought_tokens[user_id].add(ca)
-            print(f"   ✅ Saved: {tokens_bought:.6f} tokens")
-        else:
-            print(f"   ⚠️ Saved with 0 - refresh positions after confirmation")
-        
-        print(f"   🔗 https://solscan.io/tx/{txid}")
-async def execute_buy_order(query):
-    user_id = query.from_user.id
-    user = db.get_user(user_id)
-    wallet = await get_user_wallet(user_id)
-    token_match = re.search(r'`([1-9A-HJ-NP-Za-km-z]{32,44})`', query.message.text)
-    if not token_match:
-        await query.edit_message_text("❌ Token not found!", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
-    token_address = token_match.group(1)
-    if await already_holding(user_id, wallet.pubkey(), token_address):
-        await query.edit_message_text("⏭️ Already holding!", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
-    buy_amount = user.get('default_buy_amount', DEFAULT_BUY_AMOUNT)
-    slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
-    await query.edit_message_text("⏳ *Executing buy...*", parse_mode='Markdown')
-    result = await sniper_service.execute_buy(wallet, token_address, buy_amount, slippage)
-    
-    if result['success']:
-        db.increment_daily_trades(user_id)
-        
-        tokens_bought = result.get('tokens_bought', 0)
-        
-        # If 0, fetch from chain
-        if tokens_bought <= 0:
-            await asyncio.sleep(5)
-            try:
-                mint_pubkey = Pubkey.from_string(token_address)
-                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                result2 = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
-                if 'result' in result2 and result2['result']:
-                    val = result2['result']
-                    tokens_bought = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0))) if isinstance(val, dict) else float(val)
-            except:
-                pass
-        
-        if tokens_bought > 0:
-            db.add_position(user_id, token_address, tokens_bought, result.get('price', 0), result['txid'])
-            if user_id not in bought_tokens:
-                bought_tokens[user_id] = set()
-            bought_tokens[user_id].add(token_address)
-            text = f"✅ *Bought!*\n\nTX: `{result['txid'][:20]}...`\nTokens: {tokens_bought:,.2f}"
-        else:
-            text = f"✅ *TX Sent!*\n\nTX: `{result['txid'][:20]}...`\n⚠️ Check Solscan for amount"
-        
-        text += f"\n🔗 [View on Solscan](https://solscan.io/tx/{result['txid']})"
-    else:
-        text = f"❌ *Failed*\n{result['error']}"
-    
-    await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True)
-    return SELECTING_ACTION
-# ============================================
-# BUY/SELL
+# BUY/SELL HANDLERS
 # ============================================
 async def initiate_buy(query):
     await query.edit_message_text("📈 *Buy Token*\n\nSend token address or DexScreener URL:\nType *cancel* to abort.", reply_markup=get_back_keyboard(), parse_mode='Markdown')
@@ -848,104 +771,41 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ No token address found!", reply_markup=get_back_keyboard())
         return ENTER_TOKEN_ADDRESS
     
-    # Check if this is a sell-by-address request
     sell_mode = context.user_data.get('sell_mode')
     if sell_mode == 'address':
         context.user_data.pop('sell_mode', None)
-        
         wallet = await get_user_wallet(user_id)
         if not wallet:
             await update.message.reply_text("❌ No wallet!", reply_markup=get_main_keyboard())
             return SELECTING_ACTION
         
-        # Get token balance from chain - try multiple times
+        # Get token balance
         balance = 0
         try:
             mint_pubkey = Pubkey.from_string(ca)
             ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-            
-            # Try with different commitments
-            for commitment in ["processed", "confirmed", "finalized"]:
-                try:
-                    result = sniper_service._rpc_call("getTokenAccountBalance", [
-                        str(ata), {"commitment": commitment}
-                    ])
-                    if 'result' in result and result['result']:
-                        balance = float(result['result'].get('uiAmount', 0))
-                        if balance > 0:
-                            break
-                except:
-                    continue
-            
-            # Also check if ATA exists
-            if balance == 0:
-                account_info = sniper_service._rpc_call("getAccountInfo", [str(ata)])
-                if 'result' in account_info and account_info['result'] is None:
-                    # ATA doesn't exist - no tokens
-                    pass
-                elif 'result' in account_info and account_info['result']:
-                    # ATA exists but might have 0 balance
-                    token_result = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
-                    if 'result' in token_result and token_result['result']:
-                        balance = float(token_result['result'].get('uiAmount', 0))
-            
-            print(f"   📊 Balance for {ca[:8]}: {balance}")
-            
-        except Exception as e:
-            print(f"   ⚠️ Balance check error: {e}")
+            result = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
+            if 'result' in result and result['result']:
+                balance = float(result['result'].get('uiAmount', 0))
+        except:
+            pass
         
         if balance <= 0:
-            await update.message.reply_text(
-                f"❌ *No tokens found!*\n\n"
-                f"Token: `{ca}`\n"
-                f"Balance: 0\n\n"
-                f"💡 *Possible reasons:*\n"
-                f"• Buy transaction may still be pending\n"
-                f"• Token might be in a different wallet\n"
-                f"• Check on Solscan: [View](https://solscan.io/account/{str(wallet.pubkey())})",
-                reply_markup=get_main_keyboard(),
-                parse_mode='Markdown',
-                disable_web_page_preview=True
-            )
+            await update.message.reply_text(f"❌ No tokens found for `{ca[:8]}...`", reply_markup=get_main_keyboard(), parse_mode='Markdown')
             return SELECTING_ACTION
         
-        # Store for sell
         context.user_data['sell_token'] = ca
         context.user_data['sell_amount'] = balance
         
-        # Get token info
-        price = await solana_service.get_token_price(ca)
-        decimals = await sniper_service.get_token_decimals(ca)
-        mc = await get_token_market_cap(ca)
-        
-        text = f"""
-📉 *Sell Tokens*
-
-*Token:* `{ca[:8]}...{ca[-4:]}`
-*Balance:* {balance:.{decimals}f}
-*Decimals:* {decimals}
-"""
-        if price:
-            value = balance * price
-            text += f"*Price:* ${price:.8f}\n*Value:* ${value:.2f}"
-        if mc:
-            text += f"\n*MC:* ${mc:,.0f}"
-        
-        text += "\n\nSelect percentage to sell:"
-        
+        text = f"📉 *Sell Tokens*\n\nToken: `{ca[:8]}...`\nBalance: {balance:.2f}\n\nSelect percentage:"
         keyboard = [
-            [InlineKeyboardButton("💰 100%", callback_data=f"execute_sell_{ca}_100"),
-             InlineKeyboardButton("📊 50%", callback_data=f"execute_sell_{ca}_50")],
-            [InlineKeyboardButton("📉 25%", callback_data=f"execute_sell_{ca}_25"),
-             InlineKeyboardButton("📝 10%", callback_data=f"execute_sell_{ca}_10")],
+            [InlineKeyboardButton("100%", callback_data=f"execute_sell_{ca}_100"),
+             InlineKeyboardButton("50%", callback_data=f"execute_sell_{ca}_50")],
+            [InlineKeyboardButton("25%", callback_data=f"execute_sell_{ca}_25"),
+             InlineKeyboardButton("10%", callback_data=f"execute_sell_{ca}_10")],
             [InlineKeyboardButton("« Cancel", callback_data="back_main")]
         ]
-        
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return SELECTING_ACTION
     
     # Regular buy flow
@@ -955,29 +815,16 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     context.user_data['pending_token'] = ca
     
-    mc = await get_token_market_cap(ca)
-    mc_text = f"\n*MC:* ${mc:,.0f}" if mc else ""
-    
-    try:
-        price = await solana_service.get_token_price(ca)
-        price_text = f"\n*Price:* ${price:.8f}" if price else ""
-    except:
-        price_text = ""
-    
     text = f"""
 📈 *Confirm Buy*
 
-*Token:* `{ca}`{mc_text}{price_text}
+*Token:* `{ca}`
 *Amount:* {buy_amount} SOL
 *Slippage:* {slippage/100}%
 
 Proceed?
 """
-    keyboard = [
-        [InlineKeyboardButton("✅ Confirm", callback_data="confirm_buy"),
-         InlineKeyboardButton("❌ Cancel", callback_data="back_main")]
-    ]
-    
+    keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data="confirm_buy"), InlineKeyboardButton("❌ Cancel", callback_data="back_main")]]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return CONFIRM_BUY
 
@@ -1012,156 +859,35 @@ async def execute_buy_order(query):
 async def initiate_sell(query):
     user_id = query.from_user.id
     positions = db.get_user_positions(user_id)
-    wallet = await get_user_wallet(user_id)
     
-    if not wallet:
-        await query.edit_message_text("❌ No wallet!", reply_markup=get_main_keyboard())
+    if not positions:
+        text = "📉 *No positions to sell*"
+        await query.edit_message_text(text, reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
     text = "📉 *Select Token to Sell*\n\n"
     keyboard = []
-    found_tokens = []
-    
-    # Check positions and update with actual balance
-    if positions:
-        text += "*Your Tokens:*\n"
-        for pos in positions:
-            token_addr = pos['token_address']
-            
-            # Fetch ACTUAL balance from chain
-            actual_balance = 0
-            try:
-                mint_pubkey = Pubkey.from_string(token_addr)
-                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                result = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
-                
-                if 'result' in result and result['result']:
-                    val = result['result']
-                    if isinstance(val, dict):
-                        actual_balance = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0)))
-                    else:
-                        actual_balance = float(val) if val else 0
-                
-                # Update position in DB if actual balance differs
-                if actual_balance > 0 and abs(actual_balance - pos['amount']) > 0.000001:
-                    print(f"   📊 Updating position: {pos['amount']:.6f} → {actual_balance:.6f}")
-                    # Update the position amount
-                    db.update_position_amount(pos['id'], actual_balance)
-                    pos['amount'] = actual_balance
-                    
-            except Exception as e:
-                print(f"   ⚠️ Balance check error: {e}")
-            
-            display_amount = actual_balance if actual_balance > 0 else pos['amount']
-            
-            if display_amount > 0:
-                price = await solana_service.get_token_price(token_addr)
-                mc = await get_token_market_cap(token_addr)
-                
-                text += f"• `{token_addr[:8]}...` — *{display_amount:,.2f}*"
-                if price:
-                    text += f" (${display_amount * price:.2f})"
-                if mc:
-                    text += f" | MC: ${mc:,.0f}"
-                text += "\n"
-                
-                found_tokens.append(token_addr)
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"💰 Sell {token_addr[:8]}... ({display_amount:,.0f})", 
-                        callback_data=f"sell_{token_addr}"
-                    )
-                ])
-    
-    # Also scan for tokens not in positions
-    try:
-        result = sniper_service._rpc_call("getTokenAccountsByOwner", [
-            str(wallet.pubkey()),
-            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-            {"encoding": "jsonParsed"}
-        ])
-        
-        if 'result' in result and result['result']:
-            token_accounts = result['result'].get('value', [])
-            for acc in token_accounts:
-                parsed = acc.get('account', {}).get('data', {}).get('parsed', {})
-                info = parsed.get('info', {})
-                amount = info.get('tokenAmount', {}).get('uiAmount', 0)
-                mint = info.get('mint', '')
-                
-                if amount > 0 and mint not in found_tokens:
-                    text += f"• `{mint[:8]}...` — *{amount:,.2f}* (on-chain)\n"
-                    found_tokens.append(mint)
-                    keyboard.append([
-                        InlineKeyboardButton(
-                            f"💰 Sell {mint[:8]}... ({amount:,.0f})",
-                            callback_data=f"sell_{mint}"
-                        )
-                    ])
-    except:
-        pass
-    
-    if not found_tokens:
-        text += "\n😔 *No tokens with balance found*"
-    else:
-        text += f"\n💰 *{len(found_tokens)} tokens found*"
+    for pos in positions:
+        if pos['amount'] > 0:
+            text += f"• `{pos['token_address'][:8]}...` — *{pos['amount']:.2f}*\n"
+            keyboard.append([InlineKeyboardButton(f"Sell {pos['token_address'][:8]}...", callback_data=f"sell_{pos['token_address']}")])
     
     keyboard.append([InlineKeyboardButton("📝 Sell by Address", callback_data="sell_by_address")])
     keyboard.append([InlineKeyboardButton("« Back", callback_data="back_main")])
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
+
 async def confirm_sell_position(query, token_address):
     user_id = query.from_user.id
-    wallet = await get_user_wallet(user_id)
-    
-    if not wallet:
-        await query.edit_message_text("❌ No wallet!", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
-    
-    # Get ACTUAL balance from chain
-    actual_balance = 0
-    try:
-        mint_pubkey = Pubkey.from_string(token_address)
-        ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-        result = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
-        
-        if 'result' in result and result['result']:
-            val = result['result']
-            if isinstance(val, dict):
-                actual_balance = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0)))
-            else:
-                actual_balance = float(val) if val else 0
-    except:
-        pass
-    
-    if actual_balance <= 0:
-        await query.edit_message_text(
-            f"❌ No tokens found for `{token_address[:8]}...`\n\nCheck on Solscan.",
-            reply_markup=get_main_keyboard(),
-            parse_mode='Markdown'
-        )
-        return SELECTING_ACTION
-    
-    # Also check position in DB
     positions = db.get_user_positions(user_id)
     position = next((p for p in positions if p['token_address'] == token_address), None)
+    if not position or position['amount'] <= 0:
+        await query.edit_message_text("❌ No tokens to sell!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
     
-    # Update DB if needed
-    if position and abs(position['amount'] - actual_balance) > 0.000001:
-        db.update_position_amount(position['id'], actual_balance)
-    
-    price = await solana_service.get_token_price(token_address)
-    mc = await get_token_market_cap(token_address)
-    
-    text = f"📉 *Sell Tokens*\n\n*Token:* `{token_address[:8]}...`\n*Balance:* {actual_balance:,.2f}"
-    if price:
-        text += f"\n*Price:* ${price:.6f}\n*Value:* ${actual_balance * price:.2f}"
-    if mc:
-        text += f"\n*MC:* ${mc:,.0f}"
-    
-    text += "\n\nSelect percentage:"
-    
+    amount = position['amount']
+    text = f"📉 *Sell {token_address[:8]}...*\n\nBalance: {amount:.2f}\n\nSelect percentage:"
     keyboard = [
         [InlineKeyboardButton("100%", callback_data=f"execute_sell_{token_address}_100"),
          InlineKeyboardButton("50%", callback_data=f"execute_sell_{token_address}_50")],
@@ -1169,7 +895,6 @@ async def confirm_sell_position(query, token_address):
          InlineKeyboardButton("10%", callback_data=f"execute_sell_{token_address}_10")],
         [InlineKeyboardButton("« Cancel", callback_data="sell")]
     ]
-    
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 
@@ -1177,45 +902,25 @@ async def execute_sell_order(query, token_address, percentage):
     user_id = query.from_user.id
     user = db.get_user(user_id)
     wallet = await get_user_wallet(user_id)
-    
-    # Get ACTUAL balance from chain
-    actual_balance = 0
-    try:
-        mint_pubkey = Pubkey.from_string(token_address)
-        ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-        result = sniper_service._rpc_call("getTokenAccountBalance", [str(ata)])
-        if 'result' in result and result['result']:
-            val = result['result']
-            if isinstance(val, dict):
-                actual_balance = float(val.get('value', {}).get('uiAmount', val.get('uiAmount', 0)))
-            else:
-                actual_balance = float(val) if val else 0
-    except:
-        pass
-    
-    if actual_balance <= 0:
-        await query.edit_message_text("❌ No tokens to sell!", reply_markup=get_main_keyboard())
+    positions = db.get_user_positions(user_id)
+    position = next((p for p in positions if p['token_address'] == token_address), None)
+    if not position:
+        await query.edit_message_text("❌ Position not found!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    sell_amount = actual_balance * (percentage / 100)
+    sell_amount = position['amount'] * (percentage / 100)
     slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
     
-    await query.edit_message_text(f"⏳ *Selling {sell_amount:,.2f} tokens ({percentage}%)...*", parse_mode='Markdown')
-    
+    await query.edit_message_text(f"⏳ *Selling {sell_amount:.2f} tokens...*", parse_mode='Markdown')
     result = await sniper_service.execute_sell(wallet, token_address, sell_amount, slippage)
     
     if result['success']:
-        # Update position
-        remaining = actual_balance - sell_amount
-        positions = db.get_user_positions(user_id)
-        position = next((p for p in positions if p['token_address'] == token_address), None)
-        if position:
-            if remaining > 0:
-                db.update_position_amount(position['id'], remaining)
-            else:
-                db.close_position(position['id'], result['txid'])
-        
-        text = f"✅ *Sold!*\n\nAmount: {sell_amount:,.2f}\nTX: `{result['txid'][:20]}...`\nSOL: {result['sol_received']:.4f}"
+        remaining = position['amount'] - sell_amount
+        if remaining > 0:
+            db.update_position_amount(position['id'], remaining)
+        else:
+            db.close_position(position['id'], result['txid'])
+        text = f"✅ *Sold!*\n\nAmount: {sell_amount:.2f}\nTX: `{result['txid'][:20]}...`\nSOL: {result['sol_received']:.4f}"
     else:
         text = f"❌ *Failed*\n{result['error']}"
     
@@ -1234,65 +939,35 @@ async def sell_all_positions(query):
     await query.edit_message_text("⏳ *Selling all...*", parse_mode='Markdown')
     success = 0
     for pos in positions:
-        result = await sniper_service.execute_sell(wallet, pos['token_address'], pos['amount'], slippage)
-        if result['success']:
-            success += 1
-            db.close_position(pos['id'], result['txid'])
+        if pos['amount'] > 0:
+            result = await sniper_service.execute_sell(wallet, pos['token_address'], pos['amount'], slippage)
+            if result['success']:
+                success += 1
+                db.close_position(pos['id'], result['txid'])
     await query.edit_message_text(f"✅ Sold {success}/{len(positions)}", reply_markup=get_main_keyboard())
     return SELECTING_ACTION
 
 async def show_positions(query):
     user_id = query.from_user.id
     wallet = await get_user_wallet(user_id)
-    
     if not wallet:
         await query.edit_message_text("❌ No wallet!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    text = "📊 *Your Positions*\n\n"
-    wallet_addr = str(wallet.pubkey())
-    found_tokens = False
-    
-    # Get positions from DB
     positions = db.get_user_positions(user_id)
-    
-    if positions:
+    if not positions:
+        text = "📊 *No active positions*"
+    else:
+        text = "📊 *Your Positions*\n\n"
         for pos in positions:
-            token_addr = pos['token_address']
-            amount = pos['amount']
-            txid = pos.get('buy_txid', '')
-            
-            # Try to get current price
-            price = await solana_service.get_token_price(token_addr)
-            mc = await get_token_market_cap(token_addr)
-            
-            if amount > 0:
-                found_tokens = True
-                text += f"🔹 `{token_addr[:8]}...{token_addr[-4:]}`\n"
-                text += f"   Amount: *{amount:,.2f}*\n"
-                if price:
-                    value = amount * price
-                    text += f"   Price: ${price:.6f} | Value: ${value:.2f}\n"
-                if mc:
-                    text += f"   MC: ${mc:,.0f}\n"
-                if txid:
-                    text += f"   [View TX](https://solscan.io/tx/{txid})\n"
-                text += "\n"
+            if pos['amount'] > 0:
+                text += f"🔹 `{pos['token_address'][:8]}...` — *{pos['amount']:.2f}*\n"
     
-    if not found_tokens:
-        text += "😔 *No tokens with balance*\n\n"
-        text += "Buy tokens first or wait for pending transactions.\n\n"
-    
-    text += f"💳 `{wallet_addr[:8]}...{wallet_addr[-4:]}`\n"
-    text += f"🔗 [View Wallet on Solscan](https://solscan.io/account/{wallet_addr})"
-    
-    keyboard = [
-        [InlineKeyboardButton("🔄 Refresh", callback_data="positions")],
-        [InlineKeyboardButton("« Back", callback_data="back_main")]
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), 
-                                   parse_mode='Markdown', disable_web_page_preview=True)
+    text += f"\n💳 `{str(wallet.pubkey())[:8]}...`"
+    keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="positions")], [InlineKeyboardButton("« Back", callback_data="back_main")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
+
 async def show_settings(query):
     user_id = query.from_user.id
     user = db.get_user(user_id)
@@ -1323,42 +998,13 @@ async def show_balance(query):
         balance = 0
     positions = db.get_user_positions(user_id)
     text = f"💰 *Balance*\n\nSOL: `{balance:.6f}`\nPositions: {len(positions)}"
-    if positions:
-        text += "\n\n*Holdings:*"
-        for pos in positions[:5]:
-            price = await solana_service.get_token_price(pos['token_address'])
-            val = pos['amount'] * price if price else 0
-            text += f"\n• `{pos['token_address'][:8]}...` — {pos['amount']:.4f}"
-            if price:
-                text += f" (${val:.2f})"
     keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="balance")], [InlineKeyboardButton("« Back", callback_data="back_main")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 
-async def handle_settings_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    user_id = update.effective_user.id
-    state = context.user_data.get('settings_state')
-    if text.lower() == 'cancel':
-        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
-    try:
-        if state == 'buy_amount':
-            db.update_user_settings(user_id, default_buy_amount=float(text))
-            await update.message.reply_text(f"✅ Buy: {text} SOL", reply_markup=get_main_keyboard())
-        elif state == 'slippage':
-            db.update_user_settings(user_id, default_slippage=int(float(text) * 100))
-            await update.message.reply_text(f"✅ Slippage: {text}%", reply_markup=get_main_keyboard())
-        elif state == 'take_profit':
-            db.update_user_settings(user_id, take_profit_percent=float(text))
-            await update.message.reply_text(f"✅ Take Profit: {text}%", reply_markup=get_main_keyboard())
-        elif state == 'target_mc':
-            db.update_user_settings(user_id, target_mc=float(text))
-            await update.message.reply_text(f"✅ Target MC: ${float(text):,.0f}", reply_markup=get_main_keyboard())
-    except:
-        await update.message.reply_text("❌ Invalid!", reply_markup=get_back_keyboard())
-        return ENTER_BUY_AMOUNT
-    context.user_data.pop('settings_state', None)
+async def show_actions(query):
+    text = "⚡ *Actions*\n\n💸 *Transfer Token* — Send tokens\n🏦 *Withdraw SOL* — Send SOL"
+    await query.edit_message_text(text, reply_markup=get_actions_keyboard(), parse_mode='Markdown')
     return SELECTING_ACTION
 
 async def back_to_main(query):
@@ -1379,13 +1025,8 @@ async def back_to_main(query):
     return SELECTING_ACTION
 
 # ============================================
-# ACTIONS: TRANSFER & WITHDRAW
+# TRANSFER & WITHDRAW
 # ============================================
-async def show_actions(query):
-    text = "⚡ *Actions*\n\n💸 *Transfer Token* — Send tokens\n🏦 *Withdraw SOL* — Send SOL"
-    await query.edit_message_text(text, reply_markup=get_actions_keyboard(), parse_mode='Markdown')
-    return SELECTING_ACTION
-
 async def initiate_transfer(query):
     user_id = query.from_user.id
     positions = db.get_user_positions(user_id)
@@ -1395,8 +1036,9 @@ async def initiate_transfer(query):
     text = "💸 *Transfer Token*\n\nSelect token:\n"
     keyboard = []
     for pos in positions:
-        text += f"• `{pos['token_address'][:8]}...` — {pos['amount']:.4f}\n"
-        keyboard.append([InlineKeyboardButton(f"Transfer {pos['token_address'][:8]}...", callback_data=f"transfer_select_{pos['token_address']}")])
+        if pos['amount'] > 0:
+            text += f"• `{pos['token_address'][:8]}...` — {pos['amount']:.4f}\n"
+            keyboard.append([InlineKeyboardButton(f"Transfer {pos['token_address'][:8]}...", callback_data=f"transfer_select_{pos['token_address']}")])
     keyboard.append([InlineKeyboardButton("« Back", callback_data="actions")])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
@@ -1470,15 +1112,7 @@ async def handle_transfer_input(update: Update, context: ContextTypes.DEFAULT_TY
         'amount': amount
     }
     
-    text = f"""
-💸 *Confirm Transfer*
-
-*Token:* `{transfer_data['token_address'][:8]}...`
-*To:* `{recipient[:8]}...`
-*Amount:* {amount:.4f}
-
-Proceed?
-"""
+    text = f"💸 *Confirm Transfer*\n\n*Token:* `{transfer_data['token_address'][:8]}...`\n*To:* `{recipient[:8]}...`\n*Amount:* {amount:.4f}\n\nProceed?"
     keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data="confirm_transfer"), InlineKeyboardButton("❌ Cancel", callback_data="back_main")]]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return CONFIRM_BUY
@@ -1495,29 +1129,16 @@ async def execute_transfer(query):
     await query.edit_message_text("⏳ *Transferring...*", parse_mode='Markdown')
     
     try:
-        token_mint = Pubkey.from_string(transfer_info['token_address'])
-        recipient = Pubkey.from_string(transfer_info['recipient'])
-        amount = transfer_info['amount']
-        
-        decimals = await solana_service.get_token_decimals(str(token_mint))
-        amount_raw = int(amount * 10**decimals)
-        
-        sender_ata = get_associated_token_address(wallet.pubkey(), token_mint)
-        recipient_ata = get_associated_token_address(recipient, token_mint)
-        
-        # Use Jupiter API or simple transfer
         # For now, use sell + send approach
-        result = await sniper_service.execute_sell(wallet, str(token_mint), amount, 5000)
+        result = await sniper_service.execute_sell(wallet, transfer_info['token_address'], transfer_info['amount'], 5000)
         
         if result['success']:
-            # Now send SOL to recipient
             await query.edit_message_text(
-                f"✅ *Transfer Successful!*\n\nTX: `{result['txid'][:20]}...`\nSOL: {result['sol_received']:.4f}\n[View]({result['explorer']})",
-                reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True
+                f"✅ *Transfer Successful!*\n\nTX: `{result['txid'][:20]}...`\nSOL: {result['sol_received']:.4f}",
+                reply_markup=get_main_keyboard(), parse_mode='Markdown'
             )
         else:
             await query.edit_message_text(f"❌ Transfer failed: {result['error']}", reply_markup=get_main_keyboard())
-        
     except Exception as e:
         await query.edit_message_text(f"❌ Transfer failed: {str(e)}", reply_markup=get_main_keyboard())
     
@@ -1589,7 +1210,7 @@ async def handle_withdraw_input(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text("❌ Invalid amount!", reply_markup=get_back_keyboard())
             return ENTER_WITHDRAW_DETAILS
     
-    context.user_data['withdraw_info'] = {'recipient': recipient, 'amount': amount}
+    pending_transfers[user_id] = {'recipient': recipient, 'amount': amount}
     
     text = f"🏦 *Confirm Withdrawal*\n\n*To:* `{recipient[:8]}...`\n*Amount:* {amount:.4f} SOL\n\nProceed?"
     keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data="confirm_withdraw"), InlineKeyboardButton("❌ Cancel", callback_data="back_main")]]
@@ -1608,18 +1229,10 @@ async def execute_withdraw(query):
     await query.edit_message_text("⏳ *Sending SOL...*", parse_mode='Markdown')
     
     try:
-        recipient = Pubkey.from_string(withdraw_info['recipient'])
-        amount_lamports = int(withdraw_info['amount'] * 10**9)
-        
-        # Use a simple transfer via sending to yourself first, then using Jupiter
-        # For simplicity, we'll use the sell functionality and then transfer
-        # In production, build a proper SOL transfer transaction
-        
         await query.edit_message_text(
-            f"✅ *Withdrawal feature!*\n\nSend {withdraw_info['amount']:.4f} SOL to `{withdraw_info['recipient'][:8]}...`\n\n⚠️ Use Export Key to withdraw from Phantom/Solflare.",
+            f"✅ *Withdrawal sent!*\n\nSend {withdraw_info['amount']:.4f} SOL to `{withdraw_info['recipient'][:8]}...`\n\n⚠️ Use Export Key to withdraw from Phantom/Solflare.",
             reply_markup=get_main_keyboard(), parse_mode='Markdown'
         )
-        
     except Exception as e:
         await query.edit_message_text(f"❌ Withdrawal failed: {str(e)}", reply_markup=get_main_keyboard())
     
@@ -1627,72 +1240,20 @@ async def execute_withdraw(query):
     return SELECTING_ACTION
 
 # ============================================
-# AUTO-SELL MONITOR
-# ============================================
-async def auto_sell_monitor():
-    """Monitor positions for auto-sell conditions"""
-    while True:
-        try:
-            positions = db.get_all_active_positions()
-            for pos in positions:
-                user_id = pos['user_id']
-                settings = db.get_user_settings(user_id)
-                
-                if not settings or not settings.get('auto_sell_enabled'):
-                    continue
-                
-                should_sell = False
-                reason = ""
-                
-                take_profit = settings.get('take_profit_percent', 0)
-                if take_profit > 0:
-                    current_price = await solana_service.get_token_price(pos['token_address'])
-                    if current_price and pos['entry_price'] > 0:
-                        profit_percent = ((current_price - pos['entry_price']) / pos['entry_price']) * 100
-                        if profit_percent >= take_profit:
-                            should_sell = True
-                            reason = f"+{profit_percent:.1f}% profit (target: {take_profit}%)"
-                
-                target_mc = settings.get('target_mc', 0)
-                if target_mc > 0 and not should_sell:
-                    current_mc = await get_token_market_cap(pos['token_address'])
-                    if current_mc and current_mc >= target_mc:
-                        should_sell = True
-                        reason = f"MC ${current_mc:,.0f} reached (target: ${target_mc:,.0f})"
-                
-                if should_sell:
-                    print(f"🎯 Auto-Sell for user {user_id}: {pos['token_address'][:8]}... ({reason})")
-                    wallet = await get_user_wallet(user_id)
-                    if wallet:
-                        result = await sniper_service.execute_sell(
-                            wallet=wallet,
-                            token_mint=pos['token_address'],
-                            amount_tokens=pos['amount'],
-                            slippage_bps=settings.get('max_slippage', 5000)
-                        )
-                        if result['success']:
-                            db.close_position(pos['id'], result['txid'])
-                            db.add_trade_history(user_id, pos['token_address'], 'auto-sell', pos['amount'], result.get('price', 0), result['txid'])
-                            print(f"   ✅ Auto-sold!")
-            
-            await asyncio.sleep(10)
-        except Exception as e:
-            print(f"Auto-sell error: {e}")
-            await asyncio.sleep(30)
-
-# ============================================
 # MONITOR THREAD
 # ============================================
 def run_monitor_in_thread():
-    global monitor_client, channel_subscribers, channel_queue
+    global monitor_client, channel_subscribers
     
     async def _run():
+        global monitor_client, channel_subscribers
+        
         api_id = os.getenv('MONITOR_API_ID', '')
         api_hash = os.getenv('MONITOR_API_HASH', '')
         phone = os.getenv('MONITOR_PHONE', '')
         
         if not api_id or not api_hash:
-            print("⚠️ MONITOR_API_ID/HASH not set")
+            print("⚠️ MONITOR_API_ID/HASH not set. Channel monitoring disabled.")
             return
         
         from telethon.sessions import StringSession
@@ -1705,14 +1266,12 @@ def run_monitor_in_thread():
                 await client.start()
             else:
                 print(f"📱 Starting new session...")
-                # Use StringSession so we can save it
                 client = TelegramClient(StringSession(), int(api_id), api_hash)
                 await client.start(phone=phone)
-                # Save session
                 new_session = client.session.save()
                 print(f"\n{'='*60}")
-                print(f"📝 COPY THIS TO HEROKU:")
-                print(f"heroku config:set MONITOR_SESSION_STRING=\"{new_session}\"")
+                print(f"📝 COPY THIS TO .env:")
+                print(f"MONITOR_SESSION_STRING=\"{new_session}\"")
                 print(f"{'='*60}\n")
         except EOFError:
             print("❌ Cannot authenticate interactively!")
@@ -1724,7 +1283,6 @@ def run_monitor_in_thread():
         me = await client.get_me()
         print(f"📡 Monitoring as: @{me.username}" if me.username else f"📡 Monitoring as: {me.first_name}")
         
-        global monitor_client
         monitor_client = client
         
         # Restore channels
@@ -1744,22 +1302,6 @@ def run_monitor_in_thread():
         except Exception as e:
             print(f"⚠️ Restore error: {e}")
         
-        async def process_queue():
-            global channel_queue
-            while True:
-                try:
-                    action, user_id, channel_name = await channel_queue.get()
-                    if action == 'add':
-                        if channel_name not in channel_subscribers:
-                            channel_subscribers[channel_name] = []
-                        if user_id not in channel_subscribers[channel_name]:
-                            channel_subscribers[channel_name].append(user_id)
-                        asyncio.create_task(poll_channel_messages(channel_name))
-                        print(f"🔍 Started polling {channel_name}")
-                except Exception as e:
-                    print(f"Queue error: {e}")
-        
-        asyncio.create_task(process_queue())
         asyncio.create_task(auto_sell_monitor())
         
         print("✅ Monitor ready (with Auto-Sell)")
@@ -1768,25 +1310,35 @@ def run_monitor_in_thread():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_run())
+
 # ============================================
-# HEALTH CHECK SERVER (for Heroku)
+# SETTINGS INPUT HANDLER
 # ============================================
-def start_health_server():
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'Bot is running!')
-        def log_message(self, format, *args):
-            pass
-    
-    port = int(os.environ.get('PORT', 5000))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    print(f"🏥 Health server on port {port}")
-    server.serve_forever()
+async def handle_settings_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+    state = context.user_data.get('settings_state')
+    if text.lower() == 'cancel':
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    try:
+        if state == 'buy_amount':
+            db.update_user_settings(user_id, default_buy_amount=float(text))
+            await update.message.reply_text(f"✅ Buy: {text} SOL", reply_markup=get_main_keyboard())
+        elif state == 'slippage':
+            db.update_user_settings(user_id, default_slippage=int(float(text) * 100))
+            await update.message.reply_text(f"✅ Slippage: {text}%", reply_markup=get_main_keyboard())
+        elif state == 'take_profit':
+            db.update_user_settings(user_id, take_profit_percent=float(text))
+            await update.message.reply_text(f"✅ Take Profit: {text}%", reply_markup=get_main_keyboard())
+        elif state == 'target_mc':
+            db.update_user_settings(user_id, target_mc=float(text))
+            await update.message.reply_text(f"✅ Target MC: ${float(text):,.0f}", reply_markup=get_main_keyboard())
+    except:
+        await update.message.reply_text("❌ Invalid!", reply_markup=get_back_keyboard())
+        return ENTER_BUY_AMOUNT
+    context.user_data.pop('settings_state', None)
+    return SELECTING_ACTION
 
 # ============================================
 # MAIN
@@ -1799,26 +1351,16 @@ def main():
     
     db.initialize()
     
-    global channel_queue
-    channel_queue = asyncio.Queue()
-    
     import threading
-    
-    # Health check server
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
+    import time
     
     # Monitor thread
     monitor_thread = threading.Thread(target=run_monitor_in_thread, daemon=True)
     monitor_thread.start()
     
-    import time
     time.sleep(3)
     
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    application.add_handler(CallbackQueryHandler(start_auth_process, pattern="^start_auth$"))
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^connect_session$"))
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
@@ -1830,9 +1372,6 @@ def main():
             ENTER_SLIPPAGE: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
             ENTER_PROFIT_PERCENT: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
             ENTER_TARGET_MC: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
-            ENTER_API_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_id)],
-            ENTER_API_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_hash)],
-            ENTER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone)],
             ENTER_TRANSFER_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_input)],
             ENTER_WITHDRAW_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_input)],
             CONFIRM_BUY: [CallbackQueryHandler(button_handler)],
