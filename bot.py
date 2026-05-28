@@ -618,7 +618,7 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
             text=f"🔥 *Sniping token!*\n\n`{ca[:8]}...`\nAmount: {buy_amount} SOL\n\n⏳ Executing buy...",
             parse_mode='Markdown'
         )
-    except:
+    except Exception:
         pass
     
     result = await sniper_service.execute_buy(wallet=wallet, token_mint=ca, amount_sol=buy_amount, slippage_bps=slippage)
@@ -634,7 +634,7 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         
         print(f"   📊 Tokens bought: {tokens_bought}")
         
-        # Always save position
+        # Save position
         if tokens_bought > 0:
             db.add_position(user_id, ca, tokens_bought, result.get('price', 0), txid)
             db.add_trade_history(user_id, ca, 'buy', tokens_bought, result.get('price', 0), txid)
@@ -649,7 +649,7 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         
         print(f"   🔗 {result['explorer']}")
         
-        # SEND BUY NOTIFICATION with position pin
+        # SEND BUY NOTIFICATION
         try:
             mc = await get_token_market_cap(ca)
             token_price = await solana_service.get_token_price(ca)
@@ -702,8 +702,8 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
                     text=pos_text,
                     parse_mode='Markdown'
                 )
-        except Exception as e:
-            print(f"   ⚠️ Notification error: {e}")
+        except Exception:
+            pass
     
     else:
         # Buy failed - notify user
@@ -713,7 +713,7 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
                 text=f"❌ *Buy Failed*\n\nToken: `{ca[:8]}...`\nError: {result.get('error', 'Unknown')[:200]}",
                 parse_mode='Markdown'
             )
-        except:
+        except Exception:
             pass
 async def poll_channel_messages(channel_name: str):
     """Poll a channel for new messages"""
