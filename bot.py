@@ -112,16 +112,23 @@ async def get_user_wallet(user_id: int) -> Optional[Keypair]:
     except Exception as e:
         print(f"❌ Wallet derivation error: {e}")
         return None
+# Add this global dict at the top of bot.py (after other globals)
+pinned_positions_message: Dict[int, int] = {}  # user_id -> message_id
+
 async def send_buy_notification(user_id: int, token_address: str, tokens_bought: float, txid: str, price: float = 0):
-    """Send buy notification to user"""
+    """Send buy notification and update positions overview"""
     try:
+        global pinned_positions_message
+        
         # Get token info
         mc = await get_token_market_cap(token_address)
         token_price = await solana_service.get_token_price(token_address)
-        
         value = tokens_bought * token_price if token_price else 0
-        
-        text = f"""
+        # Before building positions text
+        await sync_positions_from_wallet(user_id)
+        positions = db.get_user_positions(user_id)
+        # 1. Send buy notification
+        buy_text = f"""
 🟢 *BUY EXECUTED!*
 
 *Token:* `{token_address[:8]}...{token_address[-4:]}`
@@ -130,45 +137,89 @@ async def send_buy_notification(user_id: int, token_address: str, tokens_bought:
 *TX:* [{txid[:15]}...](https://solscan.io/tx/{txid})
 """
         if mc:
-            text += f"*MC:* ${mc:,.0f}\n"
+            buy_text += f"*MC:* ${mc:,.0f}"
         
-        text += f"\n📊 Check /start → Positions"
-        
-        # Send to user
         await application.bot.send_message(
             chat_id=user_id,
-            text=text,
+            text=buy_text,
             parse_mode='Markdown',
             disable_web_page_preview=True
         )
         
-        # Pin the position update
+        # 2. Build positions overview
         positions = db.get_user_positions(user_id)
+        user = db.get_user(user_id)
+        sol_balance = await solana_service.get_balance(user['public_key'])
+        
+        pos_text = "📊 *Portfolio Overview*\n\n"
+        total_value = sol_balance
+        
         if positions:
-            pos_text = "📌 *Your Positions*\n\n"
-            for pos in positions[:5]:
+            for pos in positions[:15]:
                 addr = pos['token_address']
                 amt = pos['amount']
                 price_now = await solana_service.get_token_price(addr)
                 val = amt * price_now if price_now else 0
-                pos_text += f"• `{addr[:8]}...` — *{amt:,.2f}* (${val:.2f})\n"
-            
-            await application.bot.send_message(
-                chat_id=user_id,
-                text=pos_text,
-                parse_mode='Markdown'
-            )
+                total_value += val
+                
+                pnl = ""
+                if pos.get('entry_price') and pos['entry_price'] > 0 and price_now:
+                    pnl_pct = ((price_now - pos['entry_price']) / pos['entry_price']) * 100
+                    emoji = "🟢" if pnl_pct > 0 else "🔴"
+                    pnl = f" {emoji}{pnl_pct:+.1f}%"
+                
+                pos_text += f"• `{addr[:6]}...{addr[-4:]}` — *{amt:,.2f}* (${val:.2f}){pnl}\n"
+        else:
+            pos_text += "No positions yet.\n"
+        
+        pos_text += f"\n💰 *SOL:* ${sol_balance:.2f}"
+        pos_text += f"\n💎 *Total:* ${total_value:.2f}"
+        pos_text += f"\n\n🔄 Updates automatically on each trade"
+        
+        # 3. Pin the positions message (delete old, send new)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📈 Buy", callback_data="buy"),
+             InlineKeyboardButton("📉 Sell", callback_data="sell")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="positions")]
+        ])
+        
+        # Delete old pinned message if exists
+        if user_id in pinned_positions_message:
+            try:
+                await application.bot.delete_message(
+                    chat_id=user_id,
+                    message_id=pinned_positions_message[user_id]
+                )
+            except:
+                pass
+        
+        # Send new positions message
+        sent_msg = await application.bot.send_message(
+            chat_id=user_id,
+            text=pos_text,
+            parse_mode='Markdown',
+            reply_markup=keyboard
+        )
+        
+        # Store message ID for future updates
+        pinned_positions_message[user_id] = sent_msg.message_id
             
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
+
 async def send_sell_notification(user_id: int, token_address: str, amount_sold: float, sol_received: float, txid: str):
-    """Send sell notification to user"""
+    """Send sell notification and update positions"""
     try:
-        # Get token price for value calculation
+        global pinned_positions_message
+        
         token_price = await solana_service.get_token_price(token_address)
         value = amount_sold * token_price if token_price else 0
+        # Before building positions text
+        await sync_positions_from_wallet(user_id)
+        positions = db.get_user_positions(user_id)
         
-        text = f"""
+        # 1. Send sell notification
+        sell_text = f"""
 🔴 *SOLD!*
 
 *Token:* `{token_address[:8]}...{token_address[-4:]}`
@@ -176,34 +227,137 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
 *Value:* ${value:.2f}
 *SOL Received:* {sol_received:.4f} SOL
 *TX:* [{txid[:15]}...](https://solscan.io/tx/{txid})
-
-📊 /start → Positions
 """
         await application.bot.send_message(
             chat_id=user_id,
-            text=text,
+            text=sell_text,
             parse_mode='Markdown',
             disable_web_page_preview=True
         )
         
-        # Pin updated positions after sell
+        # 2. Update positions overview (same as buy notification)
         positions = db.get_user_positions(user_id)
+        user = db.get_user(user_id)
+        sol_balance = await solana_service.get_balance(user['public_key'])
+        
+        pos_text = "📊 *Portfolio Overview*\n\n"
+        total_value = sol_balance
+        
         if positions:
-            pos_text = "📌 *Updated Positions*\n\n"
-            for pos in positions[:10]:
+            for pos in positions[:15]:
                 addr = pos['token_address']
                 amt = pos['amount']
                 price_now = await solana_service.get_token_price(addr)
                 val = amt * price_now if price_now else 0
-                pos_text += f"• `{addr[:8]}...` — *{amt:,.2f}* (${val:.2f})\n"
-            
-            await application.bot.send_message(
+                total_value += val
+                
+                pnl = ""
+                if pos.get('entry_price') and pos['entry_price'] > 0 and price_now:
+                    pnl_pct = ((price_now - pos['entry_price']) / pos['entry_price']) * 100
+                    emoji = "🟢" if pnl_pct > 0 else "🔴"
+                    pnl = f" {emoji}{pnl_pct:+.1f}%"
+                
+                pos_text += f"• `{addr[:6]}...{addr[-4:]}` — *{amt:,.2f}* (${val:.2f}){pnl}\n"
+        else:
+            pos_text += "No positions.\n"
+        
+        pos_text += f"\n💰 *SOL:* ${sol_balance:.2f}"
+        pos_text += f"\n💎 *Total:* ${total_value:.2f}"
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📈 Buy", callback_data="buy"),
+             InlineKeyboardButton("📉 Sell", callback_data="sell")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="positions")]
+        ])
+        
+        # Update or send new positions message
+        if user_id in pinned_positions_message:
+            try:
+                await application.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=pinned_positions_message[user_id],
+                    text=pos_text,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
+                )
+            except:
+                # If edit fails, send new
+                sent_msg = await application.bot.send_message(
+                    chat_id=user_id,
+                    text=pos_text,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
+                )
+                pinned_positions_message[user_id] = sent_msg.message_id
+        else:
+            sent_msg = await application.bot.send_message(
                 chat_id=user_id,
                 text=pos_text,
-                parse_mode='Markdown'
+                parse_mode='Markdown',
+                reply_markup=keyboard
             )
+            pinned_positions_message[user_id] = sent_msg.message_id
+            
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
+async def sync_positions_from_wallet(user_id: int):
+    """Sync DB positions with actual wallet balances"""
+    wallet = await get_user_wallet(user_id)
+    if not wallet:
+        return
+    
+    wallet_addr = str(wallet.pubkey())
+    
+    try:
+        # Get ALL token accounts from wallet
+        import requests as req
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                wallet_addr,
+                {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                {"encoding": "jsonParsed"}
+            ]
+        }
+        resp = req.post(SOLANA_RPC, json=payload, timeout=15)
+        data = resp.json()
+        
+        if 'result' in data and data['result']:
+            tokens = data['result'].get('value', [])
+            actual_tokens = {}
+            
+            for t in tokens:
+                info = t.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
+                mint = info.get('mint', '')
+                amount = info.get('tokenAmount', {}).get('uiAmount', 0)
+                if amount > 0:
+                    actual_tokens[mint] = amount
+            
+            # Get existing positions from DB
+            db_positions = db.get_user_positions(user_id)
+            
+            # Update or create positions based on actual wallet
+            for mint, amount in actual_tokens.items():
+                existing = next((p for p in db_positions if p['token_address'] == mint), None)
+                if existing:
+                    # Update if amount changed
+                    if abs(existing['amount'] - amount) > 0.000001:
+                        db.update_position_amount(existing['id'], amount)
+                else:
+                    # Create new position for token found in wallet
+                    db.add_position(user_id, mint, amount, 0, 'wallet-sync')
+            
+            # Deactivate positions that no longer exist in wallet
+            for pos in db_positions:
+                if pos['token_address'] not in actual_tokens:
+                    db.close_position(pos['id'], 'wallet-sync')
+            
+            print(f"   ✅ Synced {len(actual_tokens)} tokens from wallet")
+            
+    except Exception as e:
+        print(f"   ⚠️ Wallet sync error: {e}")
 # ============================================
 # ADDRESS VALIDATION & EXTRACTION
 # ============================================
@@ -428,6 +582,7 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         if tokens_bought > 0:
             db.add_position(user_id, ca, tokens_bought, result.get('price', 0), txid)
             db.add_trade_history(user_id, ca, 'buy', tokens_bought, result.get('price', 0), txid)
+            await sync_positions_from_wallet(user_id)
             print(f"   ✅ Position saved: {tokens_bought:.6f} tokens")
         else:
             db.add_position(user_id, ca, 0, result.get('price', 0), txid)
@@ -1148,24 +1303,102 @@ async def execute_buy_order(query):
     return SELECTING_ACTION
 async def initiate_sell(query):
     user_id = query.from_user.id
-    positions = db.get_user_positions(user_id)
+    wallet = await get_user_wallet(user_id)
     
-    if not positions:
-        text = "No positions to sell"
-        await query.edit_message_text(text, reply_markup=get_main_keyboard())
+    if not wallet:
+        await safe_edit_message(query, "❌ *No wallet!*", reply_markup=get_main_keyboard(), parse_mode='Markdown')
         return SELECTING_ACTION
     
-    text = "Select Token to Sell\n\n"
-    keyboard = []
-    for pos in positions:
-        if pos['amount'] > 0:
-            text += f"• {pos['token_address'][:8]}... - {pos['amount']:.2f}\n"
-            keyboard.append([InlineKeyboardButton(f"Sell {pos['token_address'][:8]}...", callback_data=f"sell_{pos['token_address']}")])
+    await safe_edit_message(query, "⏳ *Scanning wallet...*", parse_mode='Markdown')
     
-    keyboard.append([InlineKeyboardButton("Sell by Address", callback_data="sell_by_address")])
+    # STEP 1: Scan wallet for actual balances
+    wallet_tokens = {}
+    try:
+        result = sniper_service._rpc_call("getTokenAccountsByOwner", [
+            str(wallet.pubkey()),
+            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+            {"encoding": "jsonParsed"}
+        ])
+        
+        if 'result' in result and result['result']:
+            token_accounts = result['result'].get('value', [])
+            for acc in token_accounts:
+                parsed = acc.get('account', {}).get('data', {}).get('parsed', {})
+                info = parsed.get('info', {})
+                amount = info.get('tokenAmount', {}).get('uiAmount', 0)
+                mint = info.get('mint', '')
+                
+                if amount > 0 and mint != "So11111111111111111111111111111111111111112":
+                    wallet_tokens[mint] = amount
+                    
+                    # Update DB with actual amount
+                    positions = db.get_user_positions(user_id)
+                    existing = next((p for p in positions if p['token_address'] == mint), None)
+                    if existing:
+                        if abs(existing['amount'] - amount) > 0.000001:
+                            db.update_position_amount(existing['id'], amount)
+                    else:
+                        db.add_position(user_id, mint, amount, 0, 'wallet-scan')
+    except Exception as e:
+        print(f"   ⚠️ Wallet scan error: {e}")
+    
+    # STEP 2: Get updated positions
+    positions = db.get_user_positions(user_id)
+    
+    # Filter to only tokens with balance
+    active_positions = [p for p in positions if p['amount'] > 0]
+    
+    if not active_positions:
+        text = "📉 *No Tokens to Sell*\n\n"
+        text += "Your wallet doesn't have any tokens with balance.\n\n"
+        text += "💡 Buy tokens first or check on Solscan."
+        
+        keyboard = [
+            [InlineKeyboardButton("📈 Buy Token", callback_data="buy")],
+            [InlineKeyboardButton("📝 Sell by Address", callback_data="sell_by_address")],
+            [InlineKeyboardButton("« Back", callback_data="back_main")]
+        ]
+        await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return SELECTING_ACTION
+    
+    # STEP 3: Build sell menu
+    text = "📉 *Select Token to Sell*\n\n"
+    keyboard = []
+    
+    for pos in active_positions[:10]:  # Limit to 10
+        token_addr = pos['token_address']
+        amount = pos['amount']
+        
+        # Get price for value display
+        price = await solana_service.get_token_price(token_addr)
+        mc = await get_token_market_cap(token_addr)
+        
+        value = amount * price if price else 0
+        
+        text += f"🔹 `{token_addr[:8]}...{token_addr[-4:]}`\n"
+        text += f"   Amount: *{amount:,.2f}*"
+        if value > 0:
+            text += f" (${value:.2f})"
+        if mc:
+            text += f" | MC: ${mc:,.0f}"
+        text += "\n\n"
+        
+        # Sell button with amount
+        keyboard.append([
+            InlineKeyboardButton(
+                f"💰 Sell {token_addr[:8]}... ({amount:,.0f})",
+                callback_data=f"sell_{token_addr}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("📝 Sell by Address", callback_data="sell_by_address")])
+    keyboard.append([InlineKeyboardButton("📉 Sell All Tokens", callback_data="sell_all")])
     keyboard.append([InlineKeyboardButton("« Back", callback_data="back_main")])
     
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    text += f"✅ *{len(active_positions)} tokens found in wallet*"
+    
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), 
+                             parse_mode='Markdown', disable_web_page_preview=True)
     return SELECTING_ACTION
 
 async def confirm_sell_position(query, token_address):
@@ -1331,13 +1564,15 @@ async def show_positions(query):
         await safe_edit_message(query, "❌ No wallet!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    # Get positions from database
-    positions = db.get_user_positions(user_id)
+    await safe_edit_message(query, "⏳ *Syncing with wallet...*", parse_mode='Markdown')
     
-    # Also scan on-chain for any tokens not in DB
+    wallet_addr = str(wallet.pubkey())
+    found_tokens = {}  # mint -> amount
+    
+    # STEP 1: Scan wallet for ALL tokens
     try:
         result = sniper_service._rpc_call("getTokenAccountsByOwner", [
-            str(wallet.pubkey()),
+            wallet_addr,
             {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
             {"encoding": "jsonParsed"}
         ])
@@ -1351,44 +1586,92 @@ async def show_positions(query):
                 mint = info.get('mint', '')
                 
                 if amount > 0 and mint != "So11111111111111111111111111111111111111112":
-                    # Check if already in positions
-                    existing = next((p for p in positions if p['token_address'] == mint), None)
-                    if not existing:
-                        # Add to positions
-                        db.add_position(user_id, mint, amount, 0, "on_chain_scan")
-                        positions = db.get_user_positions(user_id)  # Refresh
+                    found_tokens[mint] = amount
+                    
+                    # Update or create in DB
+                    existing_positions = db.get_user_positions(user_id)
+                    existing = next((p for p in existing_positions if p['token_address'] == mint), None)
+                    
+                    if existing:
+                        if abs(existing['amount'] - amount) > 0.000001:
+                            db.update_position_amount(existing['id'], amount)
+                    else:
+                        db.add_position(user_id, mint, amount, 0, 'wallet-scan')
+        
+        # STEP 2: Deactivate positions no longer in wallet
+        db_positions = db.get_user_positions(user_id)
+        for pos in db_positions:
+            if pos['token_address'] not in found_tokens:
+                db.close_position(pos['id'], 'wallet-scan')
+                
     except Exception as e:
-        print(f"   ⚠️ Scan error: {e}")
+        print(f"   ⚠️ Wallet scan error: {e}")
     
+    # STEP 3: Get updated positions from DB
+    positions = db.get_user_positions(user_id)
+    
+    # STEP 4: Build display
     if not positions:
-        text = "📊 No active positions\n\nNo tokens found in your wallet."
+        text = "📊 *No Tokens Found*\n\n"
+        text += "Your wallet is empty or tokens are still being indexed.\n\n"
+        text += "💡 Buy tokens or wait for pending transactions."
     else:
-        text = "📊 Your Positions\n\n"
+        text = "📊 *Your Positions*\n\n"
+        total_value = 0
+        
         for pos in positions:
             if pos['amount'] > 0:
-                token_short = f"{pos['token_address'][:6]}...{pos['token_address'][-4:]}"
-                text += f"🔹 {token_short}\n"
-                text += f"   Amount: {pos['amount']:.4f}\n"
+                token_addr = pos['token_address']
+                amount = pos['amount']
+                token_short = f"{token_addr[:6]}...{token_addr[-4:]}"
                 
                 # Get current price
-                price = await solana_service.get_token_price(pos['token_address'])
-                if price and price > 0:
-                    value = pos['amount'] * price
-                    text += f"   Value: ${value:.2f}\n"
+                price = await solana_service.get_token_price(token_addr)
+                mc = await get_token_market_cap(token_addr)
                 
-                if pos['buy_txid']:
-                    text += f"   [TX](https://solscan.io/tx/{pos['buy_txid']})\n"
+                value = amount * price if price else 0
+                total_value += value
+                
+                # P&L calculation
+                pnl_text = ""
+                if pos.get('entry_price') and pos['entry_price'] > 0 and price and price > 0:
+                    pnl_pct = ((price - pos['entry_price']) / pos['entry_price']) * 100
+                    emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                    pnl_text = f" {emoji}{pnl_pct:+.1f}%"
+                
+                text += f"🔹 `{token_short}`\n"
+                text += f"   Amount: *{amount:,.2f}*"
+                if value > 0:
+                    text += f" (${value:.2f})"
+                text += f"{pnl_text}\n"
+                
+                if mc:
+                    text += f"   MC: ${mc:,.0f}\n"
+                
+                if pos.get('buy_txid'):
+                    text += f"   [View TX](https://solscan.io/tx/{pos['buy_txid']})\n"
                 text += "\n"
+        
+        # Add SOL balance
+        sol_balance = await solana_service.get_balance(wallet_addr)
+        total_value += sol_balance
+        
+        text += f"💰 *SOL Balance:* {sol_balance:.4f} SOL (${sol_balance * (await solana_service.get_token_price('So11111111111111111111111111111111111111112') or 80):.2f})\n"
+        text += f"💎 *Total Value:* ${total_value:.2f}\n\n"
+        text += f"✅ *Verified from wallet* - {len(positions)} tokens"
     
-    wallet_short = f"{str(wallet.pubkey())[:8]}...{str(wallet.pubkey())[-4:]}"
-    text += f"\n💳 {wallet_short}\n🔗 [View Wallet](https://solscan.io/account/{str(wallet.pubkey())})"
+    wallet_short = f"{wallet_addr[:8]}...{wallet_addr[-4:]}"
+    text += f"\n\n💳 `{wallet_short}`"
+    text += f"\n🔗 [View on Solscan](https://solscan.io/account/{wallet_addr})"
     
     keyboard = [
-        [InlineKeyboardButton("🔄 Refresh", callback_data="positions")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="positions"),
+         InlineKeyboardButton("📉 Sell", callback_data="sell")],
         [InlineKeyboardButton("« Back", callback_data="back_main")]
     ]
     
-    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), 
+                             parse_mode='Markdown', disable_web_page_preview=True)
     return SELECTING_ACTION
 
 async def show_settings(query):
