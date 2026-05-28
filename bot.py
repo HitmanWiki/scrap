@@ -301,7 +301,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Read ALL tokens using Helius REST API"""
+    """Read ALL tokens from wallet and update positions"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return {}
@@ -310,92 +310,56 @@ async def sync_positions_from_wallet(user_id: int):
     wallet_tokens = {}
     
     try:
-        import requests as req
+        # Get all positions we know about from DB
+        positions = db.get_user_positions(user_id)
+        known_mints = set()
+        for pos in positions:
+            known_mints.add(pos['token_address'])
         
-        api_key = os.getenv('HELIUS_API_KEY', '')
-        
-        # Try Helius REST API for token balances
-        if api_key:
-            print(f"   Trying Helius REST API...")
-            rest_url = f"https://api.helius.xyz/v0/addresses/{wallet_addr}/balances?api-key={api_key}"
-            resp = req.get(rest_url, timeout=15)
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                tokens = data.get('tokens', [])
-                print(f"   Helius REST: Found {len(tokens)} tokens")
-                
-                for token in tokens:
-                    mint = token.get('mint', '')
-                    amount = token.get('amount', 0)
-                    decimals = token.get('decimals', 6)
-                    actual_amount = amount / (10 ** decimals)
-                    
-                    if actual_amount > 0:
-                        wallet_tokens[mint] = actual_amount
-                        print(f"   ✅ {mint[:8]}... = {actual_amount:.4f}")
-        
-        # Fallback: Try SolanaFM API
-        if not wallet_tokens:
-            print(f"   Trying SolanaFM API...")
-            fm_url = f"https://api.solana.fm/v0/accounts/{wallet_addr}/tokens"
-            resp = req.get(fm_url, timeout=15)
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                tokens = data.get('result', {}).get('data', [])
-                print(f"   SolanaFM: Found {len(tokens)} tokens")
-                
-                for token in tokens:
-                    mint = token.get('mint', token.get('tokenAddress', ''))
-                    amount = token.get('amount', token.get('balance', 0))
-                    if amount > 0:
-                        wallet_tokens[mint] = amount
-        
-        # Fallback: Try checking ATA for HOPPY token (the one we know exists)
-        if not wallet_tokens:
-            print(f"   Checking known tokens via ATA...")
-            positions = db.get_user_positions(user_id)
-            
-            # Also check the HOPPY token we see on Solscan
-            known_tokens = set()
-            for pos in positions:
-                known_tokens.add(pos['token_address'])
-            
-            # Add any other known tokens
-            # Check from recent buys in trade history
-            trades = db.get_user_trade_history(user_id, limit=20)
-            for trade in trades:
-                known_tokens.add(trade['token_address'])
-            
-            for mint in known_tokens:
+        # Check each known token's ATA directly
+        if known_mints:
+            print(f"   Checking {len(known_mints)} known tokens...")
+            for mint in known_mints:
                 try:
                     mint_pubkey = Pubkey.from_string(mint)
                     ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
                     
-                    # Use direct HTTP call
-                    payload = {
-                        "jsonrpc": "2.0", "id": 1,
-                        "method": "getTokenAccountBalance",
-                        "params": [str(ata)]
-                    }
-                    resp = req.post(SOLANA_RPC, json=payload, timeout=10)
-                    data = resp.json()
+                    # Direct balance check
+                    balance = sniper_service.client.get_token_balance(str(ata))
                     
-                    if 'result' in data and data['result']:
-                        val = data['result']
-                        if isinstance(val, dict):
-                            amount = float(val.get('value', {}).get('uiAmount', 0))
-                        else:
-                            amount = float(val)
-                        
-                        if amount > 0:
-                            wallet_tokens[mint] = amount
-                            print(f"   ✅ ATA: {mint[:8]}... = {amount:.4f}")
+                    if balance > 0:
+                        wallet_tokens[mint] = balance
+                        print(f"   ✅ {mint[:8]}... = {balance:.4f}")
                 except Exception as e:
-                    print(f"   ⚠️ ATA check error for {mint[:8]}: {e}")
+                    print(f"   ⚠️ {mint[:8]}...: {e}")
         
-        # Update DB
+        # Also try RPC to find any tokens we don't know about
+        try:
+            payload = {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    wallet_addr,
+                    {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                    {"encoding": "jsonParsed"}
+                ]
+            }
+            resp = requests.post(SOLANA_RPC, json=payload, timeout=15)
+            data = resp.json()
+            
+            if 'result' in data and data['result']:
+                tokens = data['result'].get('value', [])
+                for t in tokens:
+                    info = t.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
+                    mint = info.get('mint', '')
+                    amount = info.get('tokenAmount', {}).get('uiAmount', 0)
+                    if amount > 0 and mint not in wallet_tokens:
+                        wallet_tokens[mint] = amount
+                        print(f"   ✅ RPC: {mint[:8]}... = {amount:.4f}")
+        except:
+            pass
+        
+        # Update database
         if wallet_tokens:
             existing_positions = db.get_user_positions(user_id)
             for mint, amount in wallet_tokens.items():
@@ -406,14 +370,17 @@ async def sync_positions_from_wallet(user_id: int):
                 else:
                     db.add_position(user_id, mint, amount, 0, 'wallet-scan')
             
+            # Remove positions with zero balance
+            for pos in existing_positions:
+                if pos['token_address'] not in wallet_tokens:
+                    db.close_position(pos['id'], 'sold')
+            
             print(f"   ✅ Synced: {len(wallet_tokens)} tokens")
         else:
-            print(f"   ⚠️ No tokens found by any method")
+            print(f"   ⚠️ No tokens found")
         
     except Exception as e:
         print(f"   ⚠️ Sync error: {e}")
-        import traceback
-        traceback.print_exc()
     
     return wallet_tokens
 # ============================================
