@@ -591,23 +591,24 @@ class Database:
             print(f"❌ Error adding position: {e}")
             return -1
 
-def update_position_amount(self, position_id: int, new_amount: float) -> bool:
-    """Update just the amount of a position"""
-    try:
-        with self.lock:
-            conn = self.get_connection()
-            cursor = self.get_cursor(conn)
-            ph = self.placeholder()
-            cursor.execute(
-                f'UPDATE positions SET amount = {ph}, updated_at = CURRENT_TIMESTAMP WHERE id = {ph}',
-                (new_amount, position_id)
-            )
-            conn.commit()
-            conn.close()
-            return True
-    except Exception as e:
-        print(f"❌ Error updating position: {e}")
-        return False
+    def update_position_amount(self, position_id: int, new_amount: float) -> bool:
+        """Update just the amount of a position"""
+        try:
+            with self.lock:
+                conn = self.get_connection()
+                cursor = self.get_cursor(conn)
+                ph = self.placeholder()
+                cursor.execute(
+                    f'UPDATE positions SET amount = {ph}, updated_at = CURRENT_TIMESTAMP WHERE id = {ph}',
+                    (new_amount, position_id)
+                )
+                conn.commit()
+                conn.close()
+                return True
+        except Exception as e:
+            print(f"❌ Error updating position: {e}")
+            return False
+    
     def get_user_positions(self, user_id: int, active_only: bool = True) -> List[Dict]:
         try:
             with self.lock:
