@@ -1,6 +1,5 @@
 """
-Sniper Service - NO solana package, NO preflight check
-Matches your working single-user script exactly
+Sniper Service - Compatible with solders 0.18.1 and your working script
 """
 
 import asyncio
@@ -13,60 +12,18 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 from solders.token.associated import get_associated_token_address
 from solders import message
+from solana.rpc.api import Client
+from solana.rpc.types import TxOpts
 from typing import Optional
-
-
-class SimpleRpcClient:
-    """Simple RPC client - matches your working script"""
-    
-    def __init__(self, rpc_url: str):
-        self.rpc_url = rpc_url
-    
-    def _rpc_call(self, method: str, params: list) -> dict:
-        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        try:
-            response = requests.post(self.rpc_url, json=payload, timeout=30)
-            return response.json()
-        except Exception as e:
-            return {"error": {"message": str(e)}}
-    
-    def send_raw_transaction(self, tx_bytes: bytes) -> str:
-        """Send raw signed transaction - NO preflight check"""
-        tx_base58 = base58.b58encode(tx_bytes).decode()
-        # Simple send without any preflight options (matches your working script)
-        result = self._rpc_call("sendTransaction", [tx_base58])
-        if 'error' in result:
-            raise Exception(result['error'].get('message', 'Send failed'))
-        return result['result']
-    
-    def get_balance(self, pubkey: str) -> float:
-        result = self._rpc_call("getBalance", [pubkey])
-        if 'result' in result:
-            return result['result']['value'] / 1e9
-        return 0
-    
-    def get_token_balance(self, token_account: str) -> float:
-        result = self._rpc_call("getTokenAccountBalance", [token_account])
-        if 'result' in result and result['result']:
-            val = result['result']
-            if isinstance(val, dict):
-                return float(val.get('value', {}).get('uiAmount', 0))
-        return 0
 
 
 class SniperService:
     def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
-        self.client = SimpleRpcClient(rpc_url)
-    
-    def is_valid_solana_address(self, address: str) -> bool:
-        try:
-            base58.b58decode(address)
-            return True
-        except:
-            return False
+        self.client = Client(rpc_url)
     
     async def get_token_decimals(self, token_mint: str) -> int:
+        """Get token decimals from Jupiter token list"""
         try:
             url = f"https://tokens.jup.ag/token/{token_mint}"
             resp = requests.get(url, timeout=5)
@@ -79,6 +36,7 @@ class SniperService:
         return 9
     
     async def get_token_price(self, token_mint: str) -> Optional[float]:
+        """Get token price from DexScreener"""
         try:
             url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
             resp = requests.get(url, timeout=5)
@@ -90,7 +48,15 @@ class SniperService:
             pass
         return None
     
+    def is_valid_solana_address(self, address: str) -> bool:
+        try:
+            base58.b58decode(address)
+            return True
+        except:
+            return False
+    
     async def resolve_dexscreener_pair(self, pair_url: str) -> Optional[str]:
+        """Resolve DexScreener URL to token address"""
         import re
         try:
             match = re.search(r'dexscreener\.com/([a-zA-Z0-9]+)/([a-zA-Z0-9]+)', pair_url)
@@ -111,6 +77,7 @@ class SniperService:
         return None
     
     async def extract_contract_address(self, text: str) -> Optional[str]:
+        """Extract contract address - matches your working script"""
         import re
         urls = re.findall(r'https?://(?:www\.)?dexscreener\.com/[^\s]+', text)
         for url in urls:
@@ -127,16 +94,24 @@ class SniperService:
         return None
     
     async def is_holding_token(self, wallet_pubkey: Pubkey, token_mint: str) -> bool:
+        """Check if wallet holds token"""
         try:
             mint_pubkey = Pubkey.from_string(token_mint)
             ata = get_associated_token_address(wallet_pubkey, mint_pubkey)
-            balance = self.client.get_token_balance(str(ata))
-            return balance > 0
+            response = self.client.get_token_account_balance(ata, "confirmed")
+            if response.value:
+                return response.value.ui_amount > 0
+            return False
         except:
             return False
     
     async def get_wallet_balance(self, wallet_pubkey: Pubkey) -> float:
-        return self.client.get_balance(str(wallet_pubkey))
+        """Get SOL balance"""
+        try:
+            response = self.client.get_balance(wallet_pubkey, "processed")
+            return response.value / 1e9
+        except:
+            return 0
     
     async def execute_buy(self, wallet: Keypair, token_mint: str, amount_sol: float, slippage_bps: int) -> dict:
         """Execute buy - MATCHES YOUR WORKING SCRIPT EXACTLY"""
@@ -174,7 +149,7 @@ class SniperService:
             if "swapTransaction" not in swap_data:
                 return {"success": False, "error": "No swapTransaction"}
             
-            # 3. Sign transaction (using solders only)
+            # 3. Sign transaction (using solders 0.18.1 compatible method)
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             raw_tx = VersionedTransaction.from_bytes(tx_bytes)
             message_bytes = message.to_bytes_versioned(raw_tx.message)
@@ -182,9 +157,13 @@ class SniperService:
             signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
             signed_tx_bytes = bytes(signed_tx)
             
-            # 4. Send transaction - NO preflight options (same as your working script)
+            # 4. Send transaction
             print("   Sending transaction...")
-            txid = self.client.send_raw_transaction(signed_tx_bytes)
+            result = self.client.send_raw_transaction(
+                signed_tx_bytes,
+                opts=TxOpts(skip_preflight=True)
+            )
+            txid = str(result.value)
             print(f"   ✅ TXID: {txid}")
             
             # 5. Calculate tokens bought
@@ -203,7 +182,7 @@ class SniperService:
             return {"success": False, "error": str(e)}
     
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Execute sell transaction"""
+        """Execute sell"""
         try:
             print(f"   Selling {amount_tokens:.6f} tokens...")
             
@@ -244,7 +223,8 @@ class SniperService:
             signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
             signed_tx_bytes = bytes(signed_tx)
             
-            txid = self.client.send_raw_transaction(signed_tx_bytes)
+            result = self.client.send_raw_transaction(signed_tx_bytes, opts=TxOpts(skip_preflight=True))
+            txid = str(result.value)
             
             sol_received = 0
             raw_output = quote.get("outputAmount", "0")
