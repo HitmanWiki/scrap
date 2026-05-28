@@ -166,23 +166,19 @@ class SniperService:
     # PUMP.FUN DIRECT SELL
     # ============================================
     
+    # ============================================
+# PUMP.FUN DIRECT SELL
+# ============================================
+
     async def execute_pump_sell_direct(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
         """Sell pump.fun tokens directly using Pump.fun program"""
         try:
-            from solders.instruction import Instruction, AccountMeta
-            from solders.system_program import ID as SYSTEM_PROGRAM_ID
-            from solders.token.associated import get_associated_token_address
-            from solders.pubkey import Pubkey
-            from solders.transaction import VersionedTransaction
-            from solders.message import MessageV0
-            from solders.hash import Hash
             from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
             import base64
             
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
-            # Pump.fun program IDs
             PUMP_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
             PUMP_GLOBAL = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
             PUMP_FEE = Pubkey.from_string("CebN5WGQ4jvEPvsVU4EoHEpgzq1VVAYAbxc9YetpAMWd")
@@ -193,42 +189,17 @@ class SniperService:
             mint = Pubkey.from_string(token_mint)
             user_ata = get_associated_token_address(wallet.pubkey(), mint)
             
-            # Derive bonding curve PDA
-            bonding_curve, bump = Pubkey.find_program_address(
-                [b"bonding-curve", bytes(mint)], PUMP_PROGRAM
-            )
-            
-            # Derive associated bonding curve
+            bonding_curve, _ = Pubkey.find_program_address([b"bonding-curve", bytes(mint)], PUMP_PROGRAM)
             assoc_bonding_curve, _ = Pubkey.find_program_address(
-                [bytes(bonding_curve), bytes(TOKEN_PROGRAM), bytes(mint)],
-                ASSOC_TOKEN_PROGRAM
+                [bytes(bonding_curve), bytes(TOKEN_PROGRAM), bytes(mint)], ASSOC_TOKEN_PROGRAM
             )
             
-            # Check if assoc_bonding_curve exists, if not create it
-            create_ata_ix = None
-            account_info = self._rpc_call("getAccountInfo", [str(assoc_bonding_curve)])
-            if 'result' in account_info and account_info['result'] is None:
-                # Need to create the associated token account
-                from spl.token.instructions import create_associated_token_account, CreateAssociatedTokenAccountParams
-                create_ata_ix = create_associated_token_account(
-                    CreateAssociatedTokenAccountParams(
-                        payer=wallet.pubkey(),
-                        owner=bonding_curve,
-                        mint=mint,
-                        token_program_id=TOKEN_PROGRAM,
-                        associated_token_program_id=ASSOC_TOKEN_PROGRAM,
-                    )
-                )
-                print("   Creating associated bonding curve account...")
-            
-            # Sell discriminator
             SELL_DISCRIMINATOR = 12502976635542562355
             
-            # Build sell instruction data
             data = bytearray()
             data.extend(SELL_DISCRIMINATOR.to_bytes(8, 'little'))
             data.extend(amount_raw.to_bytes(8, 'little'))
-            data.extend(int(0).to_bytes(8, 'little'))  # min_sol_output
+            data.extend(int(0).to_bytes(8, 'little'))
             
             sell_ix = Instruction(
                 program_id=PUMP_PROGRAM,
@@ -249,38 +220,30 @@ class SniperService:
                 data=bytes(data)
             )
             
-            # Build instructions
             instructions = [
                 set_compute_unit_limit(300000),
-                set_compute_unit_price(100000),
+                set_compute_unit_price(500000),
+                sell_ix,
             ]
             
-            if create_ata_ix:
-                instructions.append(create_ata_ix)
-            
-            instructions.append(sell_ix)
-            
-            # Get blockhash
             blockhash_str = self.client.get_latest_blockhash()
             blockhash = Hash.from_string(blockhash_str)
             
-            # Build message
             msg = MessageV0.try_compile(
                 payer=wallet.pubkey(),
                 instructions=instructions,
                 address_lookup_table_accounts=[],
                 recent_blockhash=blockhash,
             )
-            
             tx = VersionedTransaction(msg, [wallet])
             
-            # Send with base64
+            # Send with skipPreflight: True (Helius doesn't support preflight)
             tx_base64 = base64.b64encode(bytes(tx)).decode()
             result = self._rpc_call("sendTransaction", [
                 tx_base64,
                 {
                     "encoding": "base64",
-                    "skipPreflight": False,
+                    "skipPreflight": True,
                     "preflightCommitment": "processed",
                     "maxRetries": 3
                 }
@@ -288,39 +251,29 @@ class SniperService:
             
             if 'error' in result:
                 err_msg = result['error'].get('message', str(result['error']))
-                print(f"   ⚠️ RPC Error: {err_msg}")
                 return {"success": False, "error": err_msg}
             
             txid = result.get('result', '')
             print(f"   ✅ PumpSell TXID: {txid}")
             
-            return {
-                "success": True,
-                "txid": txid,
-                "sol_received": 0,
-                "explorer": f"https://solscan.io/tx/{txid}"
-            }
+            return {"success": True, "txid": txid, "sol_received": 0, "explorer": f"https://solscan.io/tx/{txid}"}
             
         except Exception as e:
             print(f"   ❌ PumpSell error: {e}")
-            import traceback
-            traceback.print_exc()
             return {"success": False, "error": str(e)}
-        
+
     # ============================================
     # JUPITER SELL
     # ============================================
-    
+
     async def execute_jupiter_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Sell tokens using Jupiter with multiple fallback routes"""
+        """Sell tokens using Jupiter"""
         try:
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
             output_mints = [
                 ("So11111111111111111111111111111111111111112", 9),
-                ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 6),
-                ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", 6),
             ]
             
             for output_mint, output_decimals in output_mints:
@@ -334,7 +287,7 @@ class SniperService:
                         "inputMint": token_mint,
                         "outputMint": output_mint,
                         "amount": test_raw,
-                        "slippageBps": max(slippage_bps, 9000),
+                        "slippageBps": 9900,  # 99% for memecoins
                     }
                     
                     try:
@@ -346,7 +299,7 @@ class SniperService:
                             continue
                         
                         expected_output = int(quote["outputAmount"]) / (10 ** output_decimals)
-                        print(f"   ✅ Route: {expected_output:.6f}")
+                        print(f"   ✅ Route found: {expected_output:.6f} SOL")
                         
                         swap_url = "https://lite-api.jup.ag/swap/v1/swap"
                         payload = {
@@ -372,8 +325,7 @@ class SniperService:
                         print(f"   ✅ SELL TXID: {txid}")
                         
                         return {
-                            "success": True,
-                            "txid": txid,
+                            "success": True, "txid": txid,
                             "sol_received": expected_output,
                             "explorer": f"https://solscan.io/tx/{txid}"
                         }
@@ -383,11 +335,11 @@ class SniperService:
             return {"success": False, "error": "No routes found"}
         except Exception as e:
             return {"success": False, "error": str(e)}
-    
+
     # ============================================
     # MAIN SELL METHOD
     # ============================================
-    
+
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
         """Execute sell - PumpSwap for pump tokens, Jupiter for others"""
         is_pump = token_mint.endswith('pump')
