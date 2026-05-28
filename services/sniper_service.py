@@ -1,5 +1,5 @@
 """
-Sniper Service - Uses PumpSwap for pump.fun tokens, Jupiter for regular tokens
+Sniper Service - NO solana package, uses only solders + requests
 """
 
 import asyncio
@@ -12,19 +12,17 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 from solders.token.associated import get_associated_token_address
 from solders import message
-from solana.rpc.api import Client
-from solana.rpc.types import TxOpts
 from typing import Optional
 import json
 
 
-class SniperService:
+class SimpleRpcClient:
+    """Lightweight RPC client - no solana package needed"""
+    
     def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
-        self.client = Client(rpc_url)
     
     def _rpc_call(self, method: str, params: list) -> dict:
-        """Make raw RPC call"""
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
             response = requests.post(self.rpc_url, json=payload, timeout=30)
@@ -32,8 +30,37 @@ class SniperService:
         except Exception as e:
             return {"error": {"message": str(e)}}
     
+    def send_raw_transaction(self, tx_bytes: bytes) -> str:
+        tx_base58 = base58.b58encode(tx_bytes).decode()
+        result = self._rpc_call("sendTransaction", [tx_base58])
+        if 'error' in result:
+            raise Exception(result['error'].get('message', 'Send failed'))
+        return result['result']
+    
+    def get_balance(self, pubkey: str) -> float:
+        result = self._rpc_call("getBalance", [pubkey])
+        if 'result' in result:
+            return result['result']['value'] / 1e9
+        return 0
+    
+    def get_token_balance(self, token_account: str) -> float:
+        result = self._rpc_call("getTokenAccountBalance", [token_account])
+        if 'result' in result and result['result']:
+            val = result['result']
+            if isinstance(val, dict):
+                return float(val.get('value', {}).get('uiAmount', 0))
+        return 0
+
+
+class SniperService:
+    def __init__(self, rpc_url: str):
+        self.rpc_url = rpc_url
+        self.client = SimpleRpcClient(rpc_url)
+    
+    def _rpc_call(self, method: str, params: list) -> dict:
+        return self.client._rpc_call(method, params)
+    
     async def get_token_decimals(self, token_mint: str) -> int:
-        """Get token decimals - pump.fun tokens have 6 decimals"""
         if token_mint.endswith('pump'):
             return 6
         
@@ -50,7 +77,6 @@ class SniperService:
         return 9
     
     def is_pump_fun_token(self, token_mint: str) -> bool:
-        """Check if token is from pump.fun (ends with 'pump')"""
         return token_mint.endswith('pump')
     
     async def get_token_price(self, token_mint: str) -> Optional[float]:
@@ -112,50 +138,38 @@ class SniperService:
         try:
             mint_pubkey = Pubkey.from_string(token_mint)
             ata = get_associated_token_address(wallet_pubkey, mint_pubkey)
-            response = self.client.get_token_account_balance(ata, "confirmed")
-            if response.value:
-                return response.value.ui_amount > 0
-            return False
+            balance = self.client.get_token_balance(str(ata))
+            return balance > 0
         except:
             return False
     
     async def get_wallet_balance(self, wallet_pubkey: Pubkey) -> float:
-        try:
-            response = self.client.get_balance(wallet_pubkey, "processed")
-            return response.value / 1e9
-        except:
-            return 0
+        return self.client.get_balance(str(wallet_pubkey))
     
     async def get_token_balance(self, wallet_pubkey: Pubkey, token_mint: str) -> float:
         try:
             mint_pubkey = Pubkey.from_string(token_mint)
             ata = get_associated_token_address(wallet_pubkey, mint_pubkey)
-            response = self.client.get_token_account_balance(ata, "confirmed")
-            if response.value:
-                return response.value.ui_amount
-            return 0
+            return self.client.get_token_balance(str(ata))
         except:
             return 0
     
     # ============================================
-    # PUMP.FUN SELL (Using pump_swap)
+    # SELL METHODS
     # ============================================
+    
     async def execute_pump_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Sell pump.fun tokens using pump_swap library"""
+        """Sell pump.fun tokens using pump_swap"""
         try:
             from pump_swap import sell
             
             print(f"   🎯 Using PumpSwap for pump.fun token")
-            print(f"   Selling {amount_tokens:.6f} tokens via PumpSwap...")
             
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
-            print(f"   📊 Decimals: {decimals}, Raw: {amount_raw}")
-            
             private_key_base58 = base58.b58encode(bytes(wallet)).decode()
             slippage_percent = slippage_bps / 100
             
-            # Use pump_swap's sell function
             result = await sell(
                 mint=token_mint,
                 amount=amount_raw,
@@ -173,27 +187,18 @@ class SniperService:
                 "sol_received": 0,
                 "explorer": f"https://solscan.io/tx/{txid}"
             }
-            
         except ImportError:
-            print(f"   ⚠️ pump_swap not installed. Run: pip install pump-swap")
-            return {"success": False, "error": "pump_swap library not installed"}
+            return {"success": False, "error": "pump_swap not installed"}
         except Exception as e:
             print(f"   ❌ PumpSwap sell failed: {e}")
             return {"success": False, "error": str(e)}
     
-    # ============================================
-    # REGULAR TOKEN SELL (Using Jupiter)
-    # ============================================
     async def execute_jupiter_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Sell regular tokens using Jupiter API"""
+        """Sell regular tokens using Jupiter"""
         try:
-            print(f"   🎯 Using Jupiter for regular token")
-            print(f"   Selling {amount_tokens:.6f} tokens via Jupiter...")
-            
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
-            # Try multiple amounts
             for percentage in [1.0, 0.5, 0.25, 0.1]:
                 test_raw = int(amount_raw * percentage)
                 if test_raw < 1000:
@@ -212,7 +217,6 @@ class SniperService:
                     quote = resp.json()
                     if "outputAmount" in quote and quote["outputAmount"] != "0":
                         expected_sol = int(quote["outputAmount"]) / 1e9
-                        print(f"   ✅ Quote successful! Expected SOL: {expected_sol:.6f}")
                         
                         swap_url = "https://lite-api.jup.ag/swap/v1/swap"
                         payload = {
@@ -237,10 +241,7 @@ class SniperService:
                         signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
                         signed_tx_bytes = bytes(signed_tx)
                         
-                        result = self.client.send_raw_transaction(signed_tx_bytes, opts=TxOpts(skip_preflight=True))
-                        txid = str(result.value)
-                        
-                        print(f"   ✅ Jupiter Sell TXID: {txid}")
+                        txid = self.client.send_raw_transaction(signed_tx_bytes)
                         
                         return {
                             "success": True,
@@ -249,30 +250,21 @@ class SniperService:
                             "explorer": f"https://solscan.io/tx/{txid}"
                         }
             
-            return {"success": False, "error": "No working amount found for Jupiter"}
-            
+            return {"success": False, "error": "No working amount found"}
         except Exception as e:
-            print(f"   ❌ Jupiter sell failed: {e}")
             return {"success": False, "error": str(e)}
     
-    # ============================================
-    # MAIN EXECUTE SELL (Routes to correct method)
-    # ============================================
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Execute sell - routes to PumpSwap for pump.fun tokens, Jupiter for others"""
-        
         if self.is_pump_fun_token(token_mint):
-            print(f"\n   🔄 Token is pump.fun - using PumpSwap")
             return await self.execute_pump_sell(wallet, token_mint, amount_tokens, slippage_bps)
         else:
-            print(f"\n   🔄 Regular token - using Jupiter")
             return await self.execute_jupiter_sell(wallet, token_mint, amount_tokens, slippage_bps)
     
     # ============================================
-    # BUY EXECUTION (Uses Jupiter)
+    # BUY METHOD
     # ============================================
+    
     async def execute_buy(self, wallet: Keypair, token_mint: str, amount_sol: float, slippage_bps: int) -> dict:
-        """Execute buy using Jupiter (works for both token types)"""
         try:
             print(f"   Amount: {amount_sol} SOL | Slippage: {slippage_bps/100}%")
             
@@ -313,8 +305,7 @@ class SniperService:
             signed_tx_bytes = bytes(signed_tx)
             
             print("   Sending transaction...")
-            result = self.client.send_raw_transaction(signed_tx_bytes, opts=TxOpts(skip_preflight=True))
-            txid = str(result.value)
+            txid = self.client.send_raw_transaction(signed_tx_bytes)
             print(f"   ✅ TXID: {txid}")
             
             await asyncio.sleep(8)
@@ -325,12 +316,10 @@ class SniperService:
             try:
                 mint_pubkey = Pubkey.from_string(token_mint)
                 ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                balance_result = self._rpc_call("getTokenAccountBalance", [str(ata)])
-                if 'result' in balance_result and balance_result['result']:
-                    value_data = balance_result['result'].get('value', {})
-                    if value_data:
-                        tokens_bought = float(value_data.get('uiAmount', 0))
-                        print(f"   📊 Balance: {tokens_bought:.6f} tokens")
+                balance = self.client.get_token_balance(str(ata))
+                if balance > 0:
+                    tokens_bought = balance
+                    print(f"   📊 Balance: {tokens_bought:.6f} tokens")
             except:
                 pass
             
@@ -338,7 +327,6 @@ class SniperService:
                 raw_output = quote.get("outputAmount", "0")
                 if raw_output != "0":
                     tokens_bought = int(raw_output) / 10**decimals
-                    print(f"   📊 Using quote: {tokens_bought:.6f} tokens")
             
             return {
                 "success": True,
