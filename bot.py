@@ -301,7 +301,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Read ALL tokens from wallet and update positions"""
+    """Read tokens using getProgramAccounts - works on Helius"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return {}
@@ -310,77 +310,66 @@ async def sync_positions_from_wallet(user_id: int):
     wallet_tokens = {}
     
     try:
-        # Get all positions we know about from DB
-        positions = db.get_user_positions(user_id)
-        known_mints = set()
-        for pos in positions:
-            known_mints.add(pos['token_address'])
+        import requests as req
+        import base64 as b64
         
-        # Check each known token's ATA directly
-        if known_mints:
-            print(f"   Checking {len(known_mints)} known tokens...")
-            for mint in known_mints:
-                try:
-                    mint_pubkey = Pubkey.from_string(mint)
-                    ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                    
-                    # Direct balance check
-                    balance = sniper_service.client.get_token_balance(str(ata))
-                    
-                    if balance > 0:
-                        wallet_tokens[mint] = balance
-                        print(f"   ✅ {mint[:8]}... = {balance:.4f}")
-                except Exception as e:
-                    print(f"   ⚠️ {mint[:8]}...: {e}")
+        # Use getProgramAccounts with filters (works on Helius)
+        # Filter by owner address
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getProgramAccounts",
+            "params": [
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                {
+                    "encoding": "jsonParsed",
+                    "filters": [
+                        {"dataSize": 165},  # Token account size
+                        {
+                            "memcmp": {
+                                "offset": 32,  # Owner offset in token account
+                                "bytes": wallet_addr
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
         
-        # Also try RPC to find any tokens we don't know about
-        try:
-            payload = {
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getTokenAccountsByOwner",
-                "params": [
-                    wallet_addr,
-                    {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-                    {"encoding": "jsonParsed"}
-                ]
-            }
-            resp = requests.post(SOLANA_RPC, json=payload, timeout=15)
-            data = resp.json()
-            
-            if 'result' in data and data['result']:
-                tokens = data['result'].get('value', [])
-                for t in tokens:
-                    info = t.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
-                    mint = info.get('mint', '')
-                    amount = info.get('tokenAmount', {}).get('uiAmount', 0)
-                    if amount > 0 and mint not in wallet_tokens:
-                        wallet_tokens[mint] = amount
-                        print(f"   ✅ RPC: {mint[:8]}... = {amount:.4f}")
-        except:
-            pass
+        resp = req.post(SOLANA_RPC, json=payload, timeout=15)
+        data = resp.json()
         
-        # Update database
-        if wallet_tokens:
-            existing_positions = db.get_user_positions(user_id)
-            for mint, amount in wallet_tokens.items():
-                existing = next((p for p in existing_positions if p['token_address'] == mint), None)
-                if existing:
-                    if abs(existing['amount'] - amount) > 0.0001:
-                        db.update_position_amount(existing['id'], amount)
-                else:
-                    db.add_position(user_id, mint, amount, 0, 'wallet-scan')
+        if 'result' in data and data['result']:
+            accounts = data['result']
+            print(f"   Found {len(accounts)} token accounts via getProgramAccounts")
             
-            # Remove positions with zero balance
-            for pos in existing_positions:
-                if pos['token_address'] not in wallet_tokens:
-                    db.close_position(pos['id'], 'sold')
-            
-            print(f"   ✅ Synced: {len(wallet_tokens)} tokens")
+            for acc in accounts:
+                parsed = acc.get('account', {}).get('data', {}).get('parsed', {})
+                info = parsed.get('info', {})
+                mint = info.get('mint', '')
+                amount = info.get('tokenAmount', {}).get('uiAmount', 0)
+                
+                if amount > 0:
+                    wallet_tokens[mint] = amount
+                    print(f"   ✅ {mint[:8]}... = {amount:.4f}")
         else:
-            print(f"   ⚠️ No tokens found")
-        
+            print(f"   getProgramAccounts returned: {len(data.get('result', []))} accounts")
+            
     except Exception as e:
         print(f"   ⚠️ Sync error: {e}")
+    
+    # Update DB
+    if wallet_tokens:
+        existing_positions = db.get_user_positions(user_id)
+        for mint, amount in wallet_tokens.items():
+            existing = next((p for p in existing_positions if p['token_address'] == mint), None)
+            if existing:
+                if abs(existing['amount'] - amount) > 0.0001:
+                    db.update_position_amount(existing['id'], amount)
+            else:
+                db.add_position(user_id, mint, amount, 0, 'wallet-scan')
+        
+        print(f"   ✅ Synced: {len(wallet_tokens)} tokens")
     
     return wallet_tokens
 async def debug_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
