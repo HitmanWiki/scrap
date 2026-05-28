@@ -747,3 +747,20 @@ class Database:
         except Exception as e:
             print(f"❌ Error deleting user: {e}")
             return False
+    def update_position_amount(self, position_id: int, new_amount: float) -> bool:
+        """Update position amount with actual balance"""
+        try:
+            with self.lock:
+                conn = self.get_connection()
+                cursor = self.get_cursor(conn)
+                ph = self.placeholder()
+                cursor.execute(
+                    f'UPDATE positions SET amount = {ph}, updated_at = CURRENT_TIMESTAMP WHERE id = {ph}',
+                    (new_amount, position_id)
+                )
+                conn.commit()
+                conn.close()
+                return True
+        except Exception as e:
+            print(f"❌ Error updating position: {e}")
+            return False
