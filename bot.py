@@ -1486,11 +1486,10 @@ async def execute_sell_order(query, token_address, percentage):
         txid = result['txid']
         sol_received = result.get('sol_received', 0)
         
-        # VERIFY transaction succeeded on-chain
+        # VERIFY transaction on-chain
         tx_verified = False
         try:
-            # Wait for indexing
-            await asyncio.sleep(20)
+            await asyncio.sleep(12)
             
             for attempt in range(3):
                 try:
@@ -1504,16 +1503,16 @@ async def execute_sell_order(query, token_address, percentage):
                         err = meta.get('err')
                         
                         if err is None:
+                            # SUCCESS - no error
                             tx_verified = True
                             print(f"   ✅ Sell verified on-chain (attempt {attempt+1})")
                             
-                            # Get actual SOL received from balances
+                            # Get actual SOL received
+                            account_keys = tx_check['result'].get('transaction', {}).get('message', {}).get('accountKeys', [])
                             pre_balances = meta.get('preBalances', []) or []
                             post_balances = meta.get('postBalances', []) or []
                             
-                            # Calculate SOL received by checking wallet balance change
                             wallet_index = None
-                            account_keys = tx_check['result'].get('transaction', {}).get('message', {}).get('accountKeys', [])
                             for i, key in enumerate(account_keys):
                                 if key == str(wallet.pubkey()):
                                     wallet_index = i
@@ -1526,7 +1525,9 @@ async def execute_sell_order(query, token_address, percentage):
                                     print(f"   💰 SOL received: {sol_received:.6f}")
                             break
                         else:
+                            # FAILED - has error
                             print(f"   ❌ Sell failed on-chain: {err}")
+                            tx_verified = False
                             break
                     else:
                         print(f"   ⏳ Attempt {attempt+1}: TX not indexed yet...")
@@ -1535,24 +1536,10 @@ async def execute_sell_order(query, token_address, percentage):
                 except Exception as e:
                     print(f"   ⚠️ Attempt {attempt+1}: {e}")
                     await asyncio.sleep(3)
-            
-            # If still not verified but TX was sent, check if it exists at all
-            if not tx_verified and txid:
-                # Final check - just see if TX exists
-                final_check = sniper_service._rpc_call("getTransaction", [
-                    txid,
-                    {"encoding": "json", "maxSupportedTransactionVersion": 0}
-                ])
-                if final_check.get('result') and not final_check.get('error'):
-                    tx_verified = True
-                    print(f"   ⚠️ TX exists, assuming success")
                     
         except Exception as e:
             print(f"   ⚠️ Verification error: {e}")
-            # If TXID looks valid, assume success
-            if txid and len(txid) > 20:
-                tx_verified = True
-                print(f"   ⚠️ Assuming success (TXID: {txid[:20]}...)")
+            tx_verified = False
         
         if tx_verified:
             # Update position in DB
@@ -1583,17 +1570,19 @@ async def execute_sell_order(query, token_address, percentage):
 🔗 [View on Solscan]({result['explorer']})
 """
         else:
+            # Transaction FAILED on-chain - DON'T update positions
             text = f"""
-⚠️ *Sell Status Unknown*
+❌ *Sell Failed On-Chain*
 
-Transaction was sent but verification failed.
-Please check Solscan to confirm.
+The transaction was sent but failed.
+Your tokens are still safe in your wallet.
 
 *TX:* `{txid[:20]}...`
 🔗 [View on Solscan]({result['explorer']})
 
-Your tokens may still be in your wallet.
-Refresh positions to check.
+💡 Try:
+• Smaller amount (25% or 50%)
+• Higher slippage in Settings
 """
         
         await query.edit_message_text(
