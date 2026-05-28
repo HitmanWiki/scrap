@@ -1,9 +1,10 @@
 """
 Sniper service for executing token purchases
-Uses raw HTTP RPC calls - NO solana package needed
+Uses raw HTTP RPC calls - matching single-user bot's working method
 """
 
 import base64
+import base58 as b58
 import requests
 from typing import Dict, Any, Optional
 from solders.keypair import Keypair
@@ -32,35 +33,29 @@ class SniperService:
             return {"error": str(e)}
     
     def _send_raw_transaction(self, signed_tx_bytes: bytes) -> str:
-        """Send raw transaction via RPC"""
-        # Encode as base64 for Jupiter API, but Solana RPC expects base58
-        import base58 as b58
-        
-        # Try base58 first (Solana RPC expects this)
-        tx_encoded = b58.b58encode(signed_tx_bytes).decode()
+        """Send raw transaction via RPC - matching single-user bot"""
+        # Encode as base58 (matching solana-py behavior)
+        tx_base58 = b58.b58encode(signed_tx_bytes).decode()
         
         result = self._rpc_call("sendTransaction", [
-            tx_encoded,
-            {"skipPreflight": True, "preflightCommitment": "processed", "maxRetries": 3}
+            tx_base58,
+            {
+                "skipPreflight": True,
+                "preflightCommitment": "processed",
+                "encoding": "base58",
+                "maxRetries": 3
+            }
         ])
         
         if 'result' in result:
             return result['result']
         elif 'error' in result:
-            # If base58 fails, try base64
-            tx_base64 = base64.b64encode(signed_tx_bytes).decode()
-            result2 = self._rpc_call("sendTransaction", [
-                tx_base64,
-                {"encoding": "base64", "skipPreflight": True, "preflightCommitment": "processed"}
-            ])
-            if 'result' in result2:
-                return result2['result']
-            raise Exception(result.get('error', {}).get('message', 'Unknown RPC error'))
+            raise Exception(result['error'].get('message', 'Unknown RPC error'))
         else:
             raise Exception(f"Unexpected RPC response: {result}")
     
     async def get_token_decimals(self, token_mint: str) -> int:
-        """Fetch token decimals from Jupiter token list; fallback to 9."""
+        """Fetch token decimals"""
         try:
             url = f"https://tokens.jup.ag/token/{token_mint}"
             resp = requests.get(url, timeout=5)
@@ -68,12 +63,25 @@ class SniperService:
                 data = resp.json()
                 if 'decimals' in data:
                     return int(data['decimals'])
-        except Exception as e:
-            print(f"   ⚠️ Could not fetch decimals: {e}")
-        return 9
+        except:
+            pass
+        
+        try:
+            result = self._rpc_call("getAccountInfo", [token_mint, {"encoding": "jsonParsed"}])
+            if 'result' in result and result['result']:
+                value = result['result'].get('value', {}) if isinstance(result['result'], dict) else {}
+                if value and 'data' in value:
+                    parsed = value['data'].get('parsed', {})
+                    if parsed and 'info' in parsed:
+                        return parsed['info'].get('decimals', 9)
+        except:
+            pass
+        
+        print("   ℹ️ Default decimals: 6")
+        return 6
     
     def sign_transaction(self, tx_bytes: bytes, wallet: Keypair) -> bytes:
-        """Sign a transaction"""
+        """Sign a transaction - matching single-user bot"""
         raw_tx = VersionedTransaction.from_bytes(tx_bytes)
         message_bytes = message.to_bytes_versioned(raw_tx.message)
         signature = wallet.sign_message(message_bytes)
@@ -94,9 +102,9 @@ class SniperService:
             # Step 1: Get quote from Jupiter
             quote_url = "https://lite-api.jup.ag/swap/v1/quote"
             params = {
-                "inputMint": "So11111111111111111111111111111111111111112",  # SOL
+                "inputMint": "So11111111111111111111111111111111111111112",
                 "outputMint": token_mint,
-                "amount": int(amount_sol * 10**9),  # Convert SOL to lamports
+                "amount": int(amount_sol * 10**9),
                 "slippageBps": slippage_bps,
             }
             
@@ -104,14 +112,12 @@ class SniperService:
             resp = requests.get(quote_url, params=params, timeout=10)
             
             if resp.status_code != 200:
-                return {
-                    "success": False,
-                    "error": f"Quote HTTP {resp.status_code}: {resp.text[:200]}"
-                }
+                return {"success": False, "error": f"Quote HTTP {resp.status_code}"}
             
             quote = resp.json()
+            print(f"   📊 Output: {quote.get('outputAmount', '0')} | Price: {quote.get('priceImpactPct', '?')}%")
             
-            # Step 2: Build swap transaction
+            # Step 2: Build swap
             swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             payload = {
                 "quoteResponse": quote,
@@ -125,20 +131,14 @@ class SniperService:
             resp = requests.post(swap_url, json=payload, timeout=10)
             
             if resp.status_code != 200:
-                return {
-                    "success": False,
-                    "error": f"Swap HTTP {resp.status_code}: {resp.text[:200]}"
-                }
+                return {"success": False, "error": f"Swap HTTP {resp.status_code}"}
             
             swap_data = resp.json()
             
             if "swapTransaction" not in swap_data:
-                return {
-                    "success": False,
-                    "error": "No swapTransaction in response"
-                }
+                return {"success": False, "error": "No swapTransaction"}
             
-            # Step 3: Decode, sign, and send
+            # Step 3: Sign and send
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             
             print("   Signing transaction...")
@@ -146,39 +146,24 @@ class SniperService:
             
             print("   Sending transaction...")
             txid = self._send_raw_transaction(signed_tx_bytes)
+            print(f"   ✅ TXID: {txid}")
             
-            # Step 4: Calculate tokens bought
+            # Step 4: Calculate tokens
             token_decimals = await self.get_token_decimals(token_mint)
             raw_output = quote.get("outputAmount", "0")
-            tokens_bought = int(raw_output) / 10**token_decimals if raw_output != "0" else 0
-            
-            # Try to get token price
-            try:
-                price_url = f"https://price.jup.ag/v4/price?ids={token_mint}"
-                price_resp = requests.get(price_url, timeout=5)
-                if price_resp.status_code == 200:
-                    price_data = price_resp.json()
-                    price = price_data.get('data', {}).get(token_mint, {}).get('price', 0)
-                else:
-                    price = 0
-            except:
-                price = 0
+            tokens_bought = float(raw_output) / (10 ** token_decimals) if raw_output != "0" else 0
             
             return {
                 "success": True,
                 "txid": txid,
                 "tokens_bought": tokens_bought,
-                "price": price,
-                "explorer": f"https://solscan.io/tx/{txid}",
-                "quote": quote
+                "price": 0,
+                "explorer": f"https://solscan.io/tx/{txid}"
             }
             
         except Exception as e:
             print(f"   ❌ Buy execution error: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            return {"success": False, "error": str(e)}
     
     async def execute_sell(
         self, 
@@ -189,11 +174,9 @@ class SniperService:
     ) -> Dict[str, Any]:
         """Execute a sell order via Jupiter API"""
         try:
-            # Get token decimals
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
-            # Step 1: Get quote (token -> SOL)
             quote_url = "https://lite-api.jup.ag/swap/v1/quote"
             params = {
                 "inputMint": token_mint,
@@ -202,18 +185,14 @@ class SniperService:
                 "slippageBps": slippage_bps,
             }
             
-            print(f"   Getting sell quote for {token_mint[:8]}...")
+            print(f"   Getting sell quote...")
             resp = requests.get(quote_url, params=params, timeout=10)
             
             if resp.status_code != 200:
-                return {
-                    "success": False,
-                    "error": f"Quote HTTP {resp.status_code}"
-                }
+                return {"success": False, "error": f"Quote HTTP {resp.status_code}"}
             
             quote = resp.json()
             
-            # Step 2: Build swap transaction
             swap_url = "https://lite-api.jup.ag/swap/v1/swap"
             payload = {
                 "quoteResponse": quote,
@@ -223,35 +202,21 @@ class SniperService:
                 "prioritizationFeeLamports": "auto"
             }
             
-            print("   Building sell transaction...")
             resp = requests.post(swap_url, json=payload, timeout=10)
             
             if resp.status_code != 200:
-                return {
-                    "success": False,
-                    "error": f"Swap HTTP {resp.status_code}"
-                }
+                return {"success": False, "error": f"Swap HTTP {resp.status_code}"}
             
             swap_data = resp.json()
             
             if "swapTransaction" not in swap_data:
-                return {
-                    "success": False,
-                    "error": "No swapTransaction"
-                }
+                return {"success": False, "error": "No swapTransaction"}
             
-            # Step 3: Sign and send
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
-            
-            print("   Signing sell transaction...")
             signed_tx_bytes = self.sign_transaction(tx_bytes, wallet)
-            
-            print("   Sending sell transaction...")
             txid = self._send_raw_transaction(signed_tx_bytes)
             
-            # Calculate SOL received
-            raw_output = quote.get("outputAmount", "0")
-            sol_received = int(raw_output) / 10**9 if raw_output != "0" else 0
+            sol_received = float(quote.get("outputAmount", "0")) / 10**9
             
             return {
                 "success": True,
@@ -262,10 +227,7 @@ class SniperService:
             
         except Exception as e:
             print(f"   ❌ Sell execution error: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            return {"success": False, "error": str(e)}
     
     async def is_holding_token(self, wallet_pubkey: Pubkey, token_mint: str) -> bool:
         """Check if wallet holds a token"""
@@ -278,8 +240,7 @@ class SniperService:
                 amount = result['result'].get('uiAmount', 0)
                 return amount > 0
             return False
-        except Exception as e:
-            print(f"   ⚠️ Holding check error: {e}")
+        except:
             return False
     
     async def get_token_price(self, token_mint: str) -> Optional[float]:
@@ -294,16 +255,3 @@ class SniperService:
         except:
             pass
         return None
-    
-    async def get_balance(self, public_key: str) -> float:
-        """Get SOL balance via RPC"""
-        try:
-            result = self._rpc_call("getBalance", [public_key])
-            if 'result' in result:
-                val = result['result']
-                if isinstance(val, dict):
-                    return val.get('value', 0) / 10**9
-                return val / 10**9
-            return 0
-        except:
-            return 0
