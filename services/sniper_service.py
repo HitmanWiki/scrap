@@ -23,14 +23,15 @@ class SniperService:
         self.client = Client(rpc_url)
     
     def _rpc_call(self, method: str, params: list) -> dict:
-        """Make raw RPC call - used by show_positions"""
+        """Make raw RPC call"""
+        import requests
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
             response = requests.post(self.rpc_url, json=payload, timeout=30)
             return response.json()
         except Exception as e:
             return {"error": {"message": str(e)}}
-    
+        
     async def get_token_decimals(self, token_mint: str) -> int:
         """Get token decimals from Jupiter token list"""
         try:
@@ -135,7 +136,7 @@ class SniperService:
             return 0
     
     async def execute_buy(self, wallet: Keypair, token_mint: str, amount_sol: float, slippage_bps: int) -> dict:
-        """Execute buy - MATCHES YOUR WORKING SCRIPT EXACTLY"""
+        """Execute buy - FIXED: Direct balance fetch after transaction"""
         try:
             print(f"   Amount: {amount_sol} SOL | Slippage: {slippage_bps/100}%")
             
@@ -152,10 +153,6 @@ class SniperService:
             if resp.status_code != 200:
                 return {"success": False, "error": f"Quote HTTP {resp.status_code}"}
             quote = resp.json()
-            
-            # Debug: print raw output
-            raw_output = quote.get("outputAmount", "0")
-            print(f"   📊 Raw output from quote: {raw_output}")
             
             # 2. Build swap
             swap_url = "https://lite-api.jup.ag/swap/v1/swap"
@@ -191,46 +188,54 @@ class SniperService:
             txid = str(result.value)
             print(f"   ✅ TXID: {txid}")
             
-            # 5. Calculate tokens bought - FIXED
-            token_decimals = await self.get_token_decimals(token_mint)
+            # 5. Wait for confirmation and fetch balance - FIXED
+            print("   ⏳ Waiting for confirmation...")
+            await asyncio.sleep(5)
+            
             tokens_bought = 0
+            decimals = 9
             
-            # Method 1: Use quote's outputAmount
-            if raw_output != "0":
-                tokens_bought = int(raw_output) / 10**token_decimals
-                print(f"   📊 From quote: {tokens_bought:.6f} tokens")
+            # Get token decimals first
+            try:
+                mint_pubkey = Pubkey.from_string(token_mint)
+                mint_info = self._rpc_call("getMint", [str(mint_pubkey)])
+                if 'result' in mint_info and mint_info['result']:
+                    decimals = mint_info['result'].get('decimals', 9)
+                    print(f"   📊 Token decimals: {decimals}")
+            except:
+                pass
             
-            # Method 2: Wait a bit and check actual balance (most reliable)
+            # Fetch balance from the ATA
+            try:
+                ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
+                # Use raw RPC call instead of client method
+                balance_result = self._rpc_call("getTokenAccountBalance", [str(ata)])
+                
+                if 'result' in balance_result and balance_result['result']:
+                    value_data = balance_result['result'].get('value', {})
+                    if value_data:
+                        tokens_bought = float(value_data.get('uiAmount', 0))
+                        print(f"   📊 Balance after buy: {tokens_bought:.6f} tokens")
+                    else:
+                        print(f"   ⚠️ No value in balance response: {balance_result['result']}")
+                else:
+                    print(f"   ⚠️ Balance call failed: {balance_result}")
+            except Exception as e:
+                print(f"   ⚠️ Balance fetch error: {e}")
+            
+            # If still 0, try a second time after longer delay
             if tokens_bought <= 0:
+                print("   ⏳ Waiting additional 3 seconds...")
                 await asyncio.sleep(3)
                 try:
-                    mint_pubkey = Pubkey.from_string(token_mint)
-                    ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-                    balance_result = self.client.get_token_account_balance(ata, "confirmed")
-                    if balance_result.value:
-                        tokens_bought = balance_result.value.ui_amount
-                        print(f"   📊 From balance: {tokens_bought:.6f} tokens")
+                    balance_result = self._rpc_call("getTokenAccountBalance", [str(ata)])
+                    if 'result' in balance_result and balance_result['result']:
+                        value_data = balance_result['result'].get('value', {})
+                        if value_data:
+                            tokens_bought = float(value_data.get('uiAmount', 0))
+                            print(f"   📊 Second attempt: {tokens_bought:.6f} tokens")
                 except Exception as e:
-                    print(f"   ⚠️ Could not fetch balance: {e}")
-            
-            # Method 3: If still 0, try from transaction (fallback)
-            if tokens_bought <= 0:
-                try:
-                    tx_detail = self._rpc_call("getTransaction", [
-                        txid,
-                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-                    ])
-                    if 'result' in tx_detail and tx_detail['result']:
-                        meta = tx_detail['result'].get('meta', {})
-                        post_balances = meta.get('postTokenBalances', [])
-                        wallet_str = str(wallet.pubkey())
-                        for post in post_balances:
-                            if post.get('mint') == token_mint:
-                                tokens_bought = float(post.get('uiTokenAmount', {}).get('uiAmount', 0))
-                                print(f"   📊 From tx: {tokens_bought:.6f} tokens")
-                                break
-                except Exception as e:
-                    print(f"   ⚠️ Transaction parse error: {e}")
+                    print(f"   ⚠️ Second fetch error: {e}")
             
             return {
                 "success": True,
@@ -241,7 +246,7 @@ class SniperService:
         except Exception as e:
             print(f"   ❌ Buy failed: {e}")
             return {"success": False, "error": str(e)}
-    
+        
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
         """Execute sell"""
         try:
