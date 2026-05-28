@@ -33,15 +33,36 @@ class SniperService:
             return {"error": {"message": str(e)}}
         
     async def get_token_decimals(self, token_mint: str) -> int:
+        """Get token decimals from blockchain RPC (most reliable)"""
+        try:
+            # First try to get from RPC directly
+            result = self._rpc_call("getMint", [token_mint])
+            if 'result' in result and result['result']:
+                decimals = result['result'].get('decimals', 9)
+                print(f"   📊 On-chain decimals: {decimals}")
+                return decimals
+        except Exception as e:
+            print(f"   ⚠️ RPC decimals error: {e}")
+        
+        # Fallback: check Jupiter token list
         try:
             url = f"https://tokens.jup.ag/token/{token_mint}"
             resp = requests.get(url, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
                 if 'decimals' in data:
-                    return int(data['decimals'])
+                    decimals = int(data['decimals'])
+                    print(f"   📊 Jupiter decimals: {decimals}")
+                    return decimals
         except:
             pass
+        
+        # For pump.fun tokens, default is 6
+        if token_mint.endswith('pump'):
+            print(f"   📊 pump.fun token: using 6 decimals")
+            return 6
+        
+        print(f"   📊 Using default decimals: 9")
         return 9
     
     async def get_token_price(self, token_mint: str) -> Optional[float]:
@@ -256,13 +277,27 @@ class SniperService:
         try:
             print(f"   Selling {amount_tokens:.6f} tokens of {token_mint[:8]}...")
             
-            # Get token decimals FIRST (critical!)
+            # Get token decimals from blockchain
             decimals = await self.get_token_decimals(token_mint)
             print(f"   📊 Token decimals: {decimals}")
             
             # Convert to raw units (with decimals)
             amount_raw = int(amount_tokens * 10**decimals)
             print(f"   📊 Raw amount: {amount_raw}")
+            
+            # Sanity check - if raw amount seems too large, re-check decimals
+            if amount_raw > 10**15 and decimals == 9:
+                # Try getting decimals again with different method
+                print(f"   ⚠️ Raw amount seems large, checking decimals again...")
+                try:
+                    result = self._rpc_call("getMint", [token_mint])
+                    if 'result' in result and result['result']:
+                        decimals = result['result'].get('decimals', 9)
+                        print(f"   📊 Confirmed decimals: {decimals}")
+                        amount_raw = int(amount_tokens * 10**decimals)
+                        print(f"   📊 Adjusted raw amount: {amount_raw}")
+                except:
+                    pass
             
             # 1. Get quote from Jupiter
             quote_url = "https://lite-api.jup.ag/swap/v1/quote"
@@ -281,7 +316,22 @@ class SniperService:
             
             # Check if quote has output
             if "outputAmount" not in quote or quote["outputAmount"] == "0":
-                return {"success": False, "error": "No liquidity or price impact too high"}
+                # If decimals might be wrong, try with 6 decimals (pump.fun standard)
+                if decimals != 6:
+                    print(f"   ⚠️ Quote failed, retrying with 6 decimals...")
+                    amount_raw = int(amount_tokens * 10**6)
+                    params["amount"] = amount_raw
+                    resp = requests.get(quote_url, params=params, timeout=10)
+                    if resp.status_code == 200:
+                        quote = resp.json()
+                        if "outputAmount" in quote and quote["outputAmount"] != "0":
+                            print(f"   ✅ Retry with 6 decimals succeeded!")
+                        else:
+                            return {"success": False, "error": "No liquidity for this token"}
+                    else:
+                        return {"success": False, "error": "No liquidity or price impact too high"}
+                else:
+                    return {"success": False, "error": "No liquidity or price impact too high"}
             
             expected_sol = int(quote["outputAmount"]) / 1e9
             print(f"   📊 Expected SOL: {expected_sol:.6f}")
