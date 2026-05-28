@@ -301,7 +301,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Get token balances by checking the latest buy transaction"""
+    """Sync positions by checking actual token balances from transactions"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return {}
@@ -317,7 +317,7 @@ async def sync_positions_from_wallet(user_id: int):
         
         for pos in positions:
             txid = pos.get('buy_txid', '')
-            if not txid:
+            if not txid or txid == 'wallet-sync':
                 continue
             
             mint = pos['token_address']
@@ -332,11 +332,10 @@ async def sync_positions_from_wallet(user_id: int):
                 tx_data = tx_resp.json()
                 
                 if tx_data.get('result'):
-                    # Get the account keys from the transaction
                     account_keys = tx_data['result'].get('transaction', {}).get('message', {}).get('accountKeys', [])
                     meta = tx_data['result'].get('meta', {})
                     
-                    # Find token balance change for our mint
+                    # Find token balance for our mint
                     for token in meta.get('postTokenBalances', []):
                         if token.get('mint') == mint:
                             token_acct_idx = token.get('accountIndex')
@@ -358,21 +357,19 @@ async def sync_positions_from_wallet(user_id: int):
                                     if amount > 0:
                                         wallet_tokens[mint] = amount
                                         print(f"   ✅ {mint[:8]}... = {amount:.4f}")
+                                        
+                                        # Update position amount if changed
+                                        if abs(pos['amount'] - amount) > 0.0001:
+                                            db.update_position_amount(pos['id'], amount)
                                     else:
-                                        # Token was sold - remove position
-                                        db.close_position(pos['id'], 'sold')
+                                        # Token sold - mark as inactive
+                                        db.close_position(pos['id'], txid)
                                         print(f"   🗑️ {mint[:8]}... sold (0 balance)")
             except Exception as e:
                 print(f"   ⚠️ Check error for {mint[:8]}: {e}")
         
-        # Update DB with found tokens
         if wallet_tokens:
-            for mint, amount in wallet_tokens.items():
-                existing = next((p for p in positions if p['token_address'] == mint), None)
-                if existing and abs(existing['amount'] - amount) > 0.0001:
-                    db.update_position_amount(existing['id'], amount)
-            
-            print(f"   ✅ Synced: {len(wallet_tokens)} tokens")
+            print(f"   ✅ Synced: {len(wallet_tokens)} active tokens")
         
     except Exception as e:
         print(f"   ⚠️ Sync error: {e}")
@@ -1591,50 +1588,72 @@ async def show_positions(query):
         await query.edit_message_text("❌ No wallet!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    await query.edit_message_text("⏳ *Reading wallet...*", parse_mode='Markdown')
+    await query.edit_message_text("⏳ *Syncing with wallet...*", parse_mode='Markdown')
     
-    # Sync from wallet
+    # Sync positions from wallet first
     wallet_tokens = await sync_positions_from_wallet(user_id)
     
     wallet_addr = str(wallet.pubkey())
+    
+    # Get ALL positions with amount > 0 (ignore is_active flag)
+    all_positions = db.get_user_positions(user_id)
+    positions = [p for p in all_positions if p['amount'] > 0]
+    
     text = "📊 *Your Positions*\n\n"
     total_value = 0
+    found_any = False
     
-    if wallet_tokens:
-        for mint, amount in wallet_tokens.items():
-            token_short = f"{mint[:6]}...{mint[-4:]}"
+    if positions:
+        # Get unique tokens (latest position for each mint)
+        seen_mints = set()
+        unique_positions = []
+        for pos in reversed(positions):  # Latest first
+            if pos['token_address'] not in seen_mints:
+                seen_mints.add(pos['token_address'])
+                unique_positions.append(pos)
+        
+        for pos in unique_positions[:10]:
+            token_addr = pos['token_address']
+            amount = pos['amount']
             
-            price = await solana_service.get_token_price(mint)
-            mc = await get_token_market_cap(mint)
+            found_any = True
+            
+            # Get current price and MC
+            price = await solana_service.get_token_price(token_addr)
+            mc = await get_token_market_cap(token_addr)
             value = amount * price if price else 0
             total_value += value
             
-            text += f"🔹 `{token_short}`\n"
+            # P&L if we have entry price
+            pnl_text = ""
+            if pos.get('entry_price') and pos['entry_price'] > 0 and price:
+                pnl_pct = ((price - pos['entry_price']) / pos['entry_price']) * 100
+                emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                pnl_text = f" {emoji}{pnl_pct:+.1f}%"
+            
+            text += f"🔹 `{token_addr[:8]}...{token_addr[-4:]}`\n"
             text += f"   Amount: *{amount:,.2f}*"
             if value > 0:
                 text += f" (${value:.2f})"
+            text += f"{pnl_text}\n"
+            
             if mc:
-                text += f"\n   MC: ${mc:,.0f}"
-            text += "\n\n"
-    else:
-        # Fallback to DB positions
-        positions = db.get_user_positions(user_id)
-        if positions:
-            for pos in positions:
-                if pos['amount'] > 0:
-                    token_short = f"{pos['token_address'][:6]}...{pos['token_address'][-4:]}"
-                    text += f"🔹 `{token_short}`\n"
-                    text += f"   Amount: *{pos['amount']:,.2f}*\n"
-                    if pos.get('buy_txid'):
-                        text += f"   [View TX](https://solscan.io/tx/{pos['buy_txid']})\n"
-                    text += "\n"
-        else:
-            text += "😔 *No tokens found*\n\n"
+                text += f"   MC: ${mc:,.0f}\n"
+            
+            if pos.get('buy_txid') and pos['buy_txid'] != 'wallet-sync':
+                text += f"   [View TX](https://solscan.io/tx/{pos['buy_txid']})\n"
+            text += "\n"
     
+    if not found_any:
+        text += "😔 *No tokens with balance*\n\n"
+        text += "Buy tokens to see them here!\n"
+        text += "Already bought? Wait for transaction confirmation.\n\n"
+    
+    # SOL balance
     sol_balance = await solana_service.get_balance(wallet_addr)
     total_value += sol_balance
-    text += f"💰 *SOL:* {sol_balance:.4f}\n"
-    text += f"💎 *Total:* ${total_value:.2f}\n\n"
+    text += f"💰 *SOL:* {sol_balance:.4f} SOL\n"
+    text += f"💎 *Total Value:* ${total_value:.2f}\n\n"
     text += f"💳 `{wallet_addr[:8]}...{wallet_addr[-4:]}`"
     text += f"\n🔗 [View on Solscan](https://solscan.io/account/{wallet_addr})"
     
@@ -1650,7 +1669,6 @@ async def show_positions(query):
     except:
         pass
     return SELECTING_ACTION
-
 async def show_settings(query):
     user_id = query.from_user.id
     user = db.get_user(user_id)
