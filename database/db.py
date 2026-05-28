@@ -559,7 +559,12 @@ class Database:
                 
                 if existing:
                     new_amount = existing['amount'] + amount
-                    new_entry = ((existing['entry_price'] * existing['amount']) + (entry_price * amount)) / new_amount
+                    # Avoid division by zero
+                    if new_amount > 0:
+                        new_entry = ((existing['entry_price'] * existing['amount']) + (entry_price * amount)) / new_amount
+                    else:
+                        new_entry = 0
+                    
                     cursor.execute(f'''
                         UPDATE positions SET amount = {ph}, entry_price = {ph}, updated_at = CURRENT_TIMESTAMP
                         WHERE id = {ph}
@@ -585,7 +590,24 @@ class Database:
         except Exception as e:
             print(f"❌ Error adding position: {e}")
             return -1
-    
+
+def update_position_amount(self, position_id: int, new_amount: float) -> bool:
+    """Update just the amount of a position"""
+    try:
+        with self.lock:
+            conn = self.get_connection()
+            cursor = self.get_cursor(conn)
+            ph = self.placeholder()
+            cursor.execute(
+                f'UPDATE positions SET amount = {ph}, updated_at = CURRENT_TIMESTAMP WHERE id = {ph}',
+                (new_amount, position_id)
+            )
+            conn.commit()
+            conn.close()
+            return True
+    except Exception as e:
+        print(f"❌ Error updating position: {e}")
+        return False
     def get_user_positions(self, user_id: int, active_only: bool = True) -> List[Dict]:
         try:
             with self.lock:
