@@ -301,7 +301,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def sync_positions_from_wallet(user_id: int):
-    """Find actual token accounts from transactions"""
+    """Get ALL token balances using Helius DAS API"""
     wallet = await get_user_wallet(user_id)
     if not wallet:
         return {}
@@ -312,66 +312,46 @@ async def sync_positions_from_wallet(user_id: int):
     try:
         import requests as req
         
-        # Get recent signatures
-        sig_resp = req.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [wallet_addr, {"limit": 10}]
-        }, timeout=10)
-        sig_data = sig_resp.json()
+        api_key = os.getenv('HELIUS_API_KEY', '')
         
-        # Check the most recent transaction for token accounts
-        for sig in (sig_data.get('result', []) or [])[:3]:
-            sig_str = sig.get('signature', '')
-            if not sig_str:
-                continue
-            
-            tx_resp = req.post(SOLANA_RPC, json={
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getTransaction",
-                "params": [sig_str, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-            }, timeout=10)
-            tx_data = tx_resp.json()
-            
-            if tx_data.get('result'):
-                meta = tx_data['result'].get('meta', {}) or {}
-                post_balances = meta.get('postTokenBalances', []) or []
-                
-                for token in post_balances:
+        # Helius DAS API - search assets by owner
+        url = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
+        
+        # Method 1: getTokenBalances (Helius specific)
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenBalances",
+            "params": [wallet_addr]
+        }
+        
+        resp = req.post(url, json=payload, timeout=15)
+        data = resp.json()
+        
+        print(f"   getTokenBalances response keys: {data.keys()}")
+        
+        if 'result' in data and data['result']:
+            tokens = data['result']
+            if isinstance(tokens, list):
+                for token in tokens:
                     mint = token.get('mint', '')
-                    owner = token.get('owner', '')
-                    token_account = token.get('accountIndex')  # This gives the account index
+                    amount = token.get('amount', 0)
+                    decimals = token.get('decimals', 6)
                     
-                    # Only check tokens owned by our wallet
-                    if owner == wallet_addr and mint != "So11111111111111111111111111111111111111112":
-                        ui_data = token.get('uiTokenAmount', {}) or {}
-                        amount = ui_data.get('uiAmount', 0) or 0
-                        
-                        if amount > 0:
-                            # Get the actual token account address from the transaction
-                            accounts = tx_data['result'].get('transaction', {}).get('message', {}).get('accountKeys', [])
-                            if isinstance(token_account, int) and token_account < len(accounts):
-                                actual_ata = accounts[token_account]
-                                print(f"   Token: {mint[:8]}... at {actual_ata[:8]}... = {amount:.4f}")
-                                
-                                # Check if this account still has tokens
-                                bal_resp = req.post(SOLANA_RPC, json={
-                                    "jsonrpc": "2.0", "id": 1,
-                                    "method": "getTokenAccountBalance",
-                                    "params": [actual_ata]
-                                }, timeout=10)
-                                bal_data = bal_resp.json()
-                                
-                                if bal_data.get('result'):
-                                    val = bal_data['result']
-                                    current = float(val.get('value', {}).get('uiAmount', 0)) if isinstance(val, dict) else float(val)
-                                    if current > 0:
-                                        wallet_tokens[mint] = current
-                                        print(f"   ✅ Current: {current:.4f}")
-                                        break  # Found it, stop checking
+                    actual = amount / (10 ** decimals)
+                    if actual > 0:
+                        wallet_tokens[mint] = actual
+                        print(f"   ✅ {mint[:8]}... = {actual:.4f}")
+            elif isinstance(tokens, dict):
+                for mint, info in tokens.items():
+                    amount = info.get('amount', 0) if isinstance(info, dict) else info
+                    decimals = info.get('decimals', 6) if isinstance(info, dict) else 6
+                    actual = float(amount) / (10 ** decimals)
+                    if actual > 0:
+                        wallet_tokens[mint] = actual
+                        print(f"   ✅ {mint[:8]}... = {actual:.4f}")
             
-            if wallet_tokens:
-                break  # Found tokens, stop checking more transactions
+            print(f"   Found {len(wallet_tokens)} tokens")
         
         # Update DB
         if wallet_tokens:
@@ -381,10 +361,13 @@ async def sync_positions_from_wallet(user_id: int):
                 if pos:
                     db.update_position_amount(pos['id'], amount)
                 else:
-                    db.add_position(user_id, mint, amount, 0, 'tx-scan')
+                    db.add_position(user_id, mint, amount, 0, 'helius')
+            
+            for pos in existing:
+                if pos['token_address'] not in wallet_tokens:
+                    db.close_position(pos['id'], 'sold')
+            
             print(f"   ✅ Synced: {len(wallet_tokens)} tokens")
-        else:
-            print(f"   ⚠️ No tokens with balance found")
         
     except Exception as e:
         print(f"   ⚠️ Sync error: {e}")
