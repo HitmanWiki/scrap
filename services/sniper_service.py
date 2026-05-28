@@ -169,71 +169,129 @@ class SniperService:
     async def execute_pump_sell_direct(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
         """Sell pump.fun tokens directly using Pump.fun program"""
         try:
+            from solders.instruction import Instruction, AccountMeta
+            from solders.system_program import ID as SYSTEM_PROGRAM_ID
+            from solders.token.associated import get_associated_token_address
+            from solders.pubkey import Pubkey
+            from solders.transaction import VersionedTransaction
+            from solders.message import MessageV0
+            from solders.hash import Hash
+            from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+            import base64
+            
             decimals = await self.get_token_decimals(token_mint)
             amount_raw = int(amount_tokens * 10**decimals)
             
             # Pump.fun program IDs
-            PUMP_FUN_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+            PUMP_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
             PUMP_GLOBAL = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
-            PUMP_EVENT_AUTHORITY = Pubkey.from_string("Ce6TQqeHC1p8KedsN6JpyhTLxLkZRaL2gPZQuJwH6mSA")
-            PUMP_FEE_RECIPIENT = Pubkey.from_string("CebN5WGQ4jvEPvsVU4EoHEpgzq1VVAYAbxc9YetpAMWd")
-            TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-            ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+            PUMP_FEE = Pubkey.from_string("CebN5WGQ4jvEPvsVU4EoHEpgzq1VVAYAbxc9YetpAMWd")
+            PUMP_EVENT = Pubkey.from_string("Ce6TQqeHC1p8KedsN6JpyhTLxLkZRaL2gPZQuJwH6mSA")
+            TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            ASSOC_TOKEN_PROGRAM = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
             
             mint = Pubkey.from_string(token_mint)
-            
-            # Derive PDAs
-            bonding_curve, _ = Pubkey.find_program_address(
-                [b"bonding-curve", bytes(mint)], PUMP_FUN_PROGRAM
-            )
-            associated_bonding_curve, _ = Pubkey.find_program_address(
-                [bytes(bonding_curve), bytes(TOKEN_PROGRAM_ID), bytes(mint)],
-                ASSOCIATED_TOKEN_PROGRAM_ID
-            )
             user_ata = get_associated_token_address(wallet.pubkey(), mint)
             
-            # Build sell instruction data
-            discriminator = 12502976635542562355
-            min_sol_output = 0  # Accept any SOL output
+            # Derive bonding curve PDA
+            bonding_curve, bump = Pubkey.find_program_address(
+                [b"bonding-curve", bytes(mint)], PUMP_PROGRAM
+            )
             
-            data = discriminator.to_bytes(8, 'little')
-            data += amount_raw.to_bytes(8, 'little')
-            data += min_sol_output.to_bytes(8, 'little')
+            # Derive associated bonding curve
+            assoc_bonding_curve, _ = Pubkey.find_program_address(
+                [bytes(bonding_curve), bytes(TOKEN_PROGRAM), bytes(mint)],
+                ASSOC_TOKEN_PROGRAM
+            )
+            
+            # Check if assoc_bonding_curve exists, if not create it
+            create_ata_ix = None
+            account_info = self._rpc_call("getAccountInfo", [str(assoc_bonding_curve)])
+            if 'result' in account_info and account_info['result'] is None:
+                # Need to create the associated token account
+                from spl.token.instructions import create_associated_token_account, CreateAssociatedTokenAccountParams
+                create_ata_ix = create_associated_token_account(
+                    CreateAssociatedTokenAccountParams(
+                        payer=wallet.pubkey(),
+                        owner=bonding_curve,
+                        mint=mint,
+                        token_program_id=TOKEN_PROGRAM,
+                        associated_token_program_id=ASSOC_TOKEN_PROGRAM,
+                    )
+                )
+                print("   Creating associated bonding curve account...")
+            
+            # Sell discriminator
+            SELL_DISCRIMINATOR = 12502976635542562355
+            
+            # Build sell instruction data
+            data = bytearray()
+            data.extend(SELL_DISCRIMINATOR.to_bytes(8, 'little'))
+            data.extend(amount_raw.to_bytes(8, 'little'))
+            data.extend(int(0).to_bytes(8, 'little'))  # min_sol_output
             
             sell_ix = Instruction(
-                program_id=PUMP_FUN_PROGRAM,
+                program_id=PUMP_PROGRAM,
                 accounts=[
                     AccountMeta(PUMP_GLOBAL, False, False),
-                    AccountMeta(PUMP_FEE_RECIPIENT, False, True),
+                    AccountMeta(PUMP_FEE, False, True),
                     AccountMeta(mint, False, False),
                     AccountMeta(bonding_curve, False, True),
-                    AccountMeta(associated_bonding_curve, False, True),
+                    AccountMeta(assoc_bonding_curve, False, True),
                     AccountMeta(user_ata, False, True),
                     AccountMeta(wallet.pubkey(), True, True),
                     AccountMeta(SYSTEM_PROGRAM_ID, False, False),
-                    AccountMeta(ASSOCIATED_TOKEN_PROGRAM_ID, False, False),
-                    AccountMeta(TOKEN_PROGRAM_ID, False, False),
-                    AccountMeta(PUMP_EVENT_AUTHORITY, False, False),
-                    AccountMeta(PUMP_FUN_PROGRAM, False, False),
+                    AccountMeta(ASSOC_TOKEN_PROGRAM, False, False),
+                    AccountMeta(TOKEN_PROGRAM, False, False),
+                    AccountMeta(PUMP_EVENT, False, False),
+                    AccountMeta(PUMP_PROGRAM, False, False),
                 ],
-                data=data
+                data=bytes(data)
             )
+            
+            # Build instructions
+            instructions = [
+                set_compute_unit_limit(300000),
+                set_compute_unit_price(100000),
+            ]
+            
+            if create_ata_ix:
+                instructions.append(create_ata_ix)
+            
+            instructions.append(sell_ix)
             
             # Get blockhash
             blockhash_str = self.client.get_latest_blockhash()
             blockhash = Hash.from_string(blockhash_str)
             
-            # Build and sign
+            # Build message
             msg = MessageV0.try_compile(
                 payer=wallet.pubkey(),
-                instructions=[sell_ix],
+                instructions=instructions,
                 address_lookup_table_accounts=[],
                 recent_blockhash=blockhash,
             )
+            
             tx = VersionedTransaction(msg, [wallet])
             
-            # Send
-            txid = self.client.send_raw_transaction(bytes(tx))
+            # Send with base64
+            tx_base64 = base64.b64encode(bytes(tx)).decode()
+            result = self._rpc_call("sendTransaction", [
+                tx_base64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": False,
+                    "preflightCommitment": "processed",
+                    "maxRetries": 3
+                }
+            ])
+            
+            if 'error' in result:
+                err_msg = result['error'].get('message', str(result['error']))
+                print(f"   ⚠️ RPC Error: {err_msg}")
+                return {"success": False, "error": err_msg}
+            
+            txid = result.get('result', '')
             print(f"   ✅ PumpSell TXID: {txid}")
             
             return {
@@ -242,10 +300,13 @@ class SniperService:
                 "sol_received": 0,
                 "explorer": f"https://solscan.io/tx/{txid}"
             }
+            
         except Exception as e:
-            print(f"   ❌ PumpSell failed: {e}")
+            print(f"   ❌ PumpSell error: {e}")
+            import traceback
+            traceback.print_exc()
             return {"success": False, "error": str(e)}
-    
+        
     # ============================================
     # JUPITER SELL
     # ============================================
