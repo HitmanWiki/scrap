@@ -396,39 +396,44 @@ async def sync_positions_from_wallet(user_id: int):
     
     return wallet_tokens
 async def debug_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Debug: Check what RPC returns for wallet"""
     user_id = update.effective_user.id
     wallet = await get_user_wallet(user_id)
     wallet_addr = str(wallet.pubkey())
     
-    await update.message.reply_text(f"🔍 *Debugging wallet:* `{wallet_addr}`", parse_mode='Markdown')
-    
     import requests as req
     
-    # Test 1: getBalance
-    payload1 = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet_addr]}
-    r1 = req.post(SOLANA_RPC, json=payload1, timeout=10)
-    await update.message.reply_text(f"**getBalance:**\n```{r1.json()}```", parse_mode='Markdown')
+    results = [f"🔍 Wallet: `{wallet_addr}`"]
     
-    # Test 2: getTokenAccountsByOwner
-    payload2 = {
+    # Get all token mints from recent transactions
+    # Check last 10 transactions for token mints
+    payload = {
         "jsonrpc": "2.0", "id": 1,
-        "method": "getTokenAccountsByOwner",
-        "params": [
-            wallet_addr,
-            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-            {"encoding": "jsonParsed"}
-        ]
+        "method": "getSignaturesForAddress",
+        "params": [wallet_addr, {"limit": 10}]
     }
-    r2 = req.post(SOLANA_RPC, json=payload2, timeout=10)
-    data2 = r2.json()
-    token_count = len(data2.get('result', {}).get('value', [])) if 'result' in data2 else 0
-    await update.message.reply_text(f"**getTokenAccountsByOwner:** Found {token_count} tokens\n```{str(data2)[:1000]}```", parse_mode='Markdown')
+    resp = req.post(SOLANA_RPC, json=payload, timeout=10)
+    data = resp.json()
     
-    # Test 3: Check a specific ATA we know should exist
-    # Get from recent transactions on Solscan
-    await update.message.reply_text(f"🔗 [View on Solscan](https://solscan.io/account/{wallet_addr})", parse_mode='Markdown', disable_web_page_preview=True)
-
+    sigs = data.get('result', [])
+    results.append(f"Recent TXs: {len(sigs)}")
+    
+    # Check each transaction for token info
+    for sig in sigs[:3]:
+        tx_data = req.post(SOLANA_RPC, json={
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTransaction",
+            "params": [sig['signature'], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+        }, timeout=10).json()
+        
+        if 'result' in tx_data and tx_data['result']:
+            meta = tx_data['result'].get('meta', {})
+            for token in meta.get('postTokenBalances', []):
+                mint = token.get('mint', '')
+                amt = token.get('uiTokenAmount', {}).get('uiAmount', 0)
+                if amt > 0:
+                    results.append(f"Token: `{mint[:8]}...` = {amt:.4f}")
+    
+    await update.message.reply_text("\n".join(results), parse_mode='Markdown')
 
 # ============================================
 # ADDRESS VALIDATION & EXTRACTION
