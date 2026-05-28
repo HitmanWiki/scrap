@@ -33,36 +33,32 @@ class SniperService:
             return {"error": {"message": str(e)}}
         
     async def get_token_decimals(self, token_mint: str) -> int:
-        """Get token decimals from blockchain RPC (most reliable)"""
+        """Get token decimals - special handling for pump.fun tokens"""
+        
+        # pump.fun tokens have 6 decimals
+        if token_mint.endswith('pump'):
+            return 6
+        
+        # Try RPC first
         try:
-            # First try to get from RPC directly
             result = self._rpc_call("getMint", [token_mint])
             if 'result' in result and result['result']:
                 decimals = result['result'].get('decimals', 9)
-                print(f"   📊 On-chain decimals: {decimals}")
                 return decimals
-        except Exception as e:
-            print(f"   ⚠️ RPC decimals error: {e}")
+        except:
+            pass
         
-        # Fallback: check Jupiter token list
+        # Try Jupiter token list
         try:
             url = f"https://tokens.jup.ag/token/{token_mint}"
             resp = requests.get(url, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
                 if 'decimals' in data:
-                    decimals = int(data['decimals'])
-                    print(f"   📊 Jupiter decimals: {decimals}")
-                    return decimals
+                    return int(data['decimals'])
         except:
             pass
         
-        # For pump.fun tokens, default is 6
-        if token_mint.endswith('pump'):
-            print(f"   📊 pump.fun token: using 6 decimals")
-            return 6
-        
-        print(f"   📊 Using default decimals: 9")
         return 9
     
     async def get_token_price(self, token_mint: str) -> Optional[float]:
@@ -273,71 +269,66 @@ class SniperService:
             return {"success": False, "error": str(e)}
         
     async def execute_sell(self, wallet: Keypair, token_mint: str, amount_tokens: float, slippage_bps: int) -> dict:
-        """Execute sell - FIXED: Proper decimal handling"""
+        """Execute sell - With fallback to main Jupiter API"""
         try:
             print(f"   Selling {amount_tokens:.6f} tokens of {token_mint[:8]}...")
             
-            # Get token decimals from blockchain
+            # Get token decimals
             decimals = await self.get_token_decimals(token_mint)
             print(f"   📊 Token decimals: {decimals}")
             
-            # Convert to raw units (with decimals)
+            # Convert to raw units
             amount_raw = int(amount_tokens * 10**decimals)
             print(f"   📊 Raw amount: {amount_raw}")
             
-            # Sanity check - if raw amount seems too large, re-check decimals
-            if amount_raw > 10**15 and decimals == 9:
-                # Try getting decimals again with different method
-                print(f"   ⚠️ Raw amount seems large, checking decimals again...")
+            # Try multiple API endpoints
+            endpoints = [
+                ("https://lite-api.jup.ag/swap/v1/quote", "Lite API"),
+                ("https://quote-api.jup.ag/v6/quote", "Main API"),
+            ]
+            
+            quote = None
+            used_endpoint = None
+            
+            for url, name in endpoints:
                 try:
-                    result = self._rpc_call("getMint", [token_mint])
-                    if 'result' in result and result['result']:
-                        decimals = result['result'].get('decimals', 9)
-                        print(f"   📊 Confirmed decimals: {decimals}")
-                        amount_raw = int(amount_tokens * 10**decimals)
-                        print(f"   📊 Adjusted raw amount: {amount_raw}")
-                except:
-                    pass
-            
-            # 1. Get quote from Jupiter
-            quote_url = "https://lite-api.jup.ag/swap/v1/quote"
-            params = {
-                "inputMint": token_mint,
-                "outputMint": "So11111111111111111111111111111111111111112",
-                "amount": amount_raw,
-                "slippageBps": slippage_bps,
-            }
-            
-            print(f"   Getting sell quote...")
-            resp = requests.get(quote_url, params=params, timeout=10)
-            if resp.status_code != 200:
-                return {"success": False, "error": f"Quote failed: HTTP {resp.status_code}"}
-            quote = resp.json()
-            
-            # Check if quote has output
-            if "outputAmount" not in quote or quote["outputAmount"] == "0":
-                # If decimals might be wrong, try with 6 decimals (pump.fun standard)
-                if decimals != 6:
-                    print(f"   ⚠️ Quote failed, retrying with 6 decimals...")
-                    amount_raw = int(amount_tokens * 10**6)
-                    params["amount"] = amount_raw
-                    resp = requests.get(quote_url, params=params, timeout=10)
+                    params = {
+                        "inputMint": token_mint,
+                        "outputMint": "So11111111111111111111111111111111111111112",
+                        "amount": amount_raw,
+                        "slippageBps": slippage_bps,
+                    }
+                    
+                    print(f"   Getting quote from {name}...")
+                    resp = requests.get(url, params=params, timeout=10)
+                    
                     if resp.status_code == 200:
-                        quote = resp.json()
-                        if "outputAmount" in quote and quote["outputAmount"] != "0":
-                            print(f"   ✅ Retry with 6 decimals succeeded!")
+                        data = resp.json()
+                        if "outputAmount" in data and data["outputAmount"] != "0":
+                            quote = data
+                            used_endpoint = name
+                            print(f"   ✅ Quote successful from {name}")
+                            break
                         else:
-                            return {"success": False, "error": "No liquidity for this token"}
+                            print(f"   ⚠️ {name} returned zero output")
                     else:
-                        return {"success": False, "error": "No liquidity or price impact too high"}
-                else:
-                    return {"success": False, "error": "No liquidity or price impact too high"}
+                        print(f"   ⚠️ {name} HTTP {resp.status_code}")
+                        
+                except Exception as e:
+                    print(f"   ⚠️ {name} error: {e}")
+            
+            if not quote:
+                return {"success": False, "error": "No liquidity found for this token. Try smaller amount or different token."}
             
             expected_sol = int(quote["outputAmount"]) / 1e9
             print(f"   📊 Expected SOL: {expected_sol:.6f}")
             
-            # 2. Build swap transaction
-            swap_url = "https://lite-api.jup.ag/swap/v1/swap"
+            # Build swap transaction using the same API that gave the quote
+            if used_endpoint == "Lite API":
+                swap_url = "https://lite-api.jup.ag/swap/v1/swap"
+            else:
+                swap_url = "https://quote-api.jup.ag/v6/swap"
+            
             payload = {
                 "quoteResponse": quote,
                 "userPublicKey": str(wallet.pubkey()),
@@ -355,7 +346,7 @@ class SniperService:
             if "swapTransaction" not in swap_data:
                 return {"success": False, "error": "No swapTransaction"}
             
-            # 3. Sign transaction
+            # Sign and send
             tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             raw_tx = VersionedTransaction.from_bytes(tx_bytes)
             message_bytes = message.to_bytes_versioned(raw_tx.message)
@@ -363,7 +354,6 @@ class SniperService:
             signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
             signed_tx_bytes = bytes(signed_tx)
             
-            # 4. Send transaction
             print(f"   Sending sell transaction...")
             result = self.client.send_raw_transaction(
                 signed_tx_bytes,
@@ -372,13 +362,10 @@ class SniperService:
             txid = str(result.value)
             print(f"   ✅ Sell TXID: {txid}")
             
-            # 5. Get SOL received
-            sol_received = expected_sol
-            
             return {
                 "success": True,
                 "txid": txid,
-                "sol_received": sol_received,
+                "sol_received": expected_sol,
                 "explorer": f"https://solscan.io/tx/{txid}"
             }
         except Exception as e:
