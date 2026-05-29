@@ -1340,7 +1340,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📈 *Target Market Cap*\nCurrent: *{current_display}*\n\nAuto-sell when MC reaches this.\nEnter target in $ (e.g., 45000):",
             reply_markup=get_back_keyboard(), parse_mode='Markdown')
         return ENTER_TARGET_MC
-    
+    elif action == "delete_message":
+        try:
+            await query.message.delete()
+        except:
+            await query.answer("Cannot delete this message.")
+        return SELECTING_ACTION
     elif action == "toggle_auto_sell":
         settings = db.get_user_settings(user_id)
         current = settings.get('auto_sell_enabled', 0) if settings else 0
