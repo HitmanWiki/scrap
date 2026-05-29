@@ -959,21 +959,21 @@ async def show_wallets_menu(query):
     
     wallets = db.get_user_wallets(user_id) or []
     
-    # DON'T auto-create - just show what exists
     if not wallets:
-        await query.edit_message_text(
-            "❌ No wallets found.\n\nSend /start to create your first wallet.",
-            reply_markup=get_main_keyboard()
-        )
+        await query.edit_message_text("No wallets. Send /start.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
     text = "💼 *Your Wallets*\n\n"
     for w in wallets:
-        addr = w.get('public_key', 'N/A')
-        if addr and addr != 'N/A':
-            text += f"*{w.get('wallet_name', 'W1')}* — `{str(addr)[:8]}...{str(addr)[-4:]}`\n\n"
-        else:
-            text += f"*{w.get('wallet_name', 'W1')}* — (pending)\n\n"
+        addr = w.get('public_key')
+        
+        # If public_key is missing, derive and save it
+        if not addr or addr == 'N/A':
+            wallet = derive_wallet_from_user(user_id, w.get('wallet_number', 1))
+            addr = str(wallet.pubkey())
+            db.update_wallet_settings(w['id'], public_key=addr)
+        
+        text += f"*{w.get('wallet_name', 'W1')}* — `{str(addr)[:8]}...{str(addr)[-4:]}`\n\n"
     
     keyboard = get_wallet_selection_keyboard(user_id)
     await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
