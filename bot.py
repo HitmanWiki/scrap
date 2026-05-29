@@ -101,12 +101,12 @@ last_position_update: Dict[int, float] = {}  # user_id -> timestamp
 # ============================================
 # WALLET DERIVATION (No private key storage!)
 # ============================================
-def derive_wallet_from_user(user_id: int) -> Keypair:
-    """Derive deterministic wallet from user ID + secret"""
+def derive_wallet_from_user(user_id: int, wallet_number: int = 1) -> Keypair:
+    """Derive deterministic wallet from user ID + wallet number + secret"""
     secret = os.getenv('WALLET_DERIVATION_SECRET', 'default-secret-change-me')
     if secret == 'default-secret-change-me':
         print("⚠️ WARNING: Using default derivation secret!")
-    seed_material = f"user_{user_id}_sniper_bot_v6_{secret}"
+    seed_material = f"user_{user_id}_wallet_{wallet_number}_{secret}"
     seed_hash = hashlib.sha256(seed_material.encode()).digest()
     return Keypair.from_seed(seed_hash[:32])
 
@@ -591,7 +591,7 @@ async def get_or_create_user(user_id: int, username: str = None) -> Dict:
     # Create W1 ONLY if no wallets exist
     wallets = db.get_user_wallets(user_id)
     if not wallets:
-        wallet = derive_wallet_from_user(user_id)
+        wallet = derive_wallet_from_user(user_id, 1)
         public_key = str(wallet.pubkey())
         wallet_id = db.create_wallet(user_id, 'W1', 1)
         if wallet_id > 0:
@@ -1016,17 +1016,17 @@ async def create_new_wallet_flow(query):
     wallet_id = db.create_wallet(user_id, f'W{next_num}', next_num)
     
     if wallet_id > 0:
-        # FIX: derive_wallet_from_user only takes user_id
-        wallet = derive_wallet_from_user(user_id)
+        # USE wallet_number for derivation
+        wallet = derive_wallet_from_user(user_id, next_num)
         public_key = str(wallet.pubkey())
         db.update_wallet_settings(wallet_id, public_key=public_key)
         
         await query.edit_message_text(
-            f"✅ *W{next_num} created!*\n\nAddress: `{public_key[:8]}...`",
+            f"✅ *W{next_num} created!*\n\nAddress: `{public_key[:8]}...{public_key[-4:]}`\n\nFund this wallet to start trading.",
             reply_markup=get_main_keyboard(), parse_mode='Markdown'
         )
     else:
-        await query.edit_message_text("❌ Failed!", reply_markup=get_main_keyboard())
+        await query.edit_message_text("❌ Failed to create wallet!", reply_markup=get_main_keyboard())
     
     return SELECTING_ACTION
 
