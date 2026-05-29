@@ -2581,6 +2581,10 @@ async def execute_withdraw(query):
 def run_monitor_in_thread():
     global monitor_client, channel_subscribers
     
+    # Suppress Telethon event loop warnings
+    import logging
+    logging.getLogger('telethon').setLevel(logging.ERROR)
+    
     async def _run():
         global monitor_client, channel_subscribers
         
