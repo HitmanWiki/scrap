@@ -1257,17 +1257,18 @@ Select view:
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
-
 async def show_portfolio_by_wallet(query):
     user_id = query.from_user.id
-    wallets = db.get_user_wallets(user_id)
-    try:
-        trades = db.get_user_trade_history(user_id, limit=500) or []
-        if not isinstance(trades, list):
-            trades = []
-    except:
-        trades = []
+    wallets = db.get_user_wallets(user_id) or []
     
+    # SAFE trades fetch
+    trades = []
+    try:
+        result = db.get_user_trade_history(user_id, limit=500)
+        if result and isinstance(result, list):
+            trades = result
+    except:
+        pass
     text = "╔═══════════════════════════╗\n║     💼 WALLET SUMMARY    ║\n╚═══════════════════════════╝\n\n"
     total_sol = 0
     
