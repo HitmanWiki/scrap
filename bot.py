@@ -321,12 +321,9 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
         if not wallet:
             return
         
-        await sync_positions_from_wallet(user_id)
         positions = db.get_user_positions(user_id)
         wallet_addr = str(wallet.pubkey())
         
-        # Add timestamp so text always changes (avoids "message not modified" error)
-        from datetime import datetime
         now = datetime.now().strftime("%H:%M")
         
         text = f"📊 *Portfolio* (updated {now})\n\n"
@@ -337,10 +334,10 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
                 if pos['amount'] > 0:
                     addr = pos['token_address']
                     amt = pos['amount']
+                    symbol = await get_token_symbol(addr)
                     price = await solana_service.get_token_price(addr)
                     val = amt * price if price else 0
                     total_value += val
-                    symbol = await get_token_symbol(addr)
                     text += f"• *{symbol}* — *{amt:,.2f}*"
                     if val > 0:
                         text += f" (${val:.2f})"
@@ -359,7 +356,7 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
             [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_positions")]
         ])
         
-        # ALWAYS try to edit first
+        # Try to edit existing message
         if user_id in pinned_messages:
             try:
                 await application.bot.edit_message_text(
@@ -369,34 +366,41 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
                     parse_mode='Markdown',
                     reply_markup=keyboard
                 )
-                return  # Success - no new message sent
+                return
             except Exception as e:
-                err_str = str(e)
-                if "not modified" in err_str.lower():
-                    return  # Same content, skip silently
-                # Other error - remove stale ID
+                err_str = str(e).lower()
+                if "not modified" in err_str:
+                    return
+                if "event loop" in err_str:
+                    return  # Silently skip event loop errors
                 del pinned_messages[user_id]
         
-        # Only send new message if edit failed and no existing pin
-        if not silent:  # Only send new message for manual refreshes, not auto
-            msg = await application.bot.send_message(
-                chat_id=user_id,
-                text=text,
-                parse_mode='Markdown',
-                reply_markup=keyboard
-            )
+        # Send new message (only if not silent)
+        if not silent:
             try:
-                await application.bot.pin_chat_message(
+                msg = await application.bot.send_message(
                     chat_id=user_id,
-                    message_id=msg.message_id,
-                    disable_notification=True
+                    text=text,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
                 )
-            except:
-                pass
-            pinned_messages[user_id] = msg.message_id
+                try:
+                    await application.bot.pin_chat_message(
+                        chat_id=user_id,
+                        message_id=msg.message_id,
+                        disable_notification=True
+                    )
+                except:
+                    pass
+                pinned_messages[user_id] = msg.message_id
+            except Exception as e:
+                if "event loop" not in str(e).lower():
+                    print(f"   ⚠️ Pin update send error: {e}")
         
     except Exception as e:
-        print(f"   ⚠️ Pin update: {e}")
+        err_str = str(e).lower()
+        if "event loop" not in err_str:
+            print(f"   ⚠️ Pin update: {e}")
 async def auto_refresh_positions():
     """Silently refresh pinned positions every 5 minutes"""
     while True:
