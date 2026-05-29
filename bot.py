@@ -1203,19 +1203,18 @@ async def ask_channel_buy_settings(update, context):
     )
     return SELECTING_ACTION
 async def ask_channel_buy_amount(source, user_id):
-    """Ask for buy amount - works with both Update and CallbackQuery"""
+    """Ask for buy amount"""
     wallet_id = channel_setup_data.get(user_id, {}).get('wallet_id')
     wallet = db.get_wallet(wallet_id)
     default_buy = wallet.get('default_buy_amount', 0.01) if wallet else 0.01
     channel_name = channel_setup_data.get(user_id, {}).get('channel_name', '')
     
     text = f"""
-📋 *Channel Setup* — `{channel_name}`
+📋 `{channel_name}`
 
-💵 *Step 1/5: Buy Amount*
+💵 *Buy Amount (SOL)*
 
-Enter buy amount in SOL:
-(or type *skip* for default: {default_buy} SOL)
+Enter amount or *skip* for default: {default_buy} SOL
 """
     if hasattr(source, 'message'):
         await source.message.reply_text(text, reply_markup=get_back_keyboard(), parse_mode='Markdown')
@@ -1263,27 +1262,25 @@ async def handle_channel_buy_amount(update: Update, context: ContextTypes.DEFAUL
     user_id = update.effective_user.id
     
     if text.lower() == 'cancel':
+        channel_setup_data.pop(user_id, None)
         await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    global channel_setup_data
     setup = channel_setup_data.get(user_id, {})
     
     if text.lower() != 'skip':
         try:
-            buy_amount = float(text)
-            setup['buy_amount'] = buy_amount
+            setup['buy_amount'] = float(text)
         except:
-            await update.message.reply_text("❌ Invalid amount! Enter a number or *skip*.")
+            await update.message.reply_text("❌ Invalid! Enter number or *skip*.", reply_markup=get_back_keyboard())
             return ENTER_CHANNEL_BUY_AMOUNT
     
     channel_setup_data[user_id] = setup
     
+    # Ask for slippage
     await update.message.reply_text(
-        f"Enter *slippage %* for this channel:\n"
-        f"(or type *skip* for default: 10%)",
-        reply_markup=get_back_keyboard(),
-        parse_mode='Markdown'
+        "📊 *Slippage %*\n\nEnter % (e.g., 10) or *skip* for default:",
+        reply_markup=get_back_keyboard(), parse_mode='Markdown'
     )
     return ENTER_CHANNEL_SLIPPAGE
 async def handle_channel_slippage(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1334,7 +1331,23 @@ async def handle_channel_slippage(update: Update, context: ContextTypes.DEFAULT_
         parse_mode='Markdown'
     )
     return SELECTING_ACTION
-
+async def handle_channel_wallet_setup(query, wallet_id):
+    """After wallet selected, ask for buy amount"""
+    user_id = query.from_user.id
+    wallet = db.get_wallet(wallet_id)
+    
+    channel_setup_data[user_id] = channel_setup_data.get(user_id, {})
+    channel_setup_data[user_id]['wallet_id'] = wallet_id
+    
+    channel_name = channel_setup_data[user_id].get('channel_name', '')
+    
+    await query.edit_message_text(
+        f"📋 `{channel_name}` → 💼 *{wallet['wallet_name']}*\n\n"
+        f"💵 *Buy Amount (SOL)*\n\nEnter amount or *skip* for default: {wallet.get('default_buy_amount', 0.01)} SOL",
+        reply_markup=get_back_keyboard(),
+        parse_mode='Markdown'
+    )
+    return ENTER_CHANNEL_BUY_AMOUNT
 async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_name = update.message.text.strip()
     user_id = update.effective_user.id
@@ -1343,7 +1356,6 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    # Clean up
     channel_name = channel_name.replace('https://t.me/', '').replace('https://telegram.me/', '')
     if not channel_name.startswith('@'):
         channel_name = '@' + channel_name
@@ -1352,39 +1364,26 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Invalid format! Use @channelname", reply_markup=get_back_keyboard())
         return ENTER_CHANNEL_USERNAME
     
-    # Get W1 (default wallet)
+    # Store channel name
+    channel_setup_data[user_id] = {'channel_name': channel_name}
+    
+    # Get wallets
     wallets = db.get_user_wallets(user_id)
-    wallet_id = wallets[0]['id'] if wallets else None
-    wallet = db.get_wallet(wallet_id) if wallet_id else None
     
-    # Add channel with wallet
-    channel_id = db.add_channel(user_id, channel_name, wallet_id=wallet_id)
+    if len(wallets) == 1:
+        # Only W1 - auto select but still ask for settings
+        channel_setup_data[user_id]['wallet_id'] = wallets[0]['id']
+        return await ask_channel_buy_amount(update, user_id)
     
-    # Start monitoring
-    global channel_subscribers
-    if channel_name not in channel_subscribers:
-        channel_subscribers[channel_name] = []
-    if user_id not in channel_subscribers[channel_name]:
-        channel_subscribers[channel_name].append(user_id)
-    asyncio.create_task(poll_channel_messages(channel_name))
+    # Multiple wallets - show selection
+    text = f"📋 Channel: `{channel_name}`\n\n💼 *Select Wallet for this Channel:*"
+    keyboard = []
+    for w in wallets:
+        addr = w.get('public_key', '')[:8] if w.get('public_key') else 'N/A'
+        keyboard.append([InlineKeyboardButton(f"💼 {w['wallet_name']} ({addr}...)", callback_data=f"chsetup_wallet_{w['id']}")])
+    keyboard.append([InlineKeyboardButton("« Cancel", callback_data="back_main")])
     
-    w_name = wallet['wallet_name'] if wallet else 'W1'
-    buy_amt = wallet.get('default_buy_amount', 0.01) if wallet else 0.01
-    slip = (wallet.get('default_slippage', 1000) if wallet else 1000) / 100
-    
-    text = f"""
-✅ *Channel Added!*
-
-📋 `{channel_name}`
-💼 Wallet: *{w_name}*
-💰 Buy: {buy_amt} SOL
-📊 Slippage: {slip}%
-
-📡 Monitoring started!
-
-⚙️ Use *Settings* to change buy/sell per wallet.
-"""
-    await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 async def show_portfolio_menu(query):
     text = """
@@ -1596,7 +1595,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 *Slippage*\nCurrent: *{user.get('default_slippage', DEFAULT_SLIPPAGE)/100}%*\n\nEnter new %:",
             reply_markup=get_back_keyboard(), parse_mode='Markdown')
         return ENTER_SLIPPAGE
-    
+    elif action.startswith("chsetup_wallet_"):
+        wallet_id = int(action.replace("chsetup_wallet_", ""))
+        return await handle_channel_wallet_setup(query, wallet_id)
     elif action == "set_take_profit":
         context.user_data['settings_state'] = 'take_profit'
         settings = db.get_user_settings(user_id)
