@@ -1041,36 +1041,32 @@ async def create_new_wallet_flow(query):
 async def show_portfolio_by_channel(query):
     user_id = query.from_user.id
     channels = db.get_user_channels(user_id)
-    trades = db.get_user_trade_history(user_id, limit=100)
+    trades = db.get_user_trade_history(user_id, limit=200)
     
-    text = "📊 *Portfolio by Channel*\n\n"
+    text = "╔═══════════════════════════╗\n║    📋 CHANNEL ANALYTICS  ║\n╚═══════════════════════════╝\n\n"
     
     if channels:
         for ch in channels:
-            ch_name = ch['channel_name']
-            ch_trades = [t for t in trades if t.get('channel_name') == ch_name]
+            ch_trades = [t for t in trades if t.get('channel_name') == ch['channel_name']]
+            buys = len([t for t in ch_trades if t.get('trade_type') == 'buy'])
+            sells = len([t for t in ch_trades if t.get('trade_type') in ('sell', 'auto-sell')])
+            pnl = sum(t.get('pnl_sol', 0) or 0 for t in ch_trades if t.get('trade_type') in ('sell', 'auto-sell'))
             
-            buys = [t for t in ch_trades if t.get('trade_type') == 'buy']
-            sells = [t for t in ch_trades if t.get('trade_type') in ('sell', 'auto-sell')]
+            emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+            win_rate = f"{(sells/(buys or 1))*100:.0f}%" if buys > 0 else "N/A"
             
-            text += f"📋 `{ch_name}`\n"
-            text += f"  📈 {len(buys)} buys | 📉 {len(sells)} sells\n"
-            
-            # Calculate PNL for this channel
-            total_pnl = 0
-            for t in sells:
-                pnl = t.get('pnl_sol', 0) or 0
-                total_pnl += pnl
-            
-            emoji = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "⚪"
-            text += f"  💰 PnL: {emoji} ${total_pnl:.4f}\n\n"
-    else:
-        text += "No channels configured\n\n"
+            text += f"📡 `{ch['channel_name']}`\n"
+            text += f"   📈 {buys} buys | 📉 {sells} sells\n"
+            text += f"   🎯 Win Rate: {win_rate}\n"
+            text += f"   💰 PnL: {emoji} ${pnl:.4f}\n\n"
     
-    # Show trades without channel
-    no_ch_trades = [t for t in trades if not t.get('channel_name')]
-    if no_ch_trades:
-        text += f"📋 *Manual Trades*: {len(no_ch_trades)}\n"
+    # Manual trades
+    manual = [t for t in trades if not t.get('channel_name')]
+    if manual:
+        text += f"📝 *Manual Trades:* {len(manual)}\n\n"
+    
+    if not channels and not manual:
+        text += "📭 No trades yet\n\n"
     
     keyboard = [[InlineKeyboardButton("« Back", callback_data="portfolio")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -1079,45 +1075,92 @@ async def show_portfolio_by_channel(query):
 async def show_portfolio_by_token(query):
     user_id = query.from_user.id
     trades = db.get_user_trade_history(user_id, limit=200)
-    
-    text = "📊 *Portfolio by Token*\n\n"
-    
-    # Group by token
-    token_data = {}
-    for t in trades:
-        addr = t.get('token_address', '')
-        if addr not in token_data:
-            token_data[addr] = {'buys': 0, 'sells': 0, 'buy_vol': 0, 'sell_vol': 0, 'pnl': 0}
-        
-        if t.get('trade_type') == 'buy':
-            token_data[addr]['buys'] += 1
-            token_data[addr]['buy_vol'] += t.get('amount', 0)
-        else:
-            token_data[addr]['sells'] += 1
-            token_data[addr]['sell_vol'] += t.get('amount', 0)
-            token_data[addr]['pnl'] += t.get('pnl_sol', 0) or 0
-    
-    if token_data:
-        for addr, data in list(token_data.items())[:15]:
-            emoji = "🟢" if data['pnl'] > 0 else "🔴" if data['pnl'] < 0 else "⚪"
-            text += f"🪙 `{addr[:8]}...{addr[-4:]}`\n"
-            text += f"  {data['buys']} buys, {data['sells']} sells\n"
-            text += f"  PnL: {emoji} ${data['pnl']:.4f}\n\n"
-    else:
-        text += "No trades yet\n\n"
-    
-    # Also show active positions
     positions = db.get_user_positions(user_id)
+    
+    text = "╔═══════════════════════════╗\n║    🪙 TOKEN BREAKDOWN    ║\n╚═══════════════════════════╝\n\n"
+    
+    # Active positions first
     active = [p for p in positions if p['amount'] > 0]
     if active:
-        text += "📌 *Active Positions:*\n"
+        text += "📌 *HOLDING NOW:*\n\n"
         for pos in active[:5]:
-            text += f"  `{pos['token_address'][:8]}...` — {pos['amount']:,.2f}\n"
+            addr = pos['token_address']
+            price = await solana_service.get_token_price(addr)
+            val = pos['amount'] * price if price else 0
+            mc = await get_token_market_cap(addr)
+            
+            text += f"🪙 `{addr[:6]}...{addr[-4:]}`\n"
+            text += f"   📦 {pos['amount']:,.2f} | 💵 ${val:.2f}\n"
+            if mc:
+                text += f"   📊 MC: ${mc:,.0f}\n"
+            text += "\n"
+    
+    # Trade history by token
+    token_stats = {}
+    for t in trades:
+        addr = t.get('token_address', '')
+        if addr not in token_stats:
+            token_stats[addr] = {'buys': 0, 'sells': 0, 'pnl': 0}
+        if t.get('trade_type') == 'buy':
+            token_stats[addr]['buys'] += 1
+        else:
+            token_stats[addr]['sells'] += 1
+            token_stats[addr]['pnl'] += t.get('pnl_sol', 0) or 0
+    
+    # Show traded tokens
+    if token_stats:
+        text += "📜 *TRADE HISTORY:*\n\n"
+        sorted_tokens = sorted(token_stats.items(), key=lambda x: abs(x[1]['pnl']), reverse=True)
+        for addr, stats in sorted_tokens[:5]:
+            emoji = "🟢" if stats['pnl'] > 0 else "🔴"
+            text += f"🪙 `{addr[:6]}...{addr[-4:]}`\n"
+            text += f"   {stats['buys']} buys | {stats['sells']} sells\n"
+            text += f"   {emoji} ${stats['pnl']:.4f}\n\n"
     
     keyboard = [[InlineKeyboardButton("« Back", callback_data="portfolio")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
+async def show_portfolio_stats(query):
+    user_id = query.from_user.id
+    trades = db.get_user_trade_history(user_id, limit=500)
+    wallets = db.get_user_wallets(user_id)
+    
+    total_buys = len([t for t in trades if t.get('trade_type') == 'buy'])
+    total_sells = len([t for t in trades if t.get('trade_type') in ('sell', 'auto-sell')])
+    total_pnl = sum(t.get('pnl_sol', 0) or 0 for t in trades if t.get('trade_type') in ('sell', 'auto-sell'))
+    
+    # Win rate
+    winning = len([t for t in trades if t.get('trade_type') in ('sell', 'auto-sell') and (t.get('pnl_sol', 0) or 0) > 0])
+    win_rate = f"{(winning/(total_sells or 1))*100:.0f}%" if total_sells > 0 else "N/A"
+    
+    # Total SOL balance
+    total_sol = 0
+    for w in wallets:
+        try:
+            wallet_key = derive_wallet_from_user(user_id, w.get('wallet_number', 1))
+            total_sol += await solana_service.get_balance(str(wallet_key.pubkey()))
+        except:
+            pass
+    
+    text = f"""
+╔═══════════════════════════╗
+║    📊 OVERALL STATS      ║
+╚═══════════════════════════╝
 
+┌─────────────────────────┐
+│ 💰 Total SOL: {total_sol:.4f}        │
+│ 📈 Total Trades: {len(trades)}      │
+│ 🟢 Buys: {total_buys}               │
+│ 🔴 Sells: {total_sells}             │
+│ 🎯 Win Rate: {win_rate}            │
+│ 💵 Total PnL: ${total_pnl:.4f}     │
+│ 💼 Wallets: {len(wallets)}          │
+└─────────────────────────┘
+"""
+    
+    keyboard = [[InlineKeyboardButton("« Back", callback_data="portfolio")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
 # 3. Fix ask_channel_buy_settings (remove or implement)
 async def ask_channel_buy_settings(update, context):
     # Simplified - just add channel directly
@@ -1182,16 +1225,31 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     return SELECTING_ACTION
 async def show_portfolio_menu(query):
-    text = "📊 *Portfolio*\n\nSelect view:"
-    await query.edit_message_text(text, reply_markup=get_portfolio_keyboard(), parse_mode='Markdown')
+    text = """
+╔═══════════════════════════╗
+║      📊 PORTFOLIO        ║
+╚═══════════════════════════╝
+
+Select view:
+"""
+    keyboard = [
+        [InlineKeyboardButton("💼 By Wallet", callback_data="portfolio_wallets")],
+        [InlineKeyboardButton("📋 By Channel", callback_data="portfolio_channels")],
+        [InlineKeyboardButton("🪙 By Token", callback_data="portfolio_tokens")],
+        [InlineKeyboardButton("📊 Overall Stats", callback_data="portfolio_stats")],
+        [InlineKeyboardButton("« Back", callback_data="back_main")]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 
 async def show_portfolio_by_wallet(query):
     user_id = query.from_user.id
     wallets = db.get_user_wallets(user_id)
+    trades = db.get_user_trade_history(user_id, limit=200)
     
-    text = "📊 *Portfolio by Wallet*\n\n"
-    total_value = 0
+    text = "╔═══════════════════════════╗\n║     💼 WALLET SUMMARY    ║\n╚═══════════════════════════╝\n\n"
+    total_sol = 0
+    total_tokens = 0
     
     for w in wallets:
         wallet_num = w.get('wallet_number', 1)
@@ -1199,42 +1257,33 @@ async def show_portfolio_by_wallet(query):
         wallet_addr = str(wallet_key.pubkey())
         
         try:
-            sol_balance = await solana_service.get_balance(wallet_addr)
+            sol = await solana_service.get_balance(wallet_addr)
         except:
-            sol_balance = 0
+            sol = 0
+        total_sol += sol
         
-        text += f"💼 *{w['wallet_name']}* — `{wallet_addr[:8]}...{wallet_addr[-4:]}`\n"
-        text += f"  💰 SOL: {sol_balance:.4f}\n"
+        # Get trades for this wallet
+        wt = [t for t in trades if t.get('wallet_id') == w['id']]
+        buys = [t for t in wt if t.get('trade_type') == 'buy']
+        sells = [t for t in wt if t.get('trade_type') in ('sell', 'auto-sell')]
         
-        # Get positions for this wallet
-        positions = db.get_user_positions(user_id)
-        wallet_positions = [p for p in positions if p.get('wallet_id') == w['id']]
+        # Calculate PNL
+        pnl = sum(t.get('pnl_sol', 0) or 0 for t in sells)
+        pnl_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
         
-        if wallet_positions:
-            wallet_value = 0
-            for pos in wallet_positions[:5]:
-                if pos['amount'] > 0:
-                    price = await solana_service.get_token_price(pos['token_address'])
-                    val = pos['amount'] * price if price else 0
-                    wallet_value += val
-                    text += f"  🪙 `{pos['token_address'][:8]}...` — {pos['amount']:,.2f} (${val:.2f})\n"
-            text += f"  💎 Tokens: ${wallet_value:.2f}\n"
-        else:
-            text += f"  No active positions\n"
-        
-        # Get trade history for this wallet
-        trades = db.get_user_trade_history(user_id, limit=50)
-        wallet_trades = [t for t in trades if t.get('wallet_id') == w['id']]
-        buys = len([t for t in wallet_trades if t.get('trade_type') == 'buy'])
-        sells = len([t for t in wallet_trades if t.get('trade_type') in ('sell', 'auto-sell')])
-        text += f"  📈 Trades: {buys} buys, {sells} sells\n"
-        
-        total_value += sol_balance
-        text += "\n"
+        text += f"┌─────────────────────────┐\n"
+        text += f"│ 💼 *{w['wallet_name']}* │\n"
+        text += f"│ `{wallet_addr[:8]}...{wallet_addr[-4:]}` │\n"
+        text += f"│ 💰 {sol:.4f} SOL | {len(buys)} trades │\n"
+        text += f"│ PnL: {pnl_emoji} ${pnl:.4f} │\n"
+        text += f"└─────────────────────────┘\n\n"
     
-    text += f"💎 *Total SOL:* ${total_value:.2f}"
+    text += f"💎 *Total SOL:* {total_sol:.4f} | *Trades:* {len(trades)}"
     
-    keyboard = [[InlineKeyboardButton("« Back", callback_data="portfolio")]]
+    keyboard = [
+        [InlineKeyboardButton("🔄 Refresh", callback_data="portfolio_wallets")],
+        [InlineKeyboardButton("« Back", callback_data="portfolio")]
+    ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 # ============================================
@@ -1304,6 +1353,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "portfolio": return await show_portfolio_menu(query)
     elif action == "portfolio_channels": return await show_portfolio_by_channel(query)
     elif action == "portfolio_tokens": return await show_portfolio_by_token(query)
+    elif action == "portfolio_stats": return await show_portfolio_stats(query)
     
     # Settings
     elif action == "set_buy_amount":
