@@ -2581,9 +2581,10 @@ async def execute_withdraw(query):
 def run_monitor_in_thread():
     global monitor_client, channel_subscribers
     
-    # Suppress Telethon event loop warnings
+    ## Suppress Telethon event loop spam
     import logging
-    logging.getLogger('telethon').setLevel(logging.ERROR)
+    logging.getLogger('telethon').setLevel(logging.CRITICAL)
+    logging.getLogger('asyncio').setLevel(logging.CRITICAL)
     
     async def _run():
         global monitor_client, channel_subscribers
