@@ -46,7 +46,8 @@ from telethon.errors import SessionPasswordNeededError
 from database.db import Database
 from services.solana_service import SolanaService
 from services.sniper_service import SniperService
-
+# 4. Fix the import
+from services.wallet_service import derive_wallet  # Only what we need
 load_dotenv()
 
 # ============================================
@@ -601,13 +602,13 @@ def get_main_keyboard():
         [InlineKeyboardButton("📈 Buy Token", callback_data="buy"),
          InlineKeyboardButton("📉 Sell Token", callback_data="sell")],
         [InlineKeyboardButton("📊 Positions", callback_data="positions"),
-         InlineKeyboardButton("🔄 Refresh Pos", callback_data="refresh_positions")],  # New button
+         InlineKeyboardButton("📊 Portfolio", callback_data="portfolio")],  # NEW
         [InlineKeyboardButton("📋 Channels", callback_data="channels"),
          InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-         InlineKeyboardButton("🔑 Export Key", callback_data="export_key")],
-        [InlineKeyboardButton("🔐 TG Auth", callback_data="telegram_auth_setup"),
-         InlineKeyboardButton("⚡ Actions", callback_data="actions")],
+         InlineKeyboardButton("💼 Wallets", callback_data="manage_wallets")],  # NEW
+        [InlineKeyboardButton("🔑 Export Key", callback_data="export_key"),
+         InlineKeyboardButton("🔐 TG Auth", callback_data="telegram_auth_setup")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -647,14 +648,31 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         return
     
     print(f"   🎯 Token detected: {ca[:8]}...")
-    
-    # Initialize per-user sets
-    if user_id not in processing_tokens:
-        processing_tokens[user_id] = set()
-    if user_id not in last_processed_time:
-        last_processed_time[user_id] = {}
-    if user_id not in bought_tokens:
-        bought_tokens[user_id] = set()
+    wallet_id = None
+    channels = db.get_user_channels(user_id)
+    for ch in channels:
+        if ch['channel_name'] == channel_name:
+            wallet_id = ch.get('wallet_id')
+            break
+
+    if not wallet_id:
+        # Use default wallet (W1)
+        wallets = db.get_user_wallets(user_id)
+        if wallets:
+            wallet_id = wallets[0]['id']
+
+    if wallet_id:
+        wallet_keypair = derive_wallet_from_user(user_id, wallet_id)
+        wallet_settings = db.get_wallet(wallet_id)
+        buy_amount = wallet_settings.get('default_buy_amount', DEFAULT_BUY_AMOUNT) if wallet_settings else DEFAULT_BUY_AMOUNT
+        slippage = wallet_settings.get('default_slippage', DEFAULT_SLIPPAGE) if wallet_settings else DEFAULT_SLIPPAGE
+        # Initialize per-user sets
+        if user_id not in processing_tokens:
+            processing_tokens[user_id] = set()
+        if user_id not in last_processed_time:
+            last_processed_time[user_id] = {}
+        if user_id not in bought_tokens:
+            bought_tokens[user_id] = set()
     
     # Deduplication
     if ca in processing_tokens[user_id]:
@@ -907,7 +925,207 @@ async def auto_sell_monitor():
         except Exception as e:
             print(f"Auto-sell error: {e}")
             await asyncio.sleep(30)
+def get_wallet_selection_keyboard(user_id: int):
+    """Keyboard to select a wallet"""
+    wallets = db.get_user_wallets(user_id)
+    keyboard = []
+    for w in wallets:
+        name = w['wallet_name']
+        addr = w.get('public_key', '')[:8] if w.get('public_key') else ''
+        keyboard.append([InlineKeyboardButton(f"💼 {name} ({addr}...)", callback_data=f"select_wallet_{w['id']}")])
+    keyboard.append([InlineKeyboardButton("➕ Create New Wallet", callback_data="create_wallet")])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="back_main")])
+    return InlineKeyboardMarkup(keyboard)
 
+def get_portfolio_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("💼 By Wallet", callback_data="portfolio_wallets")],
+        [InlineKeyboardButton("📋 By Channel", callback_data="portfolio_channels")],
+        [InlineKeyboardButton("🪙 By Token", callback_data="portfolio_tokens")],
+        [InlineKeyboardButton("« Back", callback_data="back_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+# 1. Wallet management UI
+async def show_wallets_menu(query):
+    user_id = query.from_user.id
+    wallets = db.get_user_wallets(user_id)
+    
+    text = "💼 *Your Wallets*\n\n"
+    for w in wallets:
+        addr = w.get('public_key', 'N/A')
+        text += f"*{w['wallet_name']}* — `{addr[:8]}...{addr[-4:]}`\n"
+        text += f"  Buy: {w.get('default_buy_amount', 0.01)} SOL | Slip: {w.get('default_slippage', 1000)/100}%\n\n"
+    
+    keyboard = get_wallet_selection_keyboard(user_id)
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
+    return SELECTING_ACTION
+
+async def handle_wallet_selection(query, wallet_id):
+    user_id = query.from_user.id
+    wallet = db.get_wallet(wallet_id)
+    
+    if not wallet:
+        await query.edit_message_text("❌ Wallet not found!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    addr = wallet.get('public_key', 'N/A')
+    text = f"""
+💼 *{wallet['wallet_name']}*
+
+*Address:* `{addr}`
+*Buy Amount:* {wallet.get('default_buy_amount', 0.01)} SOL
+*Slippage:* {wallet.get('default_slippage', 1000)/100}%
+
+Fund this wallet to start trading!
+"""
+    keyboard = [
+        [InlineKeyboardButton("📋 Copy Address", callback_data="copy_address")],
+        [InlineKeyboardButton("« Back", callback_data="manage_wallets")]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+async def create_new_wallet_flow(query):
+    user_id = query.from_user.id
+    wallets = db.get_user_wallets(user_id)
+    
+    if len(wallets) >= 5:
+        await query.edit_message_text("❌ Max 5 wallets reached!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    next_num = len(wallets) + 1
+    wallet_id = db.create_wallet(user_id, f'W{next_num}', next_num)
+    
+    if wallet_id > 0:
+        wallet = derive_wallet_from_user(user_id, next_num)
+        public_key = str(wallet.pubkey())
+        db.update_wallet_settings(wallet_id, public_key=public_key)
+        
+        await query.edit_message_text(
+            f"✅ *W{next_num} created!*\n\nAddress: `{public_key[:8]}...`\n\nFund this wallet to start trading.",
+            reply_markup=get_main_keyboard(), parse_mode='Markdown'
+        )
+    else:
+        await query.edit_message_text("❌ Failed to create wallet!", reply_markup=get_main_keyboard())
+    
+    return SELECTING_ACTION
+
+# 2. Portfolio views
+async def show_portfolio_by_channel(query):
+    user_id = query.from_user.id
+    channels = db.get_user_channels(user_id)
+    
+    text = "📊 *Portfolio by Channel*\n\n"
+    for ch in channels:
+        text += f"📋 `{ch['channel_name']}`\n  Signals: {ch.get('signal_count', 0)}\n\n"
+    
+    keyboard = [[InlineKeyboardButton("« Back", callback_data="portfolio")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+async def show_portfolio_by_token(query):
+    user_id = query.from_user.id
+    positions = db.get_user_positions(user_id)
+    
+    text = "📊 *Portfolio by Token*\n\n"
+    for pos in positions:
+        if pos['amount'] > 0:
+            addr = pos['token_address']
+            price = await solana_service.get_token_price(addr)
+            val = pos['amount'] * price if price else 0
+            text += f"🪙 `{addr[:8]}...` — {pos['amount']:.2f} (${val:.2f})\n"
+    
+    if not positions:
+        text += "No active positions\n"
+    
+    keyboard = [[InlineKeyboardButton("« Back", callback_data="portfolio")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+# 3. Fix ask_channel_buy_settings (remove or implement)
+async def ask_channel_buy_settings(update, context):
+    # Simplified - just add channel directly
+    user_id = update.effective_user.id
+    channel_name = context.user_data.get('pending_channel', '')
+    wallet_id = context.user_data.get('selected_wallet')
+    
+    db.add_channel(user_id, channel_name, wallet_id=wallet_id)
+    
+    global channel_subscribers
+    if channel_name not in channel_subscribers:
+        channel_subscribers[channel_name] = []
+    if user_id not in channel_subscribers[channel_name]:
+        channel_subscribers[channel_name].append(user_id)
+    asyncio.create_task(poll_channel_messages(channel_name))
+    
+    await update.message.reply_text(
+        f"✅ `{channel_name}` added!\n📡 Monitoring started.",
+        reply_markup=get_main_keyboard(), parse_mode='Markdown'
+    )
+    return SELECTING_ACTION
+
+
+async def add_channel_with_wallet(query):
+    """New flow: Add channel → Select wallet"""
+    user_id = query.from_user.id
+    
+    # Just go directly to channel input - wallet selection happens after
+    await query.edit_message_text(
+        "📋 *Add Channel*\n\nSend channel username (@name):\nType *cancel* to abort.",
+        reply_markup=get_back_keyboard(),
+        parse_mode='Markdown'
+    )
+    return ENTER_CHANNEL_USERNAME
+
+# After channel entered, show wallet selection
+async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    channel_name = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if channel_name.lower() == 'cancel':
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    if not channel_name.startswith('@'):
+        channel_name = '@' + channel_name
+    
+    context.user_data['pending_channel'] = channel_name
+    
+    # Show wallet selection
+    wallets = db.get_user_wallets(user_id)
+    if len(wallets) == 1:
+        # Auto-select W1 if only one wallet
+        context.user_data['selected_wallet'] = wallets[0]['id']
+        return await ask_channel_buy_settings(update, context)
+    
+    text = f"📋 Channel: `{channel_name}`\n\nSelect wallet for this channel:"
+    await update.message.reply_text(
+        text,
+        reply_markup=get_wallet_selection_keyboard(user_id),
+        parse_mode='Markdown'
+    )
+    return SELECTING_ACTION
+async def show_portfolio_menu(query):
+    text = "📊 *Portfolio*\n\nSelect view:"
+    await query.edit_message_text(text, reply_markup=get_portfolio_keyboard(), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+async def show_portfolio_by_wallet(query):
+    user_id = query.from_user.id
+    wallets = db.get_user_wallets(user_id)
+    
+    text = "📊 *Portfolio by Wallet*\n\n"
+    total_value = 0
+    
+    for w in wallets:
+        text += f"💼 *{w['wallet_name']}* — `{w.get('public_key', '')[:8]}...`\n"
+        # Get positions for this wallet (you need to add wallet_id to positions table)
+        # For now, show wallet info
+        text += "\n"
+    
+    keyboard = [[InlineKeyboardButton("« Back", callback_data="portfolio")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
 # ============================================
 # START COMMAND & UI HANDLERS
 # ============================================
@@ -971,6 +1189,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "actions": return await show_actions(query)
     elif action == "refresh_positions":return await refresh_positions(query)
     elif action == "back_main": return await back_to_main(query)
+    elif action == "manage_wallets": return await show_wallets_menu(query)
+    elif action == "portfolio": return await show_portfolio_menu(query)
+    elif action == "portfolio_channels": return await show_portfolio_by_channel(query)
+    elif action == "portfolio_tokens": return await show_portfolio_by_token(query)
     
     # Settings
     elif action == "set_buy_amount":
@@ -1078,7 +1300,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.deactivate_channel(int(action.split("_")[2]))
         await query.edit_message_text("✅ Channel removed!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
-    
+    # In button_handler, add:
+    elif action == "portfolio":
+        return await show_portfolio_menu(query)
+
+    elif action == "portfolio_wallets":
+        return await show_portfolio_by_wallet(query)
+
+    elif action.startswith("select_wallet_"):
+        wallet_id = int(action.replace("select_wallet_", ""))
+        context.user_data['selected_wallet'] = wallet_id
+        return await handle_wallet_selection(query, wallet_id)
+
+    elif action == "create_wallet":
+        return await create_new_wallet_flow(query)
     elif action == "remove_channel": 
         return await remove_channel_menu(query)
     
