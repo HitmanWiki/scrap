@@ -304,7 +304,7 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 async def update_pinned_positions(user_id: int, silent: bool = False):
-    """Update the pinned positions message - edit if exists, send new if not"""
+    """Update the pinned positions message"""
     global pinned_messages
     
     try:
@@ -316,7 +316,11 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
         positions = db.get_user_positions(user_id)
         wallet_addr = str(wallet.pubkey())
         
-        text = "📊 *Portfolio*\n\n"
+        # Add timestamp so text always changes (avoids "message not modified" error)
+        from datetime import datetime
+        now = datetime.now().strftime("%H:%M")
+        
+        text = f"📊 *Portfolio* (updated {now})\n\n"
         total_value = 0
         
         if positions:
@@ -338,15 +342,14 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
         total_value += sol_balance
         
         text += f"\n💰 SOL: {sol_balance:.4f} | 💎 ${total_value:.2f}"
-        text += f"\n🔄 Auto-refreshes every 5 min"
         
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📈 Buy", callback_data="buy"),
              InlineKeyboardButton("📉 Sell", callback_data="sell")],
-            [InlineKeyboardButton("🔄 Refresh Now", callback_data="refresh_positions")]
+            [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_positions")]
         ])
         
-        # Try to EDIT existing message silently
+        # ALWAYS try to edit first
         if user_id in pinned_messages:
             try:
                 await application.bot.edit_message_text(
@@ -356,46 +359,43 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
                     parse_mode='Markdown',
                     reply_markup=keyboard
                 )
-                return  # Successfully edited, done!
+                return  # Success - no new message sent
             except Exception as e:
-                # Edit failed - message might be deleted
-                print(f"   Edit failed, sending new: {e}")
-                try:
-                    await application.bot.unpin_chat_message(
-                        chat_id=user_id,
-                        message_id=pinned_messages[user_id]
-                    )
-                except:
-                    pass
+                err_str = str(e)
+                if "not modified" in err_str.lower():
+                    return  # Same content, skip silently
+                # Other error - remove stale ID
                 del pinned_messages[user_id]
         
-        # Send new message and pin it
-        msg = await application.bot.send_message(
-            chat_id=user_id,
-            text=text,
-            parse_mode='Markdown',
-            reply_markup=keyboard
-        )
-        
-        await application.bot.pin_chat_message(
-            chat_id=user_id,
-            message_id=msg.message_id,
-            disable_notification=True
-        )
-        
-        pinned_messages[user_id] = msg.message_id
+        # Only send new message if edit failed and no existing pin
+        if not silent:  # Only send new message for manual refreshes, not auto
+            msg = await application.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode='Markdown',
+                reply_markup=keyboard
+            )
+            try:
+                await application.bot.pin_chat_message(
+                    chat_id=user_id,
+                    message_id=msg.message_id,
+                    disable_notification=True
+                )
+            except:
+                pass
+            pinned_messages[user_id] = msg.message_id
         
     except Exception as e:
-        print(f"   ⚠️ Pin update error: {e}")
+        print(f"   ⚠️ Pin update: {e}")
 async def auto_refresh_positions():
-    """Refresh pinned positions for all users every 5 minutes - silently"""
+    """Silently refresh pinned positions every 5 minutes"""
     while True:
-        await asyncio.sleep(300)  # 5 minutes
+        await asyncio.sleep(300)
         for user_id in list(pinned_messages.keys()):
             try:
                 await update_pinned_positions(user_id, silent=True)
-            except Exception as e:
-                print(f"   ⚠️ Refresh error: {e}")
+            except:
+                pass
 
 # Add this task in run_monitor_in_thread:
 
@@ -1050,7 +1050,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📋 Send private channel username:\nType *cancel* to abort.",
             reply_markup=get_back_keyboard(), parse_mode='Markdown')
         return ENTER_CHANNEL_USERNAME
-    
+    elif action == "refresh_positions":
+        await update_pinned_positions(user_id, silent=False)  # Can send new if needed
+        await query.answer("✅ Refreshed!")
+        return SELECTING_ACTION
     elif action == "confirm_buy": 
         return await execute_buy_order(query)
     
@@ -2333,7 +2336,7 @@ def main():
         entry_points=[CommandHandler('start', start)],
         states={
             SELECTING_ACTION: [CallbackQueryHandler(button_handler)],
-            ENTER_CHANNEL_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_input)],
+            ENTER_CHANNEL_USERNAME: [CallbackQueryHandler(button_handler),MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_input)],
             ENTER_TOKEN_ADDRESS: [CallbackQueryHandler(button_handler),MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_input)],
             ENTER_BUY_AMOUNT: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
             ENTER_SLIPPAGE: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
