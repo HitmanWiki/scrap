@@ -1657,7 +1657,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💵 *Buy Amount*\nCurrent: *{user.get('default_buy_amount', DEFAULT_BUY_AMOUNT)} SOL*\n\nEnter new amount:",
             reply_markup=get_back_keyboard(), parse_mode='Markdown')
         return ENTER_BUY_AMOUNT
-    
+    elif action.startswith("custom_sell_"):
+        token_address = action.replace("custom_sell_", "")
+        context.user_data['sell_custom_token'] = token_address
+        position = next((p for p in db.get_user_positions(user_id) if p['token_address'] == token_address), None)
+        if position:
+            await query.edit_message_text(
+                f"✏️ *Custom Sell Amount*\n\n"
+                f"Available: {position['amount']:,.2f}\n\n"
+                f"Enter amount to sell:\n"
+                f"(or type *all* to sell everything)",
+                reply_markup=get_back_keyboard(),
+                parse_mode='Markdown'
+            )
+            return ENTER_TOKEN_ADDRESS  # Reuse this state for amount input
+        return SELECTING_ACTION
     elif action == "set_slippage":
         context.user_data['settings_state'] = 'slippage'
         user = db.get_user(user_id)
@@ -2019,7 +2033,49 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     if text.lower() == 'cancel':
         context.user_data.pop('sell_mode', None)
+        context.user_data.pop('sell_custom_token', None)
         await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    # CHECK FOR CUSTOM SELL AMOUNT FIRST
+    custom_sell_token = context.user_data.get('sell_custom_token')
+    if custom_sell_token:
+        context.user_data.pop('sell_custom_token', None)
+        
+        positions = db.get_user_positions(user_id)
+        position = next((p for p in positions if p['token_address'] == custom_sell_token), None)
+        
+        if not position or position['amount'] <= 0:
+            await update.message.reply_text("❌ No tokens to sell!", reply_markup=get_main_keyboard())
+            return SELECTING_ACTION
+        
+        available = position['amount']
+        symbol = await get_token_symbol(custom_sell_token)
+        
+        if text.lower() == 'all':
+            sell_amount = available
+            percentage = 100
+        else:
+            try:
+                sell_amount = float(text)
+                if sell_amount <= 0 or sell_amount > available:
+                    await update.message.reply_text(
+                        f"❌ Invalid! Enter between 0 and {available:,.2f}",
+                        reply_markup=get_back_keyboard()
+                    )
+                    return ENTER_TOKEN_ADDRESS
+                percentage = (sell_amount / available) * 100
+            except:
+                await update.message.reply_text("❌ Invalid amount! Enter a number.", reply_markup=get_back_keyboard())
+                return ENTER_TOKEN_ADDRESS
+        
+        # Confirm the custom amount
+        text = f"📉 *Sell {symbol}*\n\nAmount: {sell_amount:,.2f} ({percentage:.1f}%)\n\nProceed?"
+        keyboard = [
+            [InlineKeyboardButton(f"✅ Confirm {sell_amount:,.0f}", callback_data=f"execute_sell_{custom_sell_token}_{int(percentage)}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="back_main")]
+        ]
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return SELECTING_ACTION
     
     ca = await extract_contract_address(text)
@@ -2027,6 +2083,7 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ No token address found!", reply_markup=get_back_keyboard())
         return ENTER_TOKEN_ADDRESS
     
+    # SELL BY ADDRESS FLOW
     sell_mode = context.user_data.get('sell_mode')
     if sell_mode == 'address':
         context.user_data.pop('sell_mode', None)
@@ -2035,7 +2092,6 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ No wallet!", reply_markup=get_main_keyboard())
             return SELECTING_ACTION
         
-        # Get token balance
         balance = 0
         try:
             mint_pubkey = Pubkey.from_string(ca)
@@ -2050,21 +2106,23 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(f"❌ No tokens found for `{ca[:8]}...`", reply_markup=get_main_keyboard(), parse_mode='Markdown')
             return SELECTING_ACTION
         
+        symbol = await get_token_symbol(ca)
         context.user_data['sell_token'] = ca
         context.user_data['sell_amount'] = balance
         
-        text = f"📉 *Sell Tokens*\n\nToken: `{ca[:8]}...`\nBalance: {balance:.2f}\n\nSelect percentage:"
+        text = f"📉 *Sell {symbol}*\n\nBalance: {balance:,.2f}\n\nSelect percentage:"
         keyboard = [
-            [InlineKeyboardButton("100%", callback_data=f"execute_sell_{ca}_100"),
-             InlineKeyboardButton("50%", callback_data=f"execute_sell_{ca}_50")],
-            [InlineKeyboardButton("25%", callback_data=f"execute_sell_{ca}_25"),
-             InlineKeyboardButton("10%", callback_data=f"execute_sell_{ca}_10")],
+            [InlineKeyboardButton("💰 100%", callback_data=f"execute_sell_{ca}_100"),
+             InlineKeyboardButton("📊 50%", callback_data=f"execute_sell_{ca}_50")],
+            [InlineKeyboardButton("📉 25%", callback_data=f"execute_sell_{ca}_25"),
+             InlineKeyboardButton("📝 10%", callback_data=f"execute_sell_{ca}_10")],
+            [InlineKeyboardButton("✏️ Custom Amount", callback_data=f"custom_sell_{ca}")],
             [InlineKeyboardButton("« Cancel", callback_data="back_main")]
         ]
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return SELECTING_ACTION
     
-    # Regular buy flow
+    # REGULAR BUY FLOW
     user = db.get_user(user_id)
     buy_amount = user.get('default_buy_amount', DEFAULT_BUY_AMOUNT)
     slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
@@ -2265,17 +2323,20 @@ async def confirm_sell_position(query, token_address):
         return SELECTING_ACTION
     
     amount = position['amount']
-    text = f"Sell {token_address[:8]}...\n\nBalance: {amount:.2f}\n\nSelect percentage:"
+    symbol = await get_token_symbol(token_address)
+    
+    text = f"📉 *Sell {symbol}*\n\nBalance: {amount:,.2f}\n\nSelect percentage or enter custom amount:"
     
     keyboard = [
-        [InlineKeyboardButton("100%", callback_data=f"execute_sell_{token_address}_100"),
-         InlineKeyboardButton("50%", callback_data=f"execute_sell_{token_address}_50")],
-        [InlineKeyboardButton("25%", callback_data=f"execute_sell_{token_address}_25"),
-         InlineKeyboardButton("10%", callback_data=f"execute_sell_{token_address}_10")],
+        [InlineKeyboardButton("💰 100%", callback_data=f"execute_sell_{token_address}_100"),
+         InlineKeyboardButton("📊 50%", callback_data=f"execute_sell_{token_address}_50")],
+        [InlineKeyboardButton("📉 25%", callback_data=f"execute_sell_{token_address}_25"),
+         InlineKeyboardButton("📝 10%", callback_data=f"execute_sell_{token_address}_10")],
+        [InlineKeyboardButton("✏️ Custom Amount", callback_data=f"custom_sell_{token_address}")],
         [InlineKeyboardButton("« Cancel", callback_data="sell")]
     ]
     
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 
 async def execute_sell_order(query, token_address, percentage):
