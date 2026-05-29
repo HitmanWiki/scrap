@@ -1352,25 +1352,39 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Invalid format! Use @channelname", reply_markup=get_back_keyboard())
         return ENTER_CHANNEL_USERNAME
     
-    # Store channel name
-    channel_setup_data[user_id] = {'channel_name': channel_name}
-    
-    # Show wallet selection
+    # Get W1 (default wallet)
     wallets = db.get_user_wallets(user_id)
+    wallet_id = wallets[0]['id'] if wallets else None
+    wallet = db.get_wallet(wallet_id) if wallet_id else None
     
-    if len(wallets) == 1:
-        # Auto-select W1
-        channel_setup_data[user_id]['wallet_id'] = wallets[0]['id']
-        return await ask_channel_buy_amount(update, user_id)
+    # Add channel with wallet
+    channel_id = db.add_channel(user_id, channel_name, wallet_id=wallet_id)
     
-    # Multiple wallets - show selection
-    text = f"📋 Channel: `{channel_name}`\n\n💼 *Select Wallet:*"
-    keyboard = []
-    for w in wallets:
-        keyboard.append([InlineKeyboardButton(f"💼 {w['wallet_name']}", callback_data=f"chsetup_wallet_{w['id']}")])
-    keyboard.append([InlineKeyboardButton("« Cancel", callback_data="back_main")])
+    # Start monitoring
+    global channel_subscribers
+    if channel_name not in channel_subscribers:
+        channel_subscribers[channel_name] = []
+    if user_id not in channel_subscribers[channel_name]:
+        channel_subscribers[channel_name].append(user_id)
+    asyncio.create_task(poll_channel_messages(channel_name))
     
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    w_name = wallet['wallet_name'] if wallet else 'W1'
+    buy_amt = wallet.get('default_buy_amount', 0.01) if wallet else 0.01
+    slip = (wallet.get('default_slippage', 1000) if wallet else 1000) / 100
+    
+    text = f"""
+✅ *Channel Added!*
+
+📋 `{channel_name}`
+💼 Wallet: *{w_name}*
+💰 Buy: {buy_amt} SOL
+📊 Slippage: {slip}%
+
+📡 Monitoring started!
+
+⚙️ Use *Settings* to change buy/sell per wallet.
+"""
+    await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     return SELECTING_ACTION
 async def show_portfolio_menu(query):
     text = """
