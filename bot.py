@@ -767,7 +767,12 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
         # Save position
         if tokens_bought > 0:
             db.add_position(user_id, ca, tokens_bought, result.get('price', 0), txid)
-            db.add_trade_history(user_id, ca, 'buy', tokens_bought, result.get('price', 0), txid)
+            db.add_trade_history(
+    user_id, ca, 'buy', tokens_bought, result.get('price', 0), txid,
+    wallet_id=wallet_id,
+    channel_name=channel_name,
+    entry_price=result.get('price', 0)  # Save entry price
+)
             print(f"   ✅ Position saved: {tokens_bought:.6f} tokens")
         else:
             db.add_position(user_id, ca, 0, result.get('price', 0), txid)
@@ -1041,26 +1046,27 @@ async def create_new_wallet_flow(query):
 async def show_portfolio_by_channel(query):
     user_id = query.from_user.id
     channels = db.get_user_channels(user_id)
-    trades = db.get_user_trade_history(user_id, limit=200)
+    trades = db.get_user_trade_history(user_id, limit=500)
     
     text = "╔═══════════════════════════╗\n║    📋 CHANNEL ANALYTICS  ║\n╚═══════════════════════════╝\n\n"
     
-    if channels:
-        for ch in channels:
-            ch_trades = [t for t in trades if t.get('channel_name') == ch['channel_name']]
-            buys = len([t for t in ch_trades if t.get('trade_type') == 'buy'])
-            sells = len([t for t in ch_trades if t.get('trade_type') in ('sell', 'auto-sell')])
-            pnl = sum(t.get('pnl_sol', 0) or 0 for t in ch_trades if t.get('trade_type') in ('sell', 'auto-sell'))
-            
-            emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
-            win_rate = f"{(sells/(buys or 1))*100:.0f}%" if buys > 0 else "N/A"
-            
-            text += f"📡 `{ch['channel_name']}`\n"
-            text += f"   📈 {buys} buys | 📉 {sells} sells\n"
-            text += f"   🎯 Win Rate: {win_rate}\n"
-            text += f"   💰 PnL: {emoji} ${pnl:.4f}\n\n"
+    for ch in channels:
+        ch_name = ch['channel_name']
+        ch_trades = [t for t in trades if t.get('channel_name') == ch_name]
+        
+        buys = len([t for t in ch_trades if t.get('trade_type') == 'buy'])
+        sells = len([t for t in ch_trades if t.get('trade_type') in ('sell', 'auto-sell')])
+        pnl = sum(t.get('pnl_sol', 0) or 0 for t in ch_trades if t.get('trade_type') in ('sell', 'auto-sell'))
+        
+        emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+        win_rate = f"{(sum(1 for t in ch_trades if t.get('trade_type') in ('sell','auto-sell') and (t.get('pnl_sol',0) or 0) > 0)/(sells or 1))*100:.0f}%" if sells > 0 else "N/A"
+        
+        text += f"📡 `{ch_name}`\n"
+        text += f"   📈 {buys} buys | 📉 {sells} sells\n"
+        text += f"   🎯 Win Rate: {win_rate}\n"
+        text += f"   💰 PnL: {emoji} ${pnl:.4f}\n\n"
     
-    # Manual trades
+    # Manual trades (no channel)
     manual = [t for t in trades if not t.get('channel_name')]
     if manual:
         text += f"📝 *Manual Trades:* {len(manual)}\n\n"
@@ -1245,11 +1251,10 @@ Select view:
 async def show_portfolio_by_wallet(query):
     user_id = query.from_user.id
     wallets = db.get_user_wallets(user_id)
-    trades = db.get_user_trade_history(user_id, limit=200)
+    trades = db.get_user_trade_history(user_id, limit=500)
     
     text = "╔═══════════════════════════╗\n║     💼 WALLET SUMMARY    ║\n╚═══════════════════════════╝\n\n"
     total_sol = 0
-    total_tokens = 0
     
     for w in wallets:
         wallet_num = w.get('wallet_number', 1)
@@ -1262,19 +1267,22 @@ async def show_portfolio_by_wallet(query):
             sol = 0
         total_sol += sol
         
-        # Get trades for this wallet
-        wt = [t for t in trades if t.get('wallet_id') == w['id']]
-        buys = [t for t in wt if t.get('trade_type') == 'buy']
-        sells = [t for t in wt if t.get('trade_type') in ('sell', 'auto-sell')]
+        # Count ALL trades (including those without wallet_id for backward compatibility)
+        # If wallet_id is NULL and wallet_number=1, count them as W1
+        if wallet_num == 1:
+            wt = [t for t in trades if t.get('wallet_id') == w['id'] or t.get('wallet_id') is None]
+        else:
+            wt = [t for t in trades if t.get('wallet_id') == w['id']]
         
-        # Calculate PNL
+        buys = len([t for t in wt if t.get('trade_type') == 'buy'])
+        sells = len([t for t in wt if t.get('trade_type') in ('sell', 'auto-sell')])
         pnl = sum(t.get('pnl_sol', 0) or 0 for t in sells)
         pnl_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
         
         text += f"┌─────────────────────────┐\n"
         text += f"│ 💼 *{w['wallet_name']}* │\n"
         text += f"│ `{wallet_addr[:8]}...{wallet_addr[-4:]}` │\n"
-        text += f"│ 💰 {sol:.4f} SOL | {len(buys)} trades │\n"
+        text += f"│ 💰 {sol:.4f} SOL | {len(wt)} trades │\n"
         text += f"│ PnL: {pnl_emoji} ${pnl:.4f} │\n"
         text += f"└─────────────────────────┘\n\n"
     
