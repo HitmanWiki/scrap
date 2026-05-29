@@ -1046,7 +1046,12 @@ async def create_new_wallet_flow(query):
 async def show_portfolio_by_channel(query):
     user_id = query.from_user.id
     channels = db.get_user_channels(user_id)
-    trades = db.get_user_trade_history(user_id, limit=500)
+    try:
+        trades = db.get_user_trade_history(user_id, limit=500) or []
+        if not isinstance(trades, list):
+            trades = []
+    except:
+        trades = []
     
     text = "╔═══════════════════════════╗\n║    📋 CHANNEL ANALYTICS  ║\n╚═══════════════════════════╝\n\n"
     
@@ -1128,7 +1133,12 @@ async def show_portfolio_by_token(query):
     return SELECTING_ACTION
 async def show_portfolio_stats(query):
     user_id = query.from_user.id
-    trades = db.get_user_trade_history(user_id, limit=500)
+    try:
+        trades = db.get_user_trade_history(user_id, limit=500) or []
+        if not isinstance(trades, list):
+            trades = []
+    except:
+        trades = []
     wallets = db.get_user_wallets(user_id)
     
     total_buys = len([t for t in trades if t.get('trade_type') == 'buy'])
@@ -1251,7 +1261,12 @@ Select view:
 async def show_portfolio_by_wallet(query):
     user_id = query.from_user.id
     wallets = db.get_user_wallets(user_id)
-    trades = db.get_user_trade_history(user_id, limit=500)
+    try:
+        trades = db.get_user_trade_history(user_id, limit=500) or []
+        if not isinstance(trades, list):
+            trades = []
+    except:
+        trades = []
     
     text = "╔═══════════════════════════╗\n║     💼 WALLET SUMMARY    ║\n╚═══════════════════════════╝\n\n"
     total_sol = 0

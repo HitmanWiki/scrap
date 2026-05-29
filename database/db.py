@@ -824,13 +824,16 @@ class Database:
             with self.lock:
                 conn = self.get_connection()
                 cursor = self.get_cursor(conn)
-                cursor.execute(f'SELECT * FROM trade_history WHERE user_id = {self.placeholder()} ORDER BY created_at DESC LIMIT {limit}', (user_id,))
+                ph = self.placeholder()
+                cursor.execute(f'SELECT * FROM trade_history WHERE user_id = {ph} ORDER BY created_at DESC LIMIT {limit}', (user_id,))
                 rows = cursor.fetchall()
                 conn.close()
-                return [dict(row) for row in rows]
-        except:
-            return []
-    
+                result = [dict(row) for row in rows] if rows else []
+                return result
+        except Exception as e:
+            print(f"❌ Error getting trade history: {e}")
+            return []  # Always return empty list on error
+        
     # ============================================
     # SNIPE LOGS
     # ============================================
