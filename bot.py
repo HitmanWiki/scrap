@@ -948,21 +948,34 @@ def get_portfolio_keyboard():
 # 1. Wallet management UI
 async def show_wallets_menu(query):
     user_id = query.from_user.id
-    wallets = db.get_user_wallets(user_id)
     
-    # If no wallets, create W1 automatically
+    try:
+        wallets = db.get_user_wallets(user_id)
+    except:
+        wallets = []
+    
+    # If None or empty, create W1
     if not wallets:
-        wallet_id = db.create_wallet(user_id, 'W1', 1)
-        if wallet_id > 0:
-            wallet = derive_wallet_from_user(user_id)
-            public_key = str(wallet.pubkey())
-            db.update_wallet_settings(wallet_id, public_key=public_key)
-            wallets = db.get_user_wallets(user_id)
+        try:
+            wallet_id = db.create_wallet(user_id, 'W1', 1)
+            if wallet_id > 0:
+                wallet = derive_wallet_from_user(user_id)
+                public_key = str(wallet.pubkey())
+                db.update_wallet_settings(wallet_id, public_key=public_key)
+                wallets = db.get_user_wallets(user_id) or []
+        except Exception as e:
+            print(f"Wallet creation error: {e}")
+            await query.edit_message_text("❌ Error creating wallet. Please try again.", reply_markup=get_main_keyboard())
+            return SELECTING_ACTION
+    
+    if not wallets:
+        await query.edit_message_text("❌ No wallets found. Please /start again.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
     
     text = "💼 *Your Wallets*\n\n"
     for w in wallets:
-        addr = w.get('public_key', 'N/A')
-        text += f"*{w['wallet_name']}* — `{addr[:8]}...{addr[-4:]}`\n\n"
+        addr = w.get('public_key', 'N/A') if w.get('public_key') else 'N/A'
+        text += f"*{w.get('wallet_name', 'W1')}* — `{str(addr)[:8]}...`\n\n"
     
     keyboard = get_wallet_selection_keyboard(user_id)
     await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
