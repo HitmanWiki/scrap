@@ -102,11 +102,16 @@ last_position_update: Dict[int, float] = {}  # user_id -> timestamp
 # WALLET DERIVATION (No private key storage!)
 # ============================================
 def derive_wallet_from_user(user_id: int, wallet_number: int = 1) -> Keypair:
-    """Derive deterministic wallet from user ID + wallet number + secret"""
+    """Derive deterministic wallet"""
     secret = os.getenv('WALLET_DERIVATION_SECRET', 'default-secret-change-me')
-    if secret == 'default-secret-change-me':
-        print("⚠️ WARNING: Using default derivation secret!")
-    seed_material = f"user_{user_id}_wallet_{wallet_number}_{secret}"
+    
+    if wallet_number == 1:
+        # W1 uses ORIGINAL derivation (backward compatible)
+        seed_material = f"user_{user_id}_sniper_bot_v6_{secret}"
+    else:
+        # W2, W3... use new derivation
+        seed_material = f"user_{user_id}_wallet_{wallet_number}_{secret}"
+    
     seed_hash = hashlib.sha256(seed_material.encode()).digest()
     return Keypair.from_seed(seed_hash[:32])
 
@@ -956,7 +961,6 @@ def get_portfolio_keyboard():
 # 1. Wallet management UI
 async def show_wallets_menu(query):
     user_id = query.from_user.id
-    
     wallets = db.get_user_wallets(user_id) or []
     
     if not wallets:
@@ -965,15 +969,18 @@ async def show_wallets_menu(query):
     
     text = "💼 *Your Wallets*\n\n"
     for w in wallets:
-        addr = w.get('public_key')
+        # Re-derive the correct public key and update if needed
+        correct_wallet = derive_wallet_from_user(user_id, w.get('wallet_number', 1))
+        correct_addr = str(correct_wallet.pubkey())
         
-        # If public_key is missing, derive and save it
-        if not addr or addr == 'N/A':
-            wallet = derive_wallet_from_user(user_id, w.get('wallet_number', 1))
-            addr = str(wallet.pubkey())
-            db.update_wallet_settings(w['id'], public_key=addr)
+        current_addr = w.get('public_key', '')
         
-        text += f"*{w.get('wallet_name', 'W1')}* — `{str(addr)[:8]}...{str(addr)[-4:]}`\n\n"
+        # If address is wrong or missing, update it
+        if not current_addr or current_addr != correct_addr:
+            db.update_wallet_settings(w['id'], public_key=correct_addr)
+            current_addr = correct_addr
+        
+        text += f"*{w.get('wallet_name', 'W1')}* — `{current_addr[:8]}...{current_addr[-4:]}`\n\n"
     
     keyboard = get_wallet_selection_keyboard(user_id)
     await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
