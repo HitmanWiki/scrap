@@ -1261,14 +1261,13 @@ async def show_portfolio_by_wallet(query):
     user_id = query.from_user.id
     wallets = db.get_user_wallets(user_id) or []
     
-    # SAFE trades fetch
-    trades = []
+    # Get trades safely
     try:
         result = db.get_user_trade_history(user_id, limit=500)
-        if result and isinstance(result, list):
-            trades = result
+        trades = result if isinstance(result, list) else []
     except:
-        pass
+        trades = []
+    
     text = "╔═══════════════════════════╗\n║     💼 WALLET SUMMARY    ║\n╚═══════════════════════════╝\n\n"
     total_sol = 0
     
@@ -1283,10 +1282,9 @@ async def show_portfolio_by_wallet(query):
             sol = 0
         total_sol += sol
         
-        # Count ALL trades (including those without wallet_id for backward compatibility)
-        # If wallet_id is NULL and wallet_number=1, count them as W1
+        # W1 gets all NULL wallet_id trades (backward compatibility)
         if wallet_num == 1:
-            wt = [t for t in trades if t.get('wallet_id') == w['id'] or t.get('wallet_id') is None]
+            wt = [t for t in trades if not t.get('wallet_id') or t.get('wallet_id') == w['id']]
         else:
             wt = [t for t in trades if t.get('wallet_id') == w['id']]
         
