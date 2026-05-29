@@ -312,12 +312,10 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
         if not wallet:
             return
         
-        # Sync positions
         await sync_positions_from_wallet(user_id)
         positions = db.get_user_positions(user_id)
         wallet_addr = str(wallet.pubkey())
         
-        # Build positions text
         text = "📊 *Portfolio*\n\n"
         total_value = 0
         
@@ -329,7 +327,6 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
                     price = await solana_service.get_token_price(addr)
                     val = amt * price if price else 0
                     total_value += val
-                    
                     text += f"• `{addr[:6]}...{addr[-4:]}` — *{amt:,.2f}*"
                     if val > 0:
                         text += f" (${val:.2f})"
@@ -349,8 +346,8 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
             [InlineKeyboardButton("🔄 Refresh Now", callback_data="refresh_positions")]
         ])
         
+        # Try to EDIT existing message silently
         if user_id in pinned_messages:
-            # Try to EDIT existing message (silent update)
             try:
                 await application.bot.edit_message_text(
                     chat_id=user_id,
@@ -359,10 +356,10 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
                     parse_mode='Markdown',
                     reply_markup=keyboard
                 )
-                # If editing works, we're done - no new message needed
-                return
-            except:
-                # If edit fails (message deleted), unpin old and send new
+                return  # Successfully edited, done!
+            except Exception as e:
+                # Edit failed - message might be deleted
+                print(f"   Edit failed, sending new: {e}")
                 try:
                     await application.bot.unpin_chat_message(
                         chat_id=user_id,
@@ -370,6 +367,7 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
                     )
                 except:
                     pass
+                del pinned_messages[user_id]
         
         # Send new message and pin it
         msg = await application.bot.send_message(
@@ -2336,7 +2334,7 @@ def main():
         states={
             SELECTING_ACTION: [CallbackQueryHandler(button_handler)],
             ENTER_CHANNEL_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_input)],
-            ENTER_TOKEN_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_input)],
+            ENTER_TOKEN_ADDRESS: [CallbackQueryHandler(button_handler),MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_input)],
             ENTER_BUY_AMOUNT: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
             ENTER_SLIPPAGE: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
             ENTER_PROFIT_PERCENT: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
