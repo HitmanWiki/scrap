@@ -2283,35 +2283,25 @@ async def execute_sell_order(query, token_address, percentage):
     user = db.get_user(user_id)
     wallet = await get_user_wallet(user_id)
     
-    # Get ACTUAL balance from chain first
-    actual_balance = 0
-    try:
-        mint_pubkey = Pubkey.from_string(token_address)
-        ata = get_associated_token_address(wallet.pubkey(), mint_pubkey)
-        actual_balance = sniper_service.client.get_token_balance(str(ata))
-        print(f"   📊 Actual balance: {actual_balance:.6f}")
-    except Exception as e:
-        print(f"   ⚠️ Balance check error: {e}")
+    # Get ACTUAL balance from DB (trust it - we update it correctly)
+    positions = db.get_user_positions(user_id)
+    position = next((p for p in positions if p['token_address'] == token_address), None)
     
-    # Fallback to DB position amount
-    if actual_balance <= 0:
-        positions = db.get_user_positions(user_id)
-        position = next((p for p in positions if p['token_address'] == token_address), None)
-        if position and position['amount'] > 0:
-            actual_balance = position['amount']
-            print(f"   📊 Using DB balance: {actual_balance:.6f}")
-        else:
-            await query.edit_message_text(
-                "❌ *No tokens to sell!*\n\nCheck on Solscan if you have this token.",
-                reply_markup=get_main_keyboard(),
-                parse_mode='Markdown'
-            )
-            return SELECTING_ACTION
+    actual_balance = 0
+    if position and position['amount'] > 0:
+        actual_balance = position['amount']
+        print(f"   📊 Using DB balance: {actual_balance:.6f}")
+    else:
+        await query.edit_message_text(
+            "❌ *No tokens to sell!*\n\nCheck on Solscan if you have this token.",
+            reply_markup=get_main_keyboard(),
+            parse_mode='Markdown'
+        )
+        return SELECTING_ACTION
     
     sell_amount = actual_balance * (percentage / 100)
     slippage = user.get('default_slippage', DEFAULT_SLIPPAGE)
     
-    # Get token price for display
     token_price = await solana_service.get_token_price(token_address)
     estimated_value = sell_amount * token_price if token_price else 0
     
@@ -2346,49 +2336,23 @@ async def execute_sell_order(query, token_address, percentage):
                         err = meta.get('err')
                         
                         if err is None:
-                            # SUCCESS - no error
                             tx_verified = True
                             print(f"   ✅ Sell verified on-chain (attempt {attempt+1})")
-                            
-                            # Get actual SOL received
-                            account_keys = tx_check['result'].get('transaction', {}).get('message', {}).get('accountKeys', [])
-                            pre_balances = meta.get('preBalances', []) or []
-                            post_balances = meta.get('postBalances', []) or []
-                            
-                            wallet_index = None
-                            for i, key in enumerate(account_keys):
-                                if key == str(wallet.pubkey()):
-                                    wallet_index = i
-                                    break
-                            
-                            if wallet_index is not None and wallet_index < len(pre_balances) and wallet_index < len(post_balances):
-                                sol_change = (post_balances[wallet_index] - pre_balances[wallet_index]) / 1e9
-                                if sol_change > 0:
-                                    sol_received = sol_change
-                                    print(f"   💰 SOL received: {sol_received:.6f}")
                             break
                         else:
-                            # FAILED - has error
                             print(f"   ❌ Sell failed on-chain: {err}")
                             tx_verified = False
                             break
                     else:
-                        print(f"   ⏳ Attempt {attempt+1}: TX not indexed yet...")
                         await asyncio.sleep(5)
-                        
-                except Exception as e:
-                    print(f"   ⚠️ Attempt {attempt+1}: {e}")
+                except:
                     await asyncio.sleep(3)
-                    
-        except Exception as e:
-            print(f"   ⚠️ Verification error: {e}")
-            tx_verified = False
+        except:
+            pass
         
         if tx_verified:
-            # Update position in DB
+            # UPDATE POSITION DIRECTLY - no sync needed
             remaining = actual_balance - sell_amount
-            positions = db.get_user_positions(user_id)
-            position = next((p for p in positions if p['token_address'] == token_address), None)
             
             if position:
                 if remaining > 0.000001:
@@ -2398,10 +2362,7 @@ async def execute_sell_order(query, token_address, percentage):
                     db.close_position(position['id'], txid)
                     print(f"   🗑️ Position closed - fully sold")
             
-            # Record trade
             db.add_trade_history(user_id, token_address, 'sell', sell_amount, sol_received, txid)
-            
-            # Send notification
             await send_sell_notification(user_id, token_address, sell_amount, sol_received, txid)
             
             text = f"""
@@ -2413,7 +2374,6 @@ async def execute_sell_order(query, token_address, percentage):
 🔗 [View on Solscan]({result['explorer']})
 """
         else:
-            # Transaction FAILED on-chain - DON'T update positions
             text = f"""
 ❌ *Sell Failed On-Chain*
 
@@ -2423,9 +2383,7 @@ Your tokens are still safe in your wallet.
 *TX:* `{txid[:20]}...`
 🔗 [View on Solscan]({result['explorer']})
 
-💡 Try:
-• Smaller amount (25% or 50%)
-• Higher slippage in Settings
+💡 Try smaller amount (25% or 50%)
 """
         await update_pinned_positions(user_id)
         await query.edit_message_text(
@@ -2434,25 +2392,9 @@ Your tokens are still safe in your wallet.
             parse_mode='Markdown',
             disable_web_page_preview=True
         )
-    
     else:
-        error_msg = result.get('error', 'Unknown error')
-        text = f"""
-❌ *Sell Failed*
-
-*Error:* {error_msg[:200]}
-
-💡 *Try:*
-• Smaller amount (25% or 50%)
-• Higher slippage in Settings
-• Check liquidity on [Jupiter](https://jup.ag)
-"""
-        await query.edit_message_text(
-            text,
-            reply_markup=get_main_keyboard(),
-            parse_mode='Markdown',
-            disable_web_page_preview=True
-        )
+        text = f"❌ *Sell Failed*\n\n{result.get('error', 'Unknown')[:200]}"
+        await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     
     return SELECTING_ACTION
 
@@ -2492,6 +2434,7 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode=None):
                 parse_mode=parse_mode
             )
 
+
 async def show_positions(query):
     user_id = query.from_user.id
     wallet = await get_user_wallet(user_id)
@@ -2500,14 +2443,9 @@ async def show_positions(query):
         await query.edit_message_text("❌ No wallet!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    await query.edit_message_text("⏳ *Syncing with wallet...*", parse_mode='Markdown')
-    
-    # Sync positions from wallet first
-    wallet_tokens = await sync_positions_from_wallet(user_id)
-    
     wallet_addr = str(wallet.pubkey())
     
-    # Get ALL positions with amount > 0 (ignore is_active flag)
+    # READ DIRECTLY FROM DB - no sync that overwrites correct amounts
     all_positions = db.get_user_positions(user_id)
     positions = [p for p in all_positions if p['amount'] > 0]
     
@@ -2516,7 +2454,6 @@ async def show_positions(query):
     found_any = False
     
     if positions:
-        # Get unique tokens (latest position for each mint)
         seen_mints = set()
         unique_positions = []
         for pos in reversed(positions):
@@ -2529,24 +2466,18 @@ async def show_positions(query):
             amount = pos['amount']
             
             found_any = True
-            
-            # Get token symbol
             symbol = await get_token_symbol(token_addr)
-            
-            # Get current price and MC
             price = await solana_service.get_token_price(token_addr)
             mc = await get_token_market_cap(token_addr)
             value = amount * price if price else 0
             total_value += value
             
-            # P&L if we have entry price
             pnl_text = ""
             if pos.get('entry_price') and pos['entry_price'] > 0 and price:
                 pnl_pct = ((price - pos['entry_price']) / pos['entry_price']) * 100
                 emoji = "🟢" if pnl_pct >= 0 else "🔴"
                 pnl_text = f" {emoji}{pnl_pct:+.1f}%"
             
-            # Display token name (symbol) with address below
             text += f"🔹 *{symbol}*\n"
             text += f"   `{token_addr[:8]}...{token_addr[-4:]}`\n"
             text += f"   Amount: *{amount:,.2f}*"
@@ -2564,9 +2495,7 @@ async def show_positions(query):
     if not found_any:
         text += "😔 *No tokens with balance*\n\n"
         text += "Buy tokens to see them here!\n"
-        text += "Already bought? Wait for transaction confirmation.\n\n"
     
-    # SOL balance
     sol_balance = await solana_service.get_balance(wallet_addr)
     total_value += sol_balance
     text += f"💰 *SOL:* {sol_balance:.4f} SOL\n"
