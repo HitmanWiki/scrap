@@ -1289,7 +1289,11 @@ Status: {status}
 # BUY/SELL HANDLERS
 # ============================================
 async def initiate_buy(query):
-    await query.edit_message_text("📈 *Buy Token*\n\nSend token address or DexScreener URL:\nType *cancel* to abort.", reply_markup=get_back_keyboard(), parse_mode='Markdown')
+    await query.edit_message_text(
+        "📈 *Buy Token*\n\nSend token address or DexScreener URL:\nType *cancel* to abort.",
+        reply_markup=get_back_keyboard(),  # This has « Back button with callback_data="back_main"
+        parse_mode='Markdown'
+    )
     return ENTER_TOKEN_ADDRESS
 
 async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
