@@ -1906,28 +1906,7 @@ async def refresh_positions(query):
     
     return SELECTING_ACTION
 
-async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    channel_name = update.message.text.strip()
-    user_id = update.effective_user.id
-    channel_type = context.user_data.get('channel_type', 'public')
-    if channel_name.lower() == 'cancel':
-        await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
-    if not channel_name.startswith('@'):
-        channel_name = '@' + channel_name
-    is_private = (channel_type == 'private')
-    db.add_channel(user_id, channel_name, is_private=is_private)
-    
-    # Start monitoring
-    global channel_subscribers
-    if channel_name not in channel_subscribers:
-        channel_subscribers[channel_name] = []
-    if user_id not in channel_subscribers[channel_name]:
-        channel_subscribers[channel_name].append(user_id)
-    asyncio.create_task(poll_channel_messages(channel_name))
-    
-    await update.message.reply_text(f"✅ `{channel_name}` added!\n📡 Monitoring started.", reply_markup=get_main_keyboard(), parse_mode='Markdown')
-    return SELECTING_ACTION
+
 
 # ============================================
 # TELEGRAM AUTH
