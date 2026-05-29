@@ -3213,8 +3213,9 @@ def start_health_server():
     server = HTTPServer(('0.0.0.0', port), HealthHandler)
     print(f"🏥 Health server on port {port}")
     server.serve_forever()
-async def start_auth_process(query):
+async def start_auth_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start Telegram auth setup"""
+    query = update.callback_query
     await query.edit_message_text(
         "🔐 *Step 1/3*\n\nEnter your *API ID* (from my.telegram.org):\n\nType *cancel* to abort.",
         reply_markup=get_back_keyboard(),
