@@ -303,8 +303,8 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
             
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
-async def update_pinned_positions(user_id: int):
-    """Pin the positions message to the TOP of the chat"""
+async def update_pinned_positions(user_id: int, silent: bool = False):
+    """Update the pinned positions message - edit if exists, send new if not"""
     global pinned_messages
     
     try:
@@ -349,17 +349,29 @@ async def update_pinned_positions(user_id: int):
             [InlineKeyboardButton("🔄 Refresh Now", callback_data="refresh_positions")]
         ])
         
-        # Unpin old message if exists
         if user_id in pinned_messages:
+            # Try to EDIT existing message (silent update)
             try:
-                await application.bot.unpin_chat_message(
+                await application.bot.edit_message_text(
                     chat_id=user_id,
-                    message_id=pinned_messages[user_id]
+                    message_id=pinned_messages[user_id],
+                    text=text,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
                 )
+                # If editing works, we're done - no new message needed
+                return
             except:
-                pass
+                # If edit fails (message deleted), unpin old and send new
+                try:
+                    await application.bot.unpin_chat_message(
+                        chat_id=user_id,
+                        message_id=pinned_messages[user_id]
+                    )
+                except:
+                    pass
         
-        # Send new message
+        # Send new message and pin it
         msg = await application.bot.send_message(
             chat_id=user_id,
             text=text,
@@ -367,7 +379,6 @@ async def update_pinned_positions(user_id: int):
             reply_markup=keyboard
         )
         
-        # PIN it to the top
         await application.bot.pin_chat_message(
             chat_id=user_id,
             message_id=msg.message_id,
@@ -379,16 +390,14 @@ async def update_pinned_positions(user_id: int):
     except Exception as e:
         print(f"   ⚠️ Pin update error: {e}")
 async def auto_refresh_positions():
-    """Refresh pinned positions for all users every 5 minutes"""
+    """Refresh pinned positions for all users every 5 minutes - silently"""
     while True:
         await asyncio.sleep(300)  # 5 minutes
-        
         for user_id in list(pinned_messages.keys()):
             try:
-                await update_pinned_positions(user_id)
-                print(f"   🔄 Refreshed positions for user {user_id}")
+                await update_pinned_positions(user_id, silent=True)
             except Exception as e:
-                print(f"   ⚠️ Refresh error for user {user_id}: {e}")
+                print(f"   ⚠️ Refresh error: {e}")
 
 # Add this task in run_monitor_in_thread:
 
