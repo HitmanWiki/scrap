@@ -94,6 +94,9 @@ DEDUPE_TTL_MS = 5000
 # Pending transfers storage
 pending_transfers: Dict[int, dict] = {}
 
+# At the top with other globals
+pinned_messages: Dict[int, int] = {}  # user_id -> message_id
+last_position_update: Dict[int, float] = {}  # user_id -> timestamp
 # ============================================
 # WALLET DERIVATION (No private key storage!)
 # ============================================
@@ -300,6 +303,95 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
             
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
+async def update_pinned_positions(user_id: int):
+    """Pin the positions message to the TOP of the chat"""
+    global pinned_messages
+    
+    try:
+        wallet = await get_user_wallet(user_id)
+        if not wallet:
+            return
+        
+        # Sync positions
+        await sync_positions_from_wallet(user_id)
+        positions = db.get_user_positions(user_id)
+        wallet_addr = str(wallet.pubkey())
+        
+        # Build positions text
+        text = "📊 *Portfolio*\n\n"
+        total_value = 0
+        
+        if positions:
+            for pos in positions[:10]:
+                if pos['amount'] > 0:
+                    addr = pos['token_address']
+                    amt = pos['amount']
+                    price = await solana_service.get_token_price(addr)
+                    val = amt * price if price else 0
+                    total_value += val
+                    
+                    text += f"• `{addr[:6]}...{addr[-4:]}` — *{amt:,.2f}*"
+                    if val > 0:
+                        text += f" (${val:.2f})"
+                    text += "\n"
+        else:
+            text += "No active positions\n"
+        
+        sol_balance = await solana_service.get_balance(wallet_addr)
+        total_value += sol_balance
+        
+        text += f"\n💰 SOL: {sol_balance:.4f} | 💎 ${total_value:.2f}"
+        text += f"\n🔄 Auto-refreshes every 5 min"
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📈 Buy", callback_data="buy"),
+             InlineKeyboardButton("📉 Sell", callback_data="sell")],
+            [InlineKeyboardButton("🔄 Refresh Now", callback_data="refresh_positions")]
+        ])
+        
+        # Unpin old message if exists
+        if user_id in pinned_messages:
+            try:
+                await application.bot.unpin_chat_message(
+                    chat_id=user_id,
+                    message_id=pinned_messages[user_id]
+                )
+            except:
+                pass
+        
+        # Send new message
+        msg = await application.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode='Markdown',
+            reply_markup=keyboard
+        )
+        
+        # PIN it to the top
+        await application.bot.pin_chat_message(
+            chat_id=user_id,
+            message_id=msg.message_id,
+            disable_notification=True
+        )
+        
+        pinned_messages[user_id] = msg.message_id
+        
+    except Exception as e:
+        print(f"   ⚠️ Pin update error: {e}")
+async def auto_refresh_positions():
+    """Refresh pinned positions for all users every 5 minutes"""
+    while True:
+        await asyncio.sleep(300)  # 5 minutes
+        
+        for user_id in list(pinned_messages.keys()):
+            try:
+                await update_pinned_positions(user_id)
+                print(f"   🔄 Refreshed positions for user {user_id}")
+            except Exception as e:
+                print(f"   ⚠️ Refresh error for user {user_id}: {e}")
+
+# Add this task in run_monitor_in_thread:
+asyncio.create_task(auto_refresh_positions())
 async def sync_positions_from_wallet(user_id: int):
     """Sync positions - safely check token balances"""
     wallet = await get_user_wallet(user_id)
@@ -672,7 +764,7 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
                 parse_mode='Markdown',
                 disable_web_page_preview=True
             )
-            
+            await update_pinned_positions(user_id)
             # Pin positions
             positions = db.get_user_positions(user_id)
             if positions:
@@ -847,6 +939,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 👇 *Select an option:*
 """
+    await update_pinned_positions(user.id)
     await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     return SELECTING_ACTION
 
@@ -1603,7 +1696,7 @@ Your tokens are still safe in your wallet.
 • Smaller amount (25% or 50%)
 • Higher slippage in Settings
 """
-        
+        await update_pinned_positions(user_id)
         await query.edit_message_text(
             text,
             reply_markup=get_main_keyboard(),
