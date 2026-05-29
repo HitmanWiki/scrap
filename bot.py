@@ -78,6 +78,7 @@ ENTER_CHANNEL_SLIPPAGE = 14
 ENTER_CHANNEL_TAKE_PROFIT = 15
 ENTER_CHANNEL_TARGET_MC = 16
 ENTER_CHANNEL_AUTO_SELL = 17
+ENTER_OTP = 18  # Add to conversation states at top
 # Initialize services
 db = Database()
 solana_service = SolanaService(SOLANA_RPC)
@@ -850,20 +851,25 @@ async def process_channel_message(user_id: int, message_text: str, channel_name:
             )
         except Exception:
             pass
-async def poll_channel_messages(channel_name: str):
-    """Poll a channel for new messages"""
+async def poll_channel_messages(channel_name: str, user_client=None):
+    """Poll a channel for new messages - works with both public and private"""
     global monitor_client, channel_subscribers
     
-    if not monitor_client:
-        print(f"   ⚠️ No monitor client for {channel_name}")
+    # Use user's client for private, monitor client for public
+    client = user_client if user_client else monitor_client
+    
+    if not client:
+        print(f"   ⚠️ No client for {channel_name}")
         return
     
+    ctype = "🔒 Private" if user_client else "🌐 Public"
+    
     try:
-        entity = await monitor_client.get_entity(channel_name)
-        print(f"   ✅ Connected to {channel_name}")
+        entity = await client.get_entity(channel_name)
+        print(f"   ✅ Connected to {channel_name} ({ctype})")
         
         last_id = 0
-        msgs = await monitor_client.get_messages(entity, limit=1)
+        msgs = await client.get_messages(entity, limit=1)
         if msgs and msgs[0]:
             last_id = msgs[0].id
         else:
@@ -873,11 +879,11 @@ async def poll_channel_messages(channel_name: str):
         
         while channel_name in channel_subscribers and channel_subscribers[channel_name]:
             try:
-                messages = await monitor_client.get_messages(entity, limit=5, min_id=last_id)
+                messages = await client.get_messages(entity, limit=5, min_id=last_id)
                 for msg in messages:
                     if msg.id > last_id and msg.text:
                         last_id = msg.id
-                        print(f"\n📨 [{datetime.now().strftime('%H:%M:%S')}] {channel_name}")
+                        print(f"\n📨 [{datetime.now().strftime('%H:%M:%S')}] {channel_name} ({ctype})")
                         print(f"   📝 {msg.text[:100]}...")
                         
                         for user_id in channel_subscribers.get(channel_name, []):
@@ -888,8 +894,7 @@ async def poll_channel_messages(channel_name: str):
                 print(f"   ⚠️ Poll error for {channel_name}: {e}")
                 await asyncio.sleep(5)
     except Exception as e:
-        print(f"❌ Failed to connect to {channel_name}: {e}")
-
+        print(f"❌ Failed to connect to {channel_name} ({ctype}): {e}")
 # ============================================
 # AUTO-SELL MONITOR
 # ============================================
@@ -1425,6 +1430,7 @@ async def handle_channel_wallet_setup(query, wallet_id):
 async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_name = update.message.text.strip()
     user_id = update.effective_user.id
+    channel_type = context.user_data.get('channel_type', 'public')
     
     if channel_name.lower() == 'cancel':
         await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
@@ -1438,8 +1444,24 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Invalid format! Use @channelname", reply_markup=get_back_keyboard())
         return ENTER_CHANNEL_USERNAME
     
-    # Store channel name
-    channel_setup_data[user_id] = {'channel_name': channel_name}
+    is_private = (channel_type == 'private')
+    
+    # Check if private channel and user is connected
+    if is_private and user_id not in active_clients:
+        await update.message.reply_text(
+            "🔒 *Private Channel*\n\n"
+            "⚠️ You need to connect your Telegram account first.\n\n"
+            "Use 🔐 *TG Auth* → Connect Session",
+            reply_markup=get_main_keyboard(),
+            parse_mode='Markdown'
+        )
+        return SELECTING_ACTION
+    
+    # Store channel info
+    channel_setup_data[user_id] = {
+        'channel_name': channel_name,
+        'is_private': is_private
+    }
     
     # Get wallets
     wallets = db.get_user_wallets(user_id)
@@ -1450,7 +1472,8 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return await ask_channel_buy_amount(update, user_id)
     
     # Multiple wallets - show selection
-    text = f"📋 Channel: `{channel_name}`\n\n💼 *Select Wallet for this Channel:*"
+    ctype = "🔒 Private" if is_private else "🌐 Public"
+    text = f"📋 {ctype}: `{channel_name}`\n\n💼 *Select Wallet for this Channel:*"
     keyboard = []
     for w in wallets:
         addr = w.get('public_key', '')[:8] if w.get('public_key') else 'N/A'
@@ -1652,6 +1675,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "portfolio_channels": return await show_portfolio_by_channel(query)
     elif action == "portfolio_tokens": return await show_portfolio_by_token(query)
     elif action == "portfolio_stats": return await show_portfolio_stats(query)
+    elif action == "connect_user_session":return await connect_user_session(query)
     
     # Settings
     elif action == "set_buy_amount":
@@ -1748,15 +1772,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == "add_private_channel":
         user = db.get_user(user_id)
-        if not user.get('telegram_api_id'):
+        if not user.get('telegram_api_id') or user_id not in active_clients:
             await query.edit_message_text(
-                "❌ *Telegram Auth Required!*",
-                reply_markup=get_main_keyboard(), parse_mode='Markdown')
+                "🔒 *Private Channel*\n\n"
+                "⚠️ You need to connect your Telegram account first.\n\n"
+                "Use 🔐 *TG Auth* → Connect Session",
+                reply_markup=get_main_keyboard(),
+                parse_mode='Markdown'
+            )
             return SELECTING_ACTION
-        context.user_data['channel_type'] = 'private'
+        
         await query.edit_message_text(
-            "📋 Send private channel username:\nType *cancel* to abort.",
-            reply_markup=get_back_keyboard(), parse_mode='Markdown')
+            "🔒 *Add Private Channel*\n\nSend channel username (@name):\nType *cancel* to abort.",
+            reply_markup=get_back_keyboard(),
+            parse_mode='Markdown'
+        )
+        context.user_data['channel_type'] = 'private'
         return ENTER_CHANNEL_USERNAME
     elif action == "refresh_positions":
         await update_pinned_positions(user_id, silent=False)  # Can send new if needed
@@ -2003,23 +2034,163 @@ async def refresh_positions(query):
 async def telegram_auth_setup(query):
     user_id = query.from_user.id
     user = db.get_user(user_id)
-    status = "✅ Configured" if user.get('telegram_api_id') else "❌ Not configured"
+    has_creds = user.get('telegram_api_id') and user.get('telegram_api_hash')
+    is_connected = user_id in active_clients
+    
+    if is_connected:
+        status = "✅ Connected"
+    elif has_creds:
+        status = "⚠️ Credentials saved - Click Connect"
+    else:
+        status = "❌ Not configured"
+    
     text = f"""
 🔐 *Telegram Auth*
 
 Status: {status}
 
-⚠️ Private channel monitoring is only available on local deployment.
+📋 *Public channels* work automatically
+🔒 *Private channels* need your Telegram account
 
-📋 *Public channels* work automatically on Heroku!
+Get API credentials at my.telegram.org
 """
     keyboard = [
         [InlineKeyboardButton("🔄 Setup Credentials", callback_data="start_auth")],
-        [InlineKeyboardButton("« Back", callback_data="back_main")]
     ]
+    if has_creds:
+        keyboard.insert(0, [InlineKeyboardButton("🔌 Connect Session", callback_data="connect_user_session")])
+    if is_connected:
+        keyboard.insert(0, [InlineKeyboardButton("🔌 Reconnect", callback_data="connect_user_session")])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="back_main")])
+    
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
-
+async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if phone.lower() == 'cancel':
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    api_id = context.user_data.get('api_id')
+    api_hash = context.user_data.get('api_hash')
+    
+    db.update_user_settings(user_id, 
+        telegram_api_id=api_id,
+        telegram_api_hash=api_hash,
+        telegram_phone=phone
+    )
+    
+    # Try to send OTP
+    try:
+        from telethon.sessions import StringSession
+        client = TelegramClient(StringSession(), api_id, api_hash)
+        await client.connect()
+        await client.send_code_request(phone)
+        context.user_data['pending_client'] = client
+        await update.message.reply_text(
+            "📱 *OTP Sent!*\n\nEnter the verification code you received:",
+            reply_markup=get_back_keyboard(),
+            parse_mode='Markdown'
+        )
+        return ENTER_OTP if hasattr(globals(), 'ENTER_OTP') else ENTER_PHONE
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Failed to send OTP: {str(e)[:200]}\n\nCredentials saved. Try Connect later.",
+            reply_markup=get_main_keyboard()
+        )
+        return SELECTING_ACTION
+async def handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if code.lower() == 'cancel':
+        await update.message.reply_text("Cancelled. Credentials saved.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    client = context.user_data.get('pending_client')
+    phone = db.get_user(user_id).get('telegram_phone')
+    
+    try:
+        await client.sign_in(phone=phone, code=code)
+        
+        # Save session string
+        session_string = client.session.save()
+        db.update_user_settings(user_id, telegram_session_string=session_string)
+        
+        # Store in active clients
+        active_clients[user_id] = client
+        me = await client.get_me()
+        
+        await update.message.reply_text(
+            f"✅ *Connected as @{me.username}!*\n\nPrivate channel monitoring is now active.",
+            reply_markup=get_main_keyboard(),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Invalid OTP: {str(e)[:200]}\n\nTry again or use Connect later.",
+            reply_markup=get_main_keyboard()
+        )
+    
+    return SELECTING_ACTION
+async def connect_user_session(query):
+    """Connect user's Telegram session for private channels"""
+    user_id = query.from_user.id
+    user = db.get_user(user_id)
+    
+    if not user.get('telegram_api_id'):
+        await query.edit_message_text("❌ Setup credentials first!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    await query.edit_message_text("⏳ *Connecting...*", parse_mode='Markdown')
+    
+    try:
+        from telethon.sessions import StringSession
+        
+        session_string = user.get('telegram_session_string', '')
+        
+        if session_string:
+            client = TelegramClient(StringSession(session_string), 
+                                   user['telegram_api_id'], 
+                                   user['telegram_api_hash'])
+            await client.start()
+        else:
+            client = TelegramClient(StringSession(), 
+                                   user['telegram_api_id'], 
+                                   user['telegram_api_hash'])
+            await client.start(phone=user.get('telegram_phone'))
+            session_string = client.session.save()
+            db.update_user_settings(user_id, telegram_session_string=session_string)
+        
+        me = await client.get_me()
+        active_clients[user_id] = client
+        
+        # Start monitoring existing private channels
+        channels = db.get_user_channels(user_id)
+        private_count = 0
+        for ch in channels:
+            if ch.get('is_private'):
+                global monitor_channel_queue
+                if monitor_channel_queue:
+                    await monitor_channel_queue.put((user_id, ch['channel_name'], client))
+                    private_count += 1
+        
+        await query.edit_message_text(
+            f"✅ *Connected as @{me.username}!*\n\n"
+            f"📋 {private_count} private channels activated.",
+            reply_markup=get_main_keyboard(),
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        await query.edit_message_text(
+            f"❌ Connection failed: {str(e)[:200]}\n\nTry Setup Credentials again.",
+            reply_markup=get_main_keyboard()
+        )
+    
+    return SELECTING_ACTION
 # ============================================
 # BUY/SELL HANDLERS
 # ============================================
@@ -2878,15 +3049,27 @@ def run_monitor_in_thread():
         # Start auto-refresh for pinned positions
         asyncio.create_task(auto_refresh_positions())
         
-        # Process new channels added at runtime (in THIS event loop)
+                # Process new channels added at runtime (in THIS event loop)
         async def process_new_channels():
             while True:
                 try:
-                    channel_name = await new_channel_queue.get()
+                    item = await new_channel_queue.get()
+                    
+                    # Handle both public (string) and private (tuple) channels
+                    if isinstance(item, tuple) and len(item) == 3:
+                        user_id, channel_name, user_client = item
+                    else:
+                        channel_name = item
+                        user_client = None
+                    
                     if channel_name not in channel_subscribers:
                         channel_subscribers[channel_name] = []
-                    asyncio.create_task(poll_channel_messages(channel_name))
-                    print(f"🔍 Started polling {channel_name}")
+                    
+                    # Pass user_client for private channels, None for public
+                    asyncio.create_task(poll_channel_messages(channel_name, user_client))
+                    
+                    ctype = "🔒 Private" if user_client else "🌐 Public"
+                    print(f"🔍 Started polling {channel_name} ({ctype})")
                 except Exception as e:
                     print(f"⚠️ Queue error: {e}")
         
@@ -2894,7 +3077,7 @@ def run_monitor_in_thread():
         
         if not api_id or not api_hash:
             print("⚠️ MONITOR_API_ID/HASH not set. Channel monitoring disabled.")
-            # Keep running to process queue
+            # Keep running to process queue for private channels
             while True:
                 await asyncio.sleep(60)
             return
@@ -2940,7 +3123,7 @@ def run_monitor_in_thread():
         
         monitor_client = client
         
-        # Restore channels (in THIS event loop)
+        # Restore ALL channels (public + private)
         try:
             channels = db.get_all_active_channels()
             print(f"📋 Restoring {len(channels)} channels...")
@@ -2948,18 +3131,42 @@ def run_monitor_in_thread():
                 channel_name = ch['channel_name']
                 if not channel_name.startswith('@'):
                     channel_name = '@' + channel_name
+                
                 if channel_name not in channel_subscribers:
                     channel_subscribers[channel_name] = []
                 if ch['user_id'] not in channel_subscribers[channel_name]:
                     channel_subscribers[channel_name].append(ch['user_id'])
-                asyncio.create_task(poll_channel_messages(channel_name))
-                print(f"🔍 Polling {channel_name}")
+                
+                # Check if private channel - use user's client
+                if ch.get('is_private'):
+                    user_id = ch['user_id']
+                    user_data = db.get_user(user_id)
+                    if user_data and user_data.get('telegram_session_string'):
+                        from telethon.sessions import StringSession
+                        user_client = TelegramClient(
+                            StringSession(user_data['telegram_session_string']),
+                            user_data['telegram_api_id'],
+                            user_data['telegram_api_hash']
+                        )
+                        try:
+                            await user_client.start()
+                            active_clients[user_id] = user_client
+                            asyncio.create_task(poll_channel_messages(channel_name, user_client))
+                            print(f"🔍 Polling {channel_name} (🔒 Private)")
+                        except Exception as e:
+                            print(f"⚠️ Could not restore private {channel_name}: {e}")
+                            asyncio.create_task(poll_channel_messages(channel_name))
+                    else:
+                        asyncio.create_task(poll_channel_messages(channel_name))
+                else:
+                    asyncio.create_task(poll_channel_messages(channel_name))
+                    print(f"🔍 Polling {channel_name} (🌐 Public)")
         except Exception as e:
             print(f"⚠️ Restore error: {e}")
         
         asyncio.create_task(auto_sell_monitor())
         
-        print("✅ Monitor ready (with Auto-Sell)")
+        print("✅ Monitor ready (Public + Private channels)")
         
         try:
             await client.run_until_disconnected()
@@ -3166,6 +3373,10 @@ def main():
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_target_mc)
             ],
+            ENTER_OTP: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp)
+],
         },
         fallbacks=[CommandHandler('start', start)],
         per_message=False

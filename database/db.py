@@ -399,7 +399,8 @@ class Database:
                 ph = self.placeholder()
                 
                 user_fields = ['default_buy_amount', 'default_slippage', 'max_daily_trades',
-                              'telegram_api_id', 'telegram_api_hash', 'telegram_phone']
+                                'telegram_api_id', 'telegram_api_hash', 'telegram_phone',
+                                'telegram_session_string', 'public_key']
                 settings_fields = ['auto_snipe', 'auto_sell_enabled', 'take_profit_percent',
                                   'target_mc', 'stop_loss_percent', 'max_slippage', 'notifications_enabled']
                 boolean_fields = ['auto_snipe', 'auto_sell_enabled', 'notifications_enabled']
