@@ -2587,8 +2587,10 @@ def run_monitor_in_thread():
         api_id = os.getenv('MONITOR_API_ID', '')
         api_hash = os.getenv('MONITOR_API_HASH', '')
         phone = os.getenv('MONITOR_PHONE', '')
+        
         # Start auto-refresh for pinned positions
         asyncio.create_task(auto_refresh_positions())
+        
         if not api_id or not api_hash:
             print("⚠️ MONITOR_API_ID/HASH not set. Channel monitoring disabled.")
             return
@@ -2596,6 +2598,7 @@ def run_monitor_in_thread():
         from telethon.sessions import StringSession
         session_string = os.getenv('MONITOR_SESSION_STRING', '')
         
+        client = None
         try:
             if session_string and session_string != 'None':
                 print("📝 Using saved session string...")
@@ -2613,12 +2616,23 @@ def run_monitor_in_thread():
         except EOFError:
             print("❌ Cannot authenticate interactively!")
             return
+        except RuntimeError as e:
+            if "event loop" in str(e).lower():
+                print("⚠️ Event loop conflict, skipping Telethon setup")
+                return
+            raise
         except Exception as e:
             print(f"❌ Telethon error: {e}")
             return
         
-        me = await client.get_me()
-        print(f"📡 Monitoring as: @{me.username}" if me.username else f"📡 Monitoring as: {me.first_name}")
+        if not client:
+            return
+        
+        try:
+            me = await client.get_me()
+            print(f"📡 Monitoring as: @{me.username}" if me.username else f"📡 Monitoring as: {me.first_name}")
+        except Exception as e:
+            print(f"⚠️ Could not get me: {e}")
         
         monitor_client = client
         
@@ -2642,11 +2656,35 @@ def run_monitor_in_thread():
         asyncio.create_task(auto_sell_monitor())
         
         print("✅ Monitor ready (with Auto-Sell)")
-        await client.run_until_disconnected()
+        
+        try:
+            await client.run_until_disconnected()
+        except RuntimeError as e:
+            if "event loop" in str(e).lower():
+                print("⚠️ Event loop changed during disconnect (normal on restart)")
+            else:
+                print(f"❌ Disconnect error: {e}")
+        except Exception as e:
+            print(f"❌ Disconnect error: {e}")
+        finally:
+            print("📡 Monitor disconnected")
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(_run())
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_run())
+    except RuntimeError as e:
+        if "event loop" in str(e).lower():
+            print("⚠️ Event loop error in monitor thread (normal on Heroku restart)")
+        else:
+            print(f"❌ Monitor thread error: {e}")
+    except Exception as e:
+        print(f"❌ Monitor thread error: {e}")
+    finally:
+        try:
+            loop.close()
+        except:
+            pass
 def start_health_server():
     """Simple HTTP server for Heroku health checks"""
     from http.server import HTTPServer, BaseHTTPRequestHandler
