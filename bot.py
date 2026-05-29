@@ -2343,7 +2343,7 @@ def main():
             ENTER_PROFIT_PERCENT: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
             ENTER_TARGET_MC: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
             ENTER_TRANSFER_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_input)],
-            ENTER_WITHDRAW_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_input)],
+            ENTER_WITHDRAW_DETAILS: [CallbackQueryHandler(button_handler),MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_input)],
             CONFIRM_BUY: [CallbackQueryHandler(button_handler)],
         },
         fallbacks=[CommandHandler('start', start)],
