@@ -127,20 +127,17 @@ pinned_positions_message: Dict[int, int] = {}  # user_id -> message_id
 async def send_buy_notification(user_id: int, token_address: str, tokens_bought: float, txid: str, price: float = 0):
     """Send buy notification and update positions overview"""
     try:
-        global pinned_positions_message
-        
-        # Get token info
+        symbol = await get_token_symbol(token_address)
         mc = await get_token_market_cap(token_address)
         token_price = await solana_service.get_token_price(token_address)
         value = tokens_bought * token_price if token_price else 0
-        # Before building positions text
-        await sync_positions_from_wallet(user_id)
-        positions = db.get_user_positions(user_id)
+        
         # 1. Send buy notification
         buy_text = f"""
 🟢 *BUY EXECUTED!*
 
-*Token:* `{token_address[:8]}...{token_address[-4:]}`
+*Token:* *{symbol}*
+`{token_address[:8]}...{token_address[-4:]}`
 *Amount:* {tokens_bought:,.2f}
 *Value:* ${value:.2f}
 *TX:* [{txid[:15]}...](https://solscan.io/tx/{txid})
@@ -155,83 +152,68 @@ async def send_buy_notification(user_id: int, token_address: str, tokens_bought:
             disable_web_page_preview=True
         )
         
-        # 2. Build positions overview
+        # 2. Build and send portfolio overview
+        await sync_positions_from_wallet(user_id)
         positions = db.get_user_positions(user_id)
-        user = db.get_user(user_id)
-        sol_balance = await solana_service.get_balance(user['public_key'])
+        wallet = await get_user_wallet(user_id)
+        sol_balance = await solana_service.get_balance(str(wallet.pubkey())) if wallet else 0
         
         pos_text = "📊 *Portfolio Overview*\n\n"
         total_value = sol_balance
         
         if positions:
             for pos in positions[:15]:
-                addr = pos['token_address']
-                amt = pos['amount']
-                price_now = await solana_service.get_token_price(addr)
-                val = amt * price_now if price_now else 0
-                total_value += val
-                
-                pnl = ""
-                if pos.get('entry_price') and pos['entry_price'] > 0 and price_now:
-                    pnl_pct = ((price_now - pos['entry_price']) / pos['entry_price']) * 100
-                    emoji = "🟢" if pnl_pct > 0 else "🔴"
-                    pnl = f" {emoji}{pnl_pct:+.1f}%"
-                
-                pos_text += f"• `{addr[:6]}...{addr[-4:]}` — *{amt:,.2f}* (${val:.2f}){pnl}\n"
+                if pos['amount'] > 0:
+                    addr = pos['token_address']
+                    amt = pos['amount']
+                    sym = await get_token_symbol(addr)
+                    price_now = await solana_service.get_token_price(addr)
+                    val = amt * price_now if price_now else 0
+                    total_value += val
+                    
+                    pnl = ""
+                    if pos.get('entry_price') and pos['entry_price'] > 0 and price_now:
+                        pnl_pct = ((price_now - pos['entry_price']) / pos['entry_price']) * 100
+                        emoji = "🟢" if pnl_pct > 0 else "🔴"
+                        pnl = f" {emoji}{pnl_pct:+.1f}%"
+                    
+                    pos_text += f"• *{sym}* — *{amt:,.2f}* (${val:.2f}){pnl}\n"
         else:
             pos_text += "No positions yet.\n"
         
         pos_text += f"\n💰 *SOL:* ${sol_balance:.2f}"
         pos_text += f"\n💎 *Total:* ${total_value:.2f}"
-        pos_text += f"\n\n🔄 Updates automatically on each trade"
         
-        # 3. Pin the positions message (delete old, send new)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📈 Buy", callback_data="buy"),
              InlineKeyboardButton("📉 Sell", callback_data="sell")],
             [InlineKeyboardButton("🔄 Refresh", callback_data="positions")]
         ])
         
-        # Delete old pinned message if exists
-        if user_id in pinned_positions_message:
-            try:
-                await application.bot.delete_message(
-                    chat_id=user_id,
-                    message_id=pinned_positions_message[user_id]
-                )
-            except:
-                pass
-        
-        # Send new positions message
-        sent_msg = await application.bot.send_message(
+        await application.bot.send_message(
             chat_id=user_id,
             text=pos_text,
             parse_mode='Markdown',
             reply_markup=keyboard
         )
-        
-        # Store message ID for future updates
-        pinned_positions_message[user_id] = sent_msg.message_id
             
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
 
+
 async def send_sell_notification(user_id: int, token_address: str, amount_sold: float, sol_received: float, txid: str):
     """Send sell notification and update positions"""
     try:
-        global pinned_positions_message
-        
+        symbol = await get_token_symbol(token_address)
         token_price = await solana_service.get_token_price(token_address)
         value = amount_sold * token_price if token_price else 0
-        # Before building positions text
-        await sync_positions_from_wallet(user_id)
-        positions = db.get_user_positions(user_id)
         
         # 1. Send sell notification
         sell_text = f"""
 🔴 *SOLD!*
 
-*Token:* `{token_address[:8]}...{token_address[-4:]}`
+*Token:* *{symbol}*
+`{token_address[:8]}...{token_address[-4:]}`
 *Amount:* {amount_sold:,.2f}
 *Value:* ${value:.2f}
 *SOL Received:* {sol_received:.4f} SOL
@@ -244,31 +226,34 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
             disable_web_page_preview=True
         )
         
-        # 2. Update positions overview (same as buy notification)
+        # 2. Build and send portfolio overview
+        await sync_positions_from_wallet(user_id)
         positions = db.get_user_positions(user_id)
-        user = db.get_user(user_id)
-        sol_balance = await solana_service.get_balance(user['public_key'])
+        wallet = await get_user_wallet(user_id)
+        sol_balance = await solana_service.get_balance(str(wallet.pubkey())) if wallet else 0
         
         pos_text = "📊 *Portfolio Overview*\n\n"
         total_value = sol_balance
         
         if positions:
             for pos in positions[:15]:
-                addr = pos['token_address']
-                amt = pos['amount']
-                price_now = await solana_service.get_token_price(addr)
-                val = amt * price_now if price_now else 0
-                total_value += val
-                
-                pnl = ""
-                if pos.get('entry_price') and pos['entry_price'] > 0 and price_now:
-                    pnl_pct = ((price_now - pos['entry_price']) / pos['entry_price']) * 100
-                    emoji = "🟢" if pnl_pct > 0 else "🔴"
-                    pnl = f" {emoji}{pnl_pct:+.1f}%"
-                
-                pos_text += f"• `{addr[:6]}...{addr[-4:]}` — *{amt:,.2f}* (${val:.2f}){pnl}\n"
+                if pos['amount'] > 0:
+                    addr = pos['token_address']
+                    amt = pos['amount']
+                    sym = await get_token_symbol(addr)
+                    price_now = await solana_service.get_token_price(addr)
+                    val = amt * price_now if price_now else 0
+                    total_value += val
+                    
+                    pnl = ""
+                    if pos.get('entry_price') and pos['entry_price'] > 0 and price_now:
+                        pnl_pct = ((price_now - pos['entry_price']) / pos['entry_price']) * 100
+                        emoji = "🟢" if pnl_pct > 0 else "🔴"
+                        pnl = f" {emoji}{pnl_pct:+.1f}%"
+                    
+                    pos_text += f"• *{sym}* — *{amt:,.2f}* (${val:.2f}){pnl}\n"
         else:
-            pos_text += "No positions.\n"
+            pos_text += "No positions yet.\n"
         
         pos_text += f"\n💰 *SOL:* ${sol_balance:.2f}"
         pos_text += f"\n💎 *Total:* ${total_value:.2f}"
@@ -279,36 +264,48 @@ async def send_sell_notification(user_id: int, token_address: str, amount_sold: 
             [InlineKeyboardButton("🔄 Refresh", callback_data="positions")]
         ])
         
-        # Update or send new positions message
-        if user_id in pinned_positions_message:
-            try:
-                await application.bot.edit_message_text(
-                    chat_id=user_id,
-                    message_id=pinned_positions_message[user_id],
-                    text=pos_text,
-                    parse_mode='Markdown',
-                    reply_markup=keyboard
-                )
-            except:
-                # If edit fails, send new
-                sent_msg = await application.bot.send_message(
-                    chat_id=user_id,
-                    text=pos_text,
-                    parse_mode='Markdown',
-                    reply_markup=keyboard
-                )
-                pinned_positions_message[user_id] = sent_msg.message_id
-        else:
-            sent_msg = await application.bot.send_message(
-                chat_id=user_id,
-                text=pos_text,
-                parse_mode='Markdown',
-                reply_markup=keyboard
-            )
-            pinned_positions_message[user_id] = sent_msg.message_id
+        await application.bot.send_message(
+            chat_id=user_id,
+            text=pos_text,
+            parse_mode='Markdown',
+            reply_markup=keyboard
+        )
             
     except Exception as e:
         print(f"   ⚠️ Notification error: {e}")
+
+async def send_sell_notification(user_id: int, token_address: str, amount_sold: float, sol_received: float, txid: str):
+    """Send sell notification and update positions"""
+    try:
+        global pinned_positions_message
+        
+        symbol = await get_token_symbol(token_address)
+        token_price = await solana_service.get_token_price(token_address)
+        value = amount_sold * token_price if token_price else 0
+        
+        sell_text = f"""
+🔴 *SOLD!*
+
+*Token:* *{symbol}*
+`{token_address[:8]}...{token_address[-4:]}`
+*Amount:* {amount_sold:,.2f}
+*Value:* ${value:.2f}
+*SOL Received:* {sol_received:.4f} SOL
+*TX:* [{txid[:15]}...](https://solscan.io/tx/{txid})
+"""
+        await application.bot.send_message(
+            chat_id=user_id,
+            text=sell_text,
+            parse_mode='Markdown',
+            disable_web_page_preview=True
+        )
+        
+        # Update pinned positions
+        await update_pinned_positions(user_id)
+            
+    except Exception as e:
+        print(f"   ⚠️ Notification error: {e}")
+
 async def update_pinned_positions(user_id: int, silent: bool = False):
     """Update the pinned positions message"""
     global pinned_messages
@@ -337,7 +334,8 @@ async def update_pinned_positions(user_id: int, silent: bool = False):
                     price = await solana_service.get_token_price(addr)
                     val = amt * price if price else 0
                     total_value += val
-                    text += f"• `{addr[:6]}...{addr[-4:]}` — *{amt:,.2f}*"
+                    symbol = await get_token_symbol(addr)
+                    text += f"• *{symbol}* — *{amt:,.2f}*"
                     if val > 0:
                         text += f" (${val:.2f})"
                     text += "\n"
@@ -1327,6 +1325,44 @@ async def show_portfolio_by_wallet(query):
     except:
         pass
     return SELECTING_ACTION
+# Cache for token symbols
+token_symbol_cache: Dict[str, str] = {}
+
+async def get_token_symbol(token_mint: str) -> str:
+    """Get token symbol from DexScreener or Jupiter"""
+    if token_mint in token_symbol_cache:
+        return token_symbol_cache[token_mint]
+    
+    # Try DexScreener
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('pairs') and len(data['pairs']) > 0:
+                        symbol = data['pairs'][0].get('baseToken', {}).get('symbol', '')
+                        if symbol:
+                            token_symbol_cache[token_mint] = symbol
+                            return symbol
+    except:
+        pass
+    
+    # Try Jupiter
+    try:
+        url = f"https://tokens.jup.ag/token/{token_mint}"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            symbol = data.get('symbol', '')
+            if symbol:
+                token_symbol_cache[token_mint] = symbol
+                return symbol
+    except:
+        pass
+    
+    # Fallback: short address
+    return f"{token_mint[:6]}...{token_mint[-4:]}"
 # ============================================
 # START COMMAND & UI HANDLERS
 # ============================================
@@ -1965,12 +2001,10 @@ async def initiate_sell(query):
     
     await query.edit_message_text("⏳ *Checking tokens...*", parse_mode='Markdown')
     
-    wallet_addr = str(wallet.pubkey())
     text = "📉 *Select Token to Sell*\n\n"
     keyboard = []
     found_tokens = []
     
-    # Check DB positions and verify with actual ATA balances
     positions = db.get_user_positions(user_id)
     
     for pos in positions:
@@ -1989,17 +2023,19 @@ async def initiate_sell(query):
         
         if amount > 0:
             found_tokens.append((token_addr, amount))
+            symbol = await get_token_symbol(token_addr)
             price = await solana_service.get_token_price(token_addr)
             value = amount * price if price else 0
             
-            text += f"🔹 `{token_addr[:8]}...` — *{amount:,.2f}*"
+            text += f"🔹 *{symbol}*\n"
+            text += f"   `{token_addr[:8]}...` — *{amount:,.2f}*"
             if value > 0:
                 text += f" (${value:.2f})"
             text += "\n\n"
             
             keyboard.append([
                 InlineKeyboardButton(
-                    f"💰 Sell ({amount:,.0f})", 
+                    f"💰 Sell {symbol}", 
                     callback_data=f"sell_{token_addr}"
                 )
             ])
@@ -2018,6 +2054,7 @@ async def initiate_sell(query):
     except:
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
+
 async def confirm_sell_position(query, token_address):
     user_id = query.from_user.id
     positions = db.get_user_positions(user_id)
@@ -2281,7 +2318,7 @@ async def show_positions(query):
         # Get unique tokens (latest position for each mint)
         seen_mints = set()
         unique_positions = []
-        for pos in reversed(positions):  # Latest first
+        for pos in reversed(positions):
             if pos['token_address'] not in seen_mints:
                 seen_mints.add(pos['token_address'])
                 unique_positions.append(pos)
@@ -2291,6 +2328,9 @@ async def show_positions(query):
             amount = pos['amount']
             
             found_any = True
+            
+            # Get token symbol
+            symbol = await get_token_symbol(token_addr)
             
             # Get current price and MC
             price = await solana_service.get_token_price(token_addr)
@@ -2305,7 +2345,9 @@ async def show_positions(query):
                 emoji = "🟢" if pnl_pct >= 0 else "🔴"
                 pnl_text = f" {emoji}{pnl_pct:+.1f}%"
             
-            text += f"🔹 `{token_addr[:8]}...{token_addr[-4:]}`\n"
+            # Display token name (symbol) with address below
+            text += f"🔹 *{symbol}*\n"
+            text += f"   `{token_addr[:8]}...{token_addr[-4:]}`\n"
             text += f"   Amount: *{amount:,.2f}*"
             if value > 0:
                 text += f" (${value:.2f})"
