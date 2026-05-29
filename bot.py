@@ -1261,7 +1261,6 @@ async def show_portfolio_by_wallet(query):
     user_id = query.from_user.id
     wallets = db.get_user_wallets(user_id) or []
     
-    # Get trades safely
     try:
         result = db.get_user_trade_history(user_id, limit=500)
         trades = result if isinstance(result, list) else []
@@ -1282,15 +1281,32 @@ async def show_portfolio_by_wallet(query):
             sol = 0
         total_sol += sol
         
-        # W1 gets all NULL wallet_id trades (backward compatibility)
+        # W1 gets all NULL wallet_id trades
         if wallet_num == 1:
             wt = [t for t in trades if not t.get('wallet_id') or t.get('wallet_id') == w['id']]
         else:
             wt = [t for t in trades if t.get('wallet_id') == w['id']]
         
-        buys = len([t for t in wt if t.get('trade_type') == 'buy'])
-        sells = len([t for t in wt if t.get('trade_type') in ('sell', 'auto-sell')])
-        pnl = sum(t.get('pnl_sol', 0) or 0 for t in sells)
+        buys = 0
+        sells_list = []
+        for t in wt:
+            if t.get('trade_type') == 'buy':
+                buys += 1
+            elif t.get('trade_type') in ('sell', 'auto-sell'):
+                sells_list.append(t)
+        
+        sells = len(sells_list)
+        
+        # SAFE PNL calculation
+        pnl = 0.0
+        for t in sells_list:
+            val = t.get('pnl_sol')
+            if val is not None:
+                try:
+                    pnl += float(val)
+                except:
+                    pass
+        
         pnl_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
         
         text += f"┌─────────────────────────┐\n"
@@ -1306,7 +1322,10 @@ async def show_portfolio_by_wallet(query):
         [InlineKeyboardButton("🔄 Refresh", callback_data="portfolio_wallets")],
         [InlineKeyboardButton("« Back", callback_data="portfolio")]
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    except:
+        pass
     return SELECTING_ACTION
 # ============================================
 # START COMMAND & UI HANDLERS

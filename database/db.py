@@ -820,19 +820,33 @@ class Database:
             return -1
     
     def get_user_trade_history(self, user_id: int, limit: int = 50) -> List[Dict]:
+        """Get user's trade history - ALWAYS returns a list"""
         try:
             with self.lock:
                 conn = self.get_connection()
                 cursor = self.get_cursor(conn)
                 ph = self.placeholder()
-                cursor.execute(f'SELECT * FROM trade_history WHERE user_id = {ph} ORDER BY created_at DESC LIMIT {limit}', (user_id,))
+                
+                cursor.execute(
+                    f'SELECT * FROM trade_history WHERE user_id = {ph} ORDER BY created_at DESC LIMIT {limit}', 
+                    (user_id,)
+                )
                 rows = cursor.fetchall()
                 conn.close()
-                result = [dict(row) for row in rows] if rows else []
+                
+                # ALWAYS return a list
+                if rows is None:
+                    return []
+                
+                result = []
+                for row in rows:
+                    result.append(dict(row))
+                
                 return result
+                
         except Exception as e:
             print(f"❌ Error getting trade history: {e}")
-            return []  # Always return empty list on error
+            return []
         
     # ============================================
     # SNIPE LOGS
