@@ -950,11 +950,19 @@ async def show_wallets_menu(query):
     user_id = query.from_user.id
     wallets = db.get_user_wallets(user_id)
     
+    # If no wallets, create W1 automatically
+    if not wallets:
+        wallet_id = db.create_wallet(user_id, 'W1', 1)
+        if wallet_id > 0:
+            wallet = derive_wallet_from_user(user_id)
+            public_key = str(wallet.pubkey())
+            db.update_wallet_settings(wallet_id, public_key=public_key)
+            wallets = db.get_user_wallets(user_id)
+    
     text = "💼 *Your Wallets*\n\n"
     for w in wallets:
         addr = w.get('public_key', 'N/A')
-        text += f"*{w['wallet_name']}* — `{addr[:8]}...{addr[-4:]}`\n"
-        text += f"  Buy: {w.get('default_buy_amount', 0.01)} SOL | Slip: {w.get('default_slippage', 1000)/100}%\n\n"
+        text += f"*{w['wallet_name']}* — `{addr[:8]}...{addr[-4:]}`\n\n"
     
     keyboard = get_wallet_selection_keyboard(user_id)
     await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
@@ -997,16 +1005,17 @@ async def create_new_wallet_flow(query):
     wallet_id = db.create_wallet(user_id, f'W{next_num}', next_num)
     
     if wallet_id > 0:
-        wallet = derive_wallet_from_user(user_id, next_num)
+        # FIX: derive_wallet_from_user only takes user_id
+        wallet = derive_wallet_from_user(user_id)
         public_key = str(wallet.pubkey())
         db.update_wallet_settings(wallet_id, public_key=public_key)
         
         await query.edit_message_text(
-            f"✅ *W{next_num} created!*\n\nAddress: `{public_key[:8]}...`\n\nFund this wallet to start trading.",
+            f"✅ *W{next_num} created!*\n\nAddress: `{public_key[:8]}...`",
             reply_markup=get_main_keyboard(), parse_mode='Markdown'
         )
     else:
-        await query.edit_message_text("❌ Failed to create wallet!", reply_markup=get_main_keyboard())
+        await query.edit_message_text("❌ Failed!", reply_markup=get_main_keyboard())
     
     return SELECTING_ACTION
 
