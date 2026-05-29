@@ -391,7 +391,7 @@ async def auto_refresh_positions():
                 print(f"   ⚠️ Refresh error for user {user_id}: {e}")
 
 # Add this task in run_monitor_in_thread:
-asyncio.create_task(auto_refresh_positions())
+
 async def sync_positions_from_wallet(user_id: int):
     """Sync positions - safely check token balances"""
     wallet = await get_user_wallet(user_id)
@@ -2135,7 +2135,8 @@ def run_monitor_in_thread():
         api_id = os.getenv('MONITOR_API_ID', '')
         api_hash = os.getenv('MONITOR_API_HASH', '')
         phone = os.getenv('MONITOR_PHONE', '')
-        
+        # Start auto-refresh for pinned positions
+        asyncio.create_task(auto_refresh_positions())
         if not api_id or not api_hash:
             print("⚠️ MONITOR_API_ID/HASH not set. Channel monitoring disabled.")
             return
