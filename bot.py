@@ -89,7 +89,7 @@ active_clients: Dict[int, TelegramClient] = {}
 # Channel monitoring globals
 monitor_client = None
 channel_subscribers: Dict[str, list] = {}
-
+monitor_channel_queue = None
 # Deduplication cache
 processing_tokens: Dict[int, set] = {}
 last_processed_time: Dict[int, Dict[str, float]] = {}
@@ -1288,48 +1288,126 @@ async def handle_channel_slippage(update: Update, context: ContextTypes.DEFAULT_
     user_id = update.effective_user.id
     
     if text.lower() == 'cancel':
+        channel_setup_data.pop(user_id, None)
         await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    global channel_setup_data
-    setup = channel_setup_data.pop(user_id, {})
+    setup = channel_setup_data.get(user_id, {})
     
-    slippage = None
     if text.lower() != 'skip':
         try:
-            slippage = int(float(text) * 100)  # Convert % to bps
-            setup['slippage'] = slippage
+            setup['slippage'] = int(float(text) * 100)
         except:
-            await update.message.reply_text("❌ Invalid! Enter a number or *skip*.")
+            await update.message.reply_text("❌ Invalid! Enter number or *skip*.", reply_markup=get_back_keyboard())
             return ENTER_CHANNEL_SLIPPAGE
+    
+    channel_setup_data[user_id] = setup
+    
+    # NOW ASK FOR SELL SETTINGS
+    await update.message.reply_text(
+        "🎯 *Take Profit %*\n\nAuto-sell when profit reaches this %\n(or type *skip* for default: 50%, *0* to disable):",
+        reply_markup=get_back_keyboard(),
+        parse_mode='Markdown'
+    )
+    return ENTER_CHANNEL_TAKE_PROFIT
+
+
+async def handle_channel_take_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if text.lower() == 'cancel':
+        channel_setup_data.pop(user_id, None)
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    setup = channel_setup_data.get(user_id, {})
+    
+    if text.lower() != 'skip':
+        try:
+            tp = float(text)
+            setup['take_profit'] = tp
+            setup['auto_sell'] = (tp > 0)
+        except:
+            await update.message.reply_text("❌ Invalid! Enter number or *skip*.", reply_markup=get_back_keyboard())
+            return ENTER_CHANNEL_TAKE_PROFIT
+    
+    channel_setup_data[user_id] = setup
+    
+    # Ask for Target MC
+    await update.message.reply_text(
+        "📈 *Target MC ($)*\n\nAuto-sell when market cap reaches this\n(or type *skip* to not set, e.g., 45000):",
+        reply_markup=get_back_keyboard(),
+        parse_mode='Markdown'
+    )
+    return ENTER_CHANNEL_TARGET_MC
+
+
+async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if text.lower() == 'cancel':
+        channel_setup_data.pop(user_id, None)
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    setup = channel_setup_data.pop(user_id, {})
+    
+    if text.lower() != 'skip':
+        try:
+            setup['target_mc'] = float(text)
+        except:
+            await update.message.reply_text("❌ Invalid! Enter number or *skip*.", reply_markup=get_back_keyboard())
+            return ENTER_CHANNEL_TARGET_MC
     
     channel_name = setup.get('channel_name', '')
     wallet_id = setup.get('wallet_id')
+    buy_amount = setup.get('buy_amount')
+    slippage = setup.get('slippage')
+    take_profit = setup.get('take_profit')
+    target_mc = setup.get('target_mc')
+    auto_sell = setup.get('auto_sell', True)
     
-    # Add channel with wallet mapping
-    channel_id = db.add_channel(user_id, channel_name, wallet_id=wallet_id)
+    if wallet_id:
+        updates = {}
+        if buy_amount: updates['default_buy_amount'] = buy_amount
+        if slippage: updates['default_slippage'] = slippage
+        if take_profit is not None: updates['take_profit_percent'] = take_profit
+        if target_mc is not None: updates['target_mc'] = target_mc
+        updates['auto_sell_enabled'] = auto_sell
+        db.update_wallet_settings(wallet_id, **updates)
     
-    # Start monitoring
-    global channel_subscribers
+    db.add_channel(user_id, channel_name, wallet_id=wallet_id)
+    
+    # QUEUE for monitor thread instead of direct create_task
+    global channel_subscribers, monitor_channel_queue
     if channel_name not in channel_subscribers:
         channel_subscribers[channel_name] = []
     if user_id not in channel_subscribers[channel_name]:
         channel_subscribers[channel_name].append(user_id)
-    asyncio.create_task(poll_channel_messages(channel_name))
+    
+    if monitor_channel_queue:
+        await monitor_channel_queue.put(channel_name)
     
     wallet = db.get_wallet(wallet_id) if wallet_id else None
     w_name = wallet['wallet_name'] if wallet else 'W1'
     
-    await update.message.reply_text(
-        f"✅ *Channel Added!*\n\n"
-        f"📋 `{channel_name}`\n"
-        f"💼 Wallet: {w_name}\n"
-        f"💰 Buy: {setup.get('buy_amount', 'default')} SOL\n"
-        f"📊 Slippage: {slippage/100 if slippage else 'default'}%\n\n"
-        f"📡 Monitoring started!",
-        reply_markup=get_main_keyboard(),
-        parse_mode='Markdown'
-    )
+    summary = f"""
+✅ *Channel Added!*
+
+📋 `{channel_name}`
+💼 Wallet: *{w_name}*
+
+💰 Buy: {buy_amount or wallet.get('default_buy_amount', 0.01)} SOL
+📊 Slippage: {(slippage or wallet.get('default_slippage', 1000))/100}%
+🎯 Take Profit: {take_profit if take_profit is not None else wallet.get('take_profit_percent', 50)}%
+📈 Target MC: ${target_mc or wallet.get('target_mc', 0):,.0f}
+🤖 Auto-Sell: {'✅ ON' if auto_sell else '❌ OFF'}
+
+📡 Monitoring will start shortly...
+"""
+    await update.message.reply_text(summary, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     return SELECTING_ACTION
 async def handle_channel_wallet_setup(query, wallet_id):
     """After wallet selected, ask for buy amount"""
@@ -2793,12 +2871,16 @@ async def execute_withdraw(query):
 # MONITOR THREAD
 # ============================================
 def run_monitor_in_thread():
-    global monitor_client, channel_subscribers
+    global monitor_client, channel_subscribers, monitor_channel_queue
     
-    ## Suppress Telethon event loop spam
+    # Suppress Telethon event loop spam
     import logging
     logging.getLogger('telethon').setLevel(logging.CRITICAL)
     logging.getLogger('asyncio').setLevel(logging.CRITICAL)
+    
+    # Queue for new channels added at runtime
+    new_channel_queue = asyncio.Queue()
+    monitor_channel_queue = new_channel_queue
     
     async def _run():
         global monitor_client, channel_subscribers
@@ -2810,8 +2892,25 @@ def run_monitor_in_thread():
         # Start auto-refresh for pinned positions
         asyncio.create_task(auto_refresh_positions())
         
+        # Process new channels added at runtime (in THIS event loop)
+        async def process_new_channels():
+            while True:
+                try:
+                    channel_name = await new_channel_queue.get()
+                    if channel_name not in channel_subscribers:
+                        channel_subscribers[channel_name] = []
+                    asyncio.create_task(poll_channel_messages(channel_name))
+                    print(f"🔍 Started polling {channel_name}")
+                except Exception as e:
+                    print(f"⚠️ Queue error: {e}")
+        
+        asyncio.create_task(process_new_channels())
+        
         if not api_id or not api_hash:
             print("⚠️ MONITOR_API_ID/HASH not set. Channel monitoring disabled.")
+            # Keep running to process queue
+            while True:
+                await asyncio.sleep(60)
             return
         
         from telethon.sessions import StringSession
@@ -2855,7 +2954,7 @@ def run_monitor_in_thread():
         
         monitor_client = client
         
-        # Restore channels
+        # Restore channels (in THIS event loop)
         try:
             channels = db.get_all_active_channels()
             print(f"📋 Restoring {len(channels)} channels...")
@@ -3004,7 +3103,7 @@ def main():
     
     db.initialize()
     
-    global channel_queue, application
+    global channel_queue, application, monitor_channel_queue
     channel_queue = asyncio.Queue()
     
     import threading
@@ -3022,6 +3121,7 @@ def main():
     monitor_thread.start()
     
     time.sleep(3)
+    
     # ADD DEBUG HANDLER HERE
     application.add_handler(CommandHandler('debug', debug_wallet))
     # Add handlers
@@ -3031,17 +3131,55 @@ def main():
         entry_points=[CommandHandler('start', start)],
         states={
             SELECTING_ACTION: [CallbackQueryHandler(button_handler)],
-            ENTER_CHANNEL_USERNAME: [CallbackQueryHandler(button_handler),MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_input)],
-            ENTER_TOKEN_ADDRESS: [CallbackQueryHandler(button_handler),MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_input)],
-            ENTER_BUY_AMOUNT: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
-            ENTER_SLIPPAGE: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
-            ENTER_PROFIT_PERCENT: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
-            ENTER_TARGET_MC: [CallbackQueryHandler(button_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)],
-            ENTER_TRANSFER_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_input)],
-            ENTER_WITHDRAW_DETAILS: [CallbackQueryHandler(button_handler),MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_input)],
+            ENTER_CHANNEL_USERNAME: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_input)
+            ],
+            ENTER_TOKEN_ADDRESS: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_input)
+            ],
+            ENTER_BUY_AMOUNT: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)
+            ],
+            ENTER_SLIPPAGE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)
+            ],
+            ENTER_PROFIT_PERCENT: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)
+            ],
+            ENTER_TARGET_MC: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)
+            ],
+            ENTER_TRANSFER_DETAILS: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_input)
+            ],
+            ENTER_WITHDRAW_DETAILS: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_input)
+            ],
             CONFIRM_BUY: [CallbackQueryHandler(button_handler)],
-            ENTER_CHANNEL_BUY_AMOUNT: [CallbackQueryHandler(button_handler),MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_buy_amount)],
-            ENTER_CHANNEL_SLIPPAGE: [CallbackQueryHandler(button_handler),MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_slippage)],
+            ENTER_CHANNEL_BUY_AMOUNT: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_buy_amount)
+            ],
+            ENTER_CHANNEL_SLIPPAGE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_slippage)
+            ],
+            ENTER_CHANNEL_TAKE_PROFIT: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_take_profit)
+            ],
+            ENTER_CHANNEL_TARGET_MC: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_target_mc)
+            ],
         },
         fallbacks=[CommandHandler('start', start)],
         per_message=False
