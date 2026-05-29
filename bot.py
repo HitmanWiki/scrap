@@ -1041,10 +1041,36 @@ async def create_new_wallet_flow(query):
 async def show_portfolio_by_channel(query):
     user_id = query.from_user.id
     channels = db.get_user_channels(user_id)
+    trades = db.get_user_trade_history(user_id, limit=100)
     
     text = "📊 *Portfolio by Channel*\n\n"
-    for ch in channels:
-        text += f"📋 `{ch['channel_name']}`\n  Signals: {ch.get('signal_count', 0)}\n\n"
+    
+    if channels:
+        for ch in channels:
+            ch_name = ch['channel_name']
+            ch_trades = [t for t in trades if t.get('channel_name') == ch_name]
+            
+            buys = [t for t in ch_trades if t.get('trade_type') == 'buy']
+            sells = [t for t in ch_trades if t.get('trade_type') in ('sell', 'auto-sell')]
+            
+            text += f"📋 `{ch_name}`\n"
+            text += f"  📈 {len(buys)} buys | 📉 {len(sells)} sells\n"
+            
+            # Calculate PNL for this channel
+            total_pnl = 0
+            for t in sells:
+                pnl = t.get('pnl_sol', 0) or 0
+                total_pnl += pnl
+            
+            emoji = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "⚪"
+            text += f"  💰 PnL: {emoji} ${total_pnl:.4f}\n\n"
+    else:
+        text += "No channels configured\n\n"
+    
+    # Show trades without channel
+    no_ch_trades = [t for t in trades if not t.get('channel_name')]
+    if no_ch_trades:
+        text += f"📋 *Manual Trades*: {len(no_ch_trades)}\n"
     
     keyboard = [[InlineKeyboardButton("« Back", callback_data="portfolio")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -1052,18 +1078,41 @@ async def show_portfolio_by_channel(query):
 
 async def show_portfolio_by_token(query):
     user_id = query.from_user.id
-    positions = db.get_user_positions(user_id)
+    trades = db.get_user_trade_history(user_id, limit=200)
     
     text = "📊 *Portfolio by Token*\n\n"
-    for pos in positions:
-        if pos['amount'] > 0:
-            addr = pos['token_address']
-            price = await solana_service.get_token_price(addr)
-            val = pos['amount'] * price if price else 0
-            text += f"🪙 `{addr[:8]}...` — {pos['amount']:.2f} (${val:.2f})\n"
     
-    if not positions:
-        text += "No active positions\n"
+    # Group by token
+    token_data = {}
+    for t in trades:
+        addr = t.get('token_address', '')
+        if addr not in token_data:
+            token_data[addr] = {'buys': 0, 'sells': 0, 'buy_vol': 0, 'sell_vol': 0, 'pnl': 0}
+        
+        if t.get('trade_type') == 'buy':
+            token_data[addr]['buys'] += 1
+            token_data[addr]['buy_vol'] += t.get('amount', 0)
+        else:
+            token_data[addr]['sells'] += 1
+            token_data[addr]['sell_vol'] += t.get('amount', 0)
+            token_data[addr]['pnl'] += t.get('pnl_sol', 0) or 0
+    
+    if token_data:
+        for addr, data in list(token_data.items())[:15]:
+            emoji = "🟢" if data['pnl'] > 0 else "🔴" if data['pnl'] < 0 else "⚪"
+            text += f"🪙 `{addr[:8]}...{addr[-4:]}`\n"
+            text += f"  {data['buys']} buys, {data['sells']} sells\n"
+            text += f"  PnL: {emoji} ${data['pnl']:.4f}\n\n"
+    else:
+        text += "No trades yet\n\n"
+    
+    # Also show active positions
+    positions = db.get_user_positions(user_id)
+    active = [p for p in positions if p['amount'] > 0]
+    if active:
+        text += "📌 *Active Positions:*\n"
+        for pos in active[:5]:
+            text += f"  `{pos['token_address'][:8]}...` — {pos['amount']:,.2f}\n"
     
     keyboard = [[InlineKeyboardButton("« Back", callback_data="portfolio")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -1145,10 +1194,45 @@ async def show_portfolio_by_wallet(query):
     total_value = 0
     
     for w in wallets:
-        text += f"💼 *{w['wallet_name']}* — `{w.get('public_key', '')[:8]}...`\n"
-        # Get positions for this wallet (you need to add wallet_id to positions table)
-        # For now, show wallet info
+        wallet_num = w.get('wallet_number', 1)
+        wallet_key = derive_wallet_from_user(user_id, wallet_num)
+        wallet_addr = str(wallet_key.pubkey())
+        
+        try:
+            sol_balance = await solana_service.get_balance(wallet_addr)
+        except:
+            sol_balance = 0
+        
+        text += f"💼 *{w['wallet_name']}* — `{wallet_addr[:8]}...{wallet_addr[-4:]}`\n"
+        text += f"  💰 SOL: {sol_balance:.4f}\n"
+        
+        # Get positions for this wallet
+        positions = db.get_user_positions(user_id)
+        wallet_positions = [p for p in positions if p.get('wallet_id') == w['id']]
+        
+        if wallet_positions:
+            wallet_value = 0
+            for pos in wallet_positions[:5]:
+                if pos['amount'] > 0:
+                    price = await solana_service.get_token_price(pos['token_address'])
+                    val = pos['amount'] * price if price else 0
+                    wallet_value += val
+                    text += f"  🪙 `{pos['token_address'][:8]}...` — {pos['amount']:,.2f} (${val:.2f})\n"
+            text += f"  💎 Tokens: ${wallet_value:.2f}\n"
+        else:
+            text += f"  No active positions\n"
+        
+        # Get trade history for this wallet
+        trades = db.get_user_trade_history(user_id, limit=50)
+        wallet_trades = [t for t in trades if t.get('wallet_id') == w['id']]
+        buys = len([t for t in wallet_trades if t.get('trade_type') == 'buy'])
+        sells = len([t for t in wallet_trades if t.get('trade_type') in ('sell', 'auto-sell')])
+        text += f"  📈 Trades: {buys} buys, {sells} sells\n"
+        
+        total_value += sol_balance
         text += "\n"
+    
+    text += f"💎 *Total SOL:* ${total_value:.2f}"
     
     keyboard = [[InlineKeyboardButton("« Back", callback_data="portfolio")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -1278,6 +1362,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         return SELECTING_ACTION
+    elif action.startswith("export_wallet_"):
+        wallet_id = int(action.replace("export_wallet_", ""))
+        return await export_single_wallet(query, wallet_id)
     
     # Channel type
     elif action == "add_public_channel":
@@ -1396,10 +1483,42 @@ async def show_wallet(query):
     return SELECTING_ACTION
 
 async def export_private_key(query):
+    """Show wallet selection for key export"""
     user_id = query.from_user.id
-    wallet = await get_user_wallet(user_id)
+    wallets = db.get_user_wallets(user_id)
+    
+    if not wallets:
+        await query.edit_message_text("❌ No wallets found!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    if len(wallets) == 1:
+        # Only one wallet - export it directly
+        return await export_single_wallet(query, wallets[0]['id'])
+    
+    # Multiple wallets - show selection
+    text = "🔑 *Export Private Key*\n\nSelect wallet:"
+    keyboard = []
+    for w in wallets:
+        addr = w.get('public_key', '')[:8] if w.get('public_key') else 'N/A'
+        keyboard.append([InlineKeyboardButton(f"💼 {w['wallet_name']} ({addr}...)", callback_data=f"export_wallet_{w['id']}")])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="back_main")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+async def export_single_wallet(query, wallet_id):
+    """Export private key for a specific wallet"""
+    user_id = query.from_user.id
+    wallet_data = db.get_wallet(wallet_id)
+    
+    if not wallet_data:
+        await query.edit_message_text("❌ Wallet not found!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    wallet = derive_wallet_from_user(user_id, wallet_data.get('wallet_number', 1))
+    
     if not wallet:
-        await query.edit_message_text("❌ Error!", reply_markup=get_main_keyboard())
+        await query.edit_message_text("❌ Error deriving wallet!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
     keypair_bytes = bytes(wallet)
@@ -1409,6 +1528,8 @@ async def export_private_key(query):
 ╔═══════════════════════════╗
 ║      ⚠️ PRIVATE KEY      ║
 ╚═══════════════════════════╝
+
+*Wallet:* {wallet_data['wallet_name']}
 
 `{private_key}`
 
@@ -1421,7 +1542,7 @@ async def export_private_key(query):
 """
     keyboard = [
         [InlineKeyboardButton("🗑️ Delete", callback_data="delete_message")],
-        [InlineKeyboardButton("« Back", callback_data="back_main")]
+        [InlineKeyboardButton("« Back", callback_data="export_key")]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
