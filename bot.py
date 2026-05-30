@@ -79,6 +79,7 @@ ENTER_CHANNEL_TAKE_PROFIT = 15
 ENTER_CHANNEL_TARGET_MC = 16
 ENTER_CHANNEL_AUTO_SELL = 17
 ENTER_OTP = 18  # Add to conversation states at top
+ENTER_2FA = 19
 # Initialize services
 db = Database()
 solana_service = SolanaService(SOLANA_RPC)
@@ -105,6 +106,8 @@ pinned_messages: Dict[int, int] = {}  # user_id -> message_id
 last_position_update: Dict[int, float] = {}  # user_id -> timestamp
 # At top with other globals
 channel_setup_data: Dict[int, dict] = {}
+# At top with other globals (around line 80-100)
+pending_clients: Dict[int, TelegramClient] = {}
 # ============================================
 # WALLET DERIVATION (No private key storage!)
 # ============================================
@@ -2115,37 +2118,44 @@ async def handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if code.lower() == 'cancel':
-        await update.message.reply_text("Cancelled. Credentials saved.", reply_markup=get_main_keyboard())
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
     client = context.user_data.get('pending_client')
     phone = db.get_user(user_id).get('telegram_phone')
     
     try:
+        from telethon.errors import SessionPasswordNeededError
         await client.sign_in(phone=phone, code=code)
         
-        # Save session string
         session_string = client.session.save()
         db.update_user_settings(user_id, telegram_session_string=session_string)
         
-        # Store in active clients
         active_clients[user_id] = client
         me = await client.get_me()
         
         await update.message.reply_text(
-            f"✅ *Connected as @{me.username}!*\n\nPrivate channel monitoring is now active.",
+            f"✅ *Connected as @{me.username}!*",
             reply_markup=get_main_keyboard(),
             parse_mode='Markdown'
         )
+    except SessionPasswordNeededError:
+        context.user_data['pending_client'] = client
+        await update.message.reply_text(
+            "🔒 *2FA Enabled*\n\nEnter your *2FA password*:",
+            reply_markup=get_back_keyboard(),
+            parse_mode='Markdown'
+        )
+        return ENTER_2FA
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Invalid OTP: {str(e)[:200]}\n\nTry again or use Connect later.",
+            f"❌ Invalid OTP: {str(e)[:200]}",
             reply_markup=get_main_keyboard()
         )
     
     return SELECTING_ACTION
 async def connect_user_session(query):
-    """Connect user's Telegram session for private channels"""
+    global pending_clients  # ADD THIS
     user_id = query.from_user.id
     user = db.get_user(user_id)
     
@@ -2157,6 +2167,7 @@ async def connect_user_session(query):
     
     try:
         from telethon.sessions import StringSession
+        from telethon.errors import SessionPasswordNeededError
         
         session_string = user.get('telegram_session_string', '')
         
@@ -2176,7 +2187,6 @@ async def connect_user_session(query):
         me = await client.get_me()
         active_clients[user_id] = client
         
-        # Start monitoring existing private channels
         channels = db.get_user_channels(user_id)
         private_count = 0
         for ch in channels:
@@ -2187,17 +2197,70 @@ async def connect_user_session(query):
                     private_count += 1
         
         await query.edit_message_text(
-            f"✅ *Connected as @{me.username}!*\n\n"
-            f"📋 {private_count} private channels activated.",
+            f"✅ *Connected as @{me.username}!*\n\n📋 {private_count} private channels activated.",
+            reply_markup=get_main_keyboard(), parse_mode='Markdown'
+        )
+        
+    except SessionPasswordNeededError:
+        pending_clients[user_id] = client  # Use global dict
+        await query.edit_message_text(
+            "🔒 *2FA Enabled*\n\nEnter your *2FA password*:",
+            reply_markup=get_back_keyboard(), parse_mode='Markdown'
+        )
+        return ENTER_2FA
+        
+    except EOFError:
+        try:
+            client = TelegramClient(StringSession(), 
+                                   user['telegram_api_id'], 
+                                   user['telegram_api_hash'])
+            await client.connect()
+            await client.send_code_request(user.get('telegram_phone'))
+            pending_clients[user_id] = client  # Use global dict
+            await query.edit_message_text(
+                "📱 *OTP Sent!*\n\nEnter the verification code:",
+                reply_markup=get_back_keyboard(), parse_mode='Markdown'
+            )
+            return ENTER_OTP
+        except Exception as e:
+            await query.edit_message_text(f"❌ Failed: {str(e)[:200]}", reply_markup=get_main_keyboard())
+            return SELECTING_ACTION
+    
+    except Exception as e:
+        await query.edit_message_text(f"❌ Connection failed: {str(e)[:200]}", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    return SELECTING_ACTION
+async def handle_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if password.lower() == 'cancel':
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    client = context.user_data.get('pending_client')
+    
+    try:
+        await client.sign_in(password=password)
+        
+        session_string = client.session.save()
+        db.update_user_settings(user_id, telegram_session_string=session_string)
+        
+        active_clients[user_id] = client
+        me = await client.get_me()
+        
+        await update.message.reply_text(
+            f"✅ *Connected as @{me.username}!*\n\nPrivate channel monitoring active.",
             reply_markup=get_main_keyboard(),
             parse_mode='Markdown'
         )
-        
     except Exception as e:
-        await query.edit_message_text(
-            f"❌ Connection failed: {str(e)[:200]}\n\nTry Setup Credentials again.",
-            reply_markup=get_main_keyboard()
+        await update.message.reply_text(
+            f"❌ Wrong password: {str(e)[:200]}",
+            reply_markup=get_back_keyboard()
         )
+        return ENTER_2FA
     
     return SELECTING_ACTION
 # ============================================
@@ -3397,6 +3460,10 @@ def main():
             ENTER_CHANNEL_TARGET_MC: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_target_mc)
+            ],
+            ENTER_2FA: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_2fa)
             ],
         },
         fallbacks=[CommandHandler('start', start)],
