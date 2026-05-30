@@ -1422,8 +1422,7 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
     
     if monitor_channel_queue:
         if is_private and user_id in active_clients:
-            # Use user's client for private
-            await monitor_channel_queue.put((user_id, channel_name, active_clients[user_id]))
+            await monitor_channel_queue.put((user_id, channel_name, 'private'))
         else:
             # Use monitor client for public
             await monitor_channel_queue.put(channel_name)
@@ -3300,9 +3299,14 @@ def run_monitor_in_thread():
                 try:
                     item = await new_channel_queue.get()
                     
-                    # Handle both public (string) and private (tuple) channels
                     if isinstance(item, tuple) and len(item) == 3:
-                        user_id, channel_name, user_client = item
+                        user_id, channel_name, channel_type = item
+                        
+                        if channel_type == 'private':
+                            # Get user's client from active_clients
+                            user_client = active_clients.get(user_id)
+                        else:
+                            user_client = None
                     else:
                         channel_name = item
                         user_client = None
@@ -3310,7 +3314,6 @@ def run_monitor_in_thread():
                     if channel_name not in channel_subscribers:
                         channel_subscribers[channel_name] = []
                     
-                    # Pass user_client for private channels, None for public
                     asyncio.create_task(poll_channel_messages(channel_name, user_client))
                     
                     ctype = "🔒 Private" if user_client else "🌐 Public"
@@ -3382,28 +3385,37 @@ def run_monitor_in_thread():
                 if ch['user_id'] not in channel_subscribers[channel_name]:
                     channel_subscribers[channel_name].append(ch['user_id'])
                 
-                # Check if private channel - use user's client
+                # Check if private channel
                 if ch.get('is_private'):
                     user_id = ch['user_id']
-                    user_data = db.get_user(user_id)
-                    if user_data and user_data.get('telegram_session_string'):
-                        from telethon.sessions import StringSession
-                        user_client = TelegramClient(
-                            StringSession(user_data['telegram_session_string']),
-                            user_data['telegram_api_id'],
-                            user_data['telegram_api_hash']
-                        )
-                        try:
-                            await user_client.start()
-                            active_clients[user_id] = user_client
-                            asyncio.create_task(poll_channel_messages(channel_name, user_client))
-                            print(f"🔍 Polling {channel_name} (🔒 Private)")
-                        except Exception as e:
-                            print(f"⚠️ Could not restore private {channel_name}: {e}")
-                            asyncio.create_task(poll_channel_messages(channel_name))
+                    # First check if user is already in active_clients
+                    user_client = active_clients.get(user_id)
+                    
+                    if user_client:
+                        # Already connected - use existing client
+                        asyncio.create_task(poll_channel_messages(channel_name, user_client))
+                        print(f"🔍 Polling {channel_name} (🔒 Private - active)")
                     else:
-                        asyncio.create_task(poll_channel_messages(channel_name))
+                        # Try to restore from saved session
+                        user_data = db.get_user(user_id)
+                        if user_data and user_data.get('telegram_session_string'):
+                            try:
+                                from telethon.sessions import StringSession
+                                user_client = TelegramClient(
+                                    StringSession(user_data['telegram_session_string']),
+                                    user_data['telegram_api_id'],
+                                    user_data['telegram_api_hash']
+                                )
+                                await user_client.start()
+                                active_clients[user_id] = user_client
+                                asyncio.create_task(poll_channel_messages(channel_name, user_client))
+                                print(f"🔍 Polling {channel_name} (🔒 Private - restored)")
+                            except Exception as e:
+                                print(f"⚠️ Could not restore private {channel_name}: {e}")
+                        else:
+                            print(f"⚠️ No session for user {user_id}, skipping {channel_name}")
                 else:
+                    # Public channel - use monitor client
                     asyncio.create_task(poll_channel_messages(channel_name))
                     print(f"🔍 Polling {channel_name} (🌐 Public)")
         except Exception as e:
