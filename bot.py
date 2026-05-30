@@ -645,7 +645,7 @@ def get_settings_keyboard():
 def get_actions_keyboard():
     keyboard = [
         [InlineKeyboardButton("💸 Transfers", callback_data="transfer_menu")],
-        [InlineKeyboardButton("🏦 Withdraw SOL", callback_data="withdraw_sol")],
+        
         [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -2550,8 +2550,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "transfer_token": 
         return await initiate_transfer(query)
     
-    elif action == "withdraw_sol": 
-        return await initiate_withdraw(query)
+    
     
     elif action == "confirm_transfer": 
         return await execute_transfer(query)
@@ -3734,8 +3733,15 @@ async def show_balance(query):
     return SELECTING_ACTION
 
 async def show_actions(query):
-    text = "⚡ *Actions*\n\n💸 *Transfer Token* — Send tokens\n🏦 *Withdraw SOL* — Send SOL"
-    await query.edit_message_text(text, reply_markup=get_actions_keyboard(), parse_mode='Markdown')
+    text = """
+╔═══════════════════════════╗
+║      💸 TRANSFERS        ║
+╚═══════════════════════════╝
+
+Transfer SOL and Tokens between wallets or to external addresses.
+"""
+    keyboard = get_actions_keyboard()
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
     return SELECTING_ACTION
 
 async def back_to_main(query):
