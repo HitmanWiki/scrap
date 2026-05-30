@@ -2248,7 +2248,7 @@ async def connect_user_session(query):
         )
         return SELECTING_ACTION
 async def connect_user_session_qr(query):
-    """Connect via QR code - properly handles 2FA"""
+    """Connect via QR code"""
     global pending_clients
     user_id = query.from_user.id
     user = db.get_user(user_id)
@@ -2269,7 +2269,10 @@ async def connect_user_session_qr(query):
                                user['telegram_api_id'], 
                                user['telegram_api_hash'])
         
-        # Generate QR login
+        # CONNECT FIRST
+        await client.connect()
+        
+        # Now generate QR login
         qr_login = await client.qr_login()
         
         # Store client
@@ -2287,66 +2290,56 @@ async def connect_user_session_qr(query):
         
         await query.message.reply_photo(
             photo=bio,
-            caption=(
-                "📱 *Login via QR Code*\n\n"
-                "1. Open Telegram on your phone\n"
-                "2. Settings → Devices → Scan QR\n"
-                "3. Scan this QR code\n\n"
-                "⚠️ If you have 2FA, you'll be asked for password after scanning"
-            ),
+            caption="📱 *Scan this QR code*\n\nOpen Telegram → Settings → Devices → Scan QR\n\n⚠️ Disable 2FA first if you have it enabled",
             parse_mode='Markdown'
         )
         
         await query.edit_message_text(
-            "📱 *QR Code sent!*\n\nScan it with your phone.\n⏳ Waiting for scan...",
+            "📱 *QR Code sent above!*\n\n⏳ Waiting for scan... (2 min timeout)",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
         
-        # Wait for QR login - but catch 2FA
+        # Wait for QR login
         try:
-            # Use sign_in after QR to trigger proper auth flow
             await asyncio.wait_for(qr_login.wait(), timeout=120)
             
-            # QR scanned - now try to complete login
+            # QR scanned - try to complete auth
             try:
-                # This will raise SessionPasswordNeededError if 2FA is enabled
-                await client.sign_in(password="")  # Empty password triggers 2FA prompt
+                await client.sign_in(password="")
             except SessionPasswordNeededError:
-                # Expected - 2FA is enabled
                 pending_clients[user_id] = {'client': client, 'type': 'qr_2fa'}
                 await query.edit_message_text(
-                    "🔒 *2FA Password Required*\n\n"
-                    "Your account has Two-Factor Authentication enabled.\n"
-                    "Enter your *2FA password* to complete login:",
+                    "🔒 *2FA Required*\n\nEnter your 2FA password:",
                     reply_markup=get_back_keyboard(),
                     parse_mode='Markdown'
                 )
                 return ENTER_2FA
-            except Exception:
-                pass  # No 2FA, continue
+            except:
+                pass
             
-            # If we get here, no 2FA or already authenticated
+            # Success!
             session_string = client.session.save()
             db.update_user_settings(user_id, telegram_session_string=session_string)
             active_clients[user_id] = client
             pending_clients.pop(user_id, None)
             
             me = await client.get_me()
-            await finish_qr_connection(query, user_id, client, me)
+            await query.edit_message_text(
+                f"✅ *Connected as @{me.username}!*",
+                reply_markup=get_main_keyboard(),
+                parse_mode='Markdown'
+            )
             
         except asyncio.TimeoutError:
             pending_clients.pop(user_id, None)
             await client.disconnect()
-            await query.edit_message_text(
-                "⏰ QR login timed out. Try again.",
-                reply_markup=get_main_keyboard()
-            )
+            await query.edit_message_text("⏰ Timed out. Try again.", reply_markup=get_main_keyboard())
             return SELECTING_ACTION
             
     except Exception as e:
         await query.edit_message_text(
-            f"❌ QR login failed: {str(e)[:200]}\n\nTry OTP login instead.",
+            f"❌ QR login failed: {str(e)[:200]}",
             reply_markup=get_main_keyboard()
         )
         return SELECTING_ACTION
