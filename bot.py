@@ -644,15 +644,676 @@ def get_settings_keyboard():
 
 def get_actions_keyboard():
     keyboard = [
-        [InlineKeyboardButton("💸 Transfer Token", callback_data="transfer_token"),
-         InlineKeyboardButton("🏦 Withdraw SOL", callback_data="withdraw_sol")],
+        [InlineKeyboardButton("💸 Transfers", callback_data="transfer_menu")],
+        [InlineKeyboardButton("🏦 Withdraw SOL", callback_data="withdraw_sol")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def get_transfer_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🔄 SOL: Between My Wallets", callback_data="transfer_sol_internal")],
+        [InlineKeyboardButton("📤 SOL: To External", callback_data="transfer_sol_external")],
+        [InlineKeyboardButton("🔄 Token: Between My Wallets", callback_data="transfer_token_internal")],
+        [InlineKeyboardButton("📤 Token: To External", callback_data="transfer_token_external")],
+        [InlineKeyboardButton("« Back", callback_data="actions")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 def get_back_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="back_main")]])
+async def show_transfer_menu(query):
+    text = """
+╔═══════════════════════════╗
+║      💸 TRANSFERS        ║
+╚═══════════════════════════╝
 
+Select transfer type:
+"""
+    await query.edit_message_text(text, reply_markup=get_transfer_menu_keyboard(), parse_mode='Markdown')
+    return SELECTING_ACTION
+async def transfer_sol_internal(query):
+    """Transfer SOL between user's own wallets"""
+    user_id = query.from_user.id
+    wallets = db.get_user_wallets(user_id)
+    
+    if len(wallets) < 2:
+        await query.edit_message_text("❌ Need 2+ wallets.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    text = "🔄 *SOL Transfer: Select Source Wallet*\n\n"
+    keyboard = []
+    for w in wallets:
+        wallet_key = derive_wallet_from_user(user_id, w['wallet_number'])
+        try:
+            bal = await solana_service.get_balance(str(wallet_key.pubkey()))
+        except:
+            bal = 0
+        text += f"💼 {w['wallet_name']}: {bal:.4f} SOL\n"
+        keyboard.append([InlineKeyboardButton(
+            f"From: {w['wallet_name']} ({bal:.4f} SOL)",
+            callback_data=f"sol_int_from_{w['id']}"
+        )])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="transfer_menu")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+async def sol_internal_select_to(query, from_wallet_id):
+    """Select destination wallet for SOL transfer"""
+    user_id = query.from_user.id
+    wallets = db.get_user_wallets(user_id)
+    from_wallet = db.get_wallet(from_wallet_id)
+    
+    pending_transfers[user_id] = {'type': 'sol_internal', 'from_wallet_id': from_wallet_id}
+    
+    text = f"🔄 *SOL Transfer*\nFrom: {from_wallet['wallet_name']}\n\nSelect destination:"
+    keyboard = []
+    for w in wallets:
+        if w['id'] != from_wallet_id:
+            keyboard.append([InlineKeyboardButton(
+                f"To: {w['wallet_name']}",
+                callback_data=f"sol_int_to_{w['id']}"
+            )])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="transfer_sol_internal")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+async def sol_internal_amount(query, to_wallet_id):
+    """Ask for SOL amount"""
+    user_id = query.from_user.id
+    from_wallet_id = pending_transfers[user_id].get('from_wallet_id')
+    pending_transfers[user_id]['to_wallet_id'] = to_wallet_id
+    
+    from_wallet = db.get_wallet(from_wallet_id)
+    to_wallet = db.get_wallet(to_wallet_id)
+    from_key = derive_wallet_from_user(user_id, from_wallet['wallet_number'])
+    balance = await solana_service.get_balance(str(from_key.pubkey()))
+    
+    text = f"""
+🔄 *SOL Transfer*
+
+From: *{from_wallet['wallet_name']}*
+To: *{to_wallet['wallet_name']}*
+Available: {balance:.4f} SOL
+
+Enter amount (or *all*):
+"""
+    await query.edit_message_text(text, reply_markup=get_back_keyboard(), parse_mode='Markdown')
+    return ENTER_TRANSFER_DETAILS
+async def transfer_sol_external(query):
+    """Send SOL to external address - select source wallet first"""
+    user_id = query.from_user.id
+    wallets = db.get_user_wallets(user_id)
+    
+    text = "📤 *SOL: Send to External*\n\nSelect source wallet:\n"
+    keyboard = []
+    for w in wallets:
+        wallet_key = derive_wallet_from_user(user_id, w['wallet_number'])
+        try:
+            bal = await solana_service.get_balance(str(wallet_key.pubkey()))
+        except:
+            bal = 0
+        text += f"💼 {w['wallet_name']}: {bal:.4f} SOL\n"
+        keyboard.append([InlineKeyboardButton(
+            f"From: {w['wallet_name']} ({bal:.4f} SOL)",
+            callback_data=f"sol_ext_from_{w['id']}"
+        )])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="transfer_menu")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+async def sol_external_address(query, from_wallet_id):
+    """Ask for recipient address"""
+    user_id = query.from_user.id
+    pending_transfers[user_id] = {'type': 'sol_external', 'from_wallet_id': from_wallet_id}
+    
+    await query.edit_message_text(
+        "📤 *SOL: Send to External*\n\nEnter recipient SOL address:",
+        reply_markup=get_back_keyboard(),
+        parse_mode='Markdown'
+    )
+    return ENTER_WITHDRAW_DETAILS
+async def transfer_token_internal(query):
+    """Transfer tokens between own wallets"""
+    user_id = query.from_user.id
+    wallets = db.get_user_wallets(user_id)
+    
+    if len(wallets) < 2:
+        await query.edit_message_text("❌ Need 2+ wallets.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    # Get all tokens across all wallets
+    all_tokens = {}
+    for w in wallets:
+        wallet_key = derive_wallet_from_user(user_id, w['wallet_number'])
+        positions = db.get_user_positions(user_id)
+        for pos in positions:
+            if pos['amount'] > 0:
+                token_addr = pos['token_address']
+                try:
+                    mint_pubkey = Pubkey.from_string(token_addr)
+                    ata = get_associated_token_address(wallet_key.pubkey(), mint_pubkey)
+                    balance = sniper_service.client.get_token_balance(str(ata))
+                    if balance > 0:
+                        if token_addr not in all_tokens:
+                            all_tokens[token_addr] = {'symbol': await get_token_symbol(token_addr), 'wallets': {}}
+                        all_tokens[token_addr]['wallets'][w['id']] = {
+                            'name': w['wallet_name'], 'balance': balance, 'wallet_number': w['wallet_number']
+                        }
+                except:
+                    pass
+    
+    if not all_tokens:
+        await query.edit_message_text("❌ No tokens found.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    text = "🔄 *Token Transfer*\n\nSelect token:\n"
+    keyboard = []
+    for token_addr, data in all_tokens.items():
+        text += f"\n🔹 *{data['symbol']}*"
+        for wid, wdata in data['wallets'].items():
+            text += f"\n   {wdata['name']}: {wdata['balance']:,.2f}"
+        text += "\n"
+        keyboard.append([InlineKeyboardButton(
+            f"Transfer {data['symbol']}",
+            callback_data=f"tok_int_{token_addr}"
+        )])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="transfer_menu")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+async def token_internal_select_from(query, token_addr):
+    """Select source wallet for token"""
+    user_id = query.from_user.id
+    wallets = db.get_user_wallets(user_id)
+    symbol = await get_token_symbol(token_addr)
+    
+    token_wallets = {}
+    for w in wallets:
+        wallet_key = derive_wallet_from_user(user_id, w['wallet_number'])
+        try:
+            mint_pubkey = Pubkey.from_string(token_addr)
+            ata = get_associated_token_address(wallet_key.pubkey(), mint_pubkey)
+            balance = sniper_service.client.get_token_balance(str(ata))
+            if balance > 0:
+                token_wallets[w['id']] = {'name': w['wallet_name'], 'balance': balance}
+        except:
+            pass
+    
+    pending_transfers[user_id] = {'type': 'token_internal', 'token_addr': token_addr, 'symbol': symbol}
+    
+    text = f"🔄 *Transfer {symbol}*\n\nSelect source wallet:\n"
+    keyboard = []
+    for wid, data in token_wallets.items():
+        keyboard.append([InlineKeyboardButton(
+            f"From: {data['name']} ({data['balance']:,.2f})",
+            callback_data=f"tok_int_from_{wid}"
+        )])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="transfer_token_internal")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+async def transfer_token_external(query):
+    """Send tokens to external address"""
+    user_id = query.from_user.id
+    wallets = db.get_user_wallets(user_id)
+    
+    # Get all tokens
+    all_tokens = {}
+    for w in wallets:
+        wallet_key = derive_wallet_from_user(user_id, w['wallet_number'])
+        positions = db.get_user_positions(user_id)
+        for pos in positions:
+            if pos['amount'] > 0:
+                token_addr = pos['token_address']
+                try:
+                    mint_pubkey = Pubkey.from_string(token_addr)
+                    ata = get_associated_token_address(wallet_key.pubkey(), mint_pubkey)
+                    balance = sniper_service.client.get_token_balance(str(ata))
+                    if balance > 0:
+                        if token_addr not in all_tokens:
+                            all_tokens[token_addr] = {'symbol': await get_token_symbol(token_addr), 'wallets': {}}
+                        all_tokens[token_addr]['wallets'][w['id']] = {
+                            'name': w['wallet_name'], 'balance': balance
+                        }
+                except:
+                    pass
+    
+    if not all_tokens:
+        await query.edit_message_text("❌ No tokens found.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    text = "📤 *Token: Send to External*\n\nSelect token and source wallet:\n"
+    keyboard = []
+    for token_addr, data in all_tokens.items():
+        for wid, wdata in data['wallets'].items():
+            keyboard.append([InlineKeyboardButton(
+                f"{data['symbol']} from {wdata['name']} ({wdata['balance']:,.2f})",
+                callback_data=f"tok_ext_{token_addr}_{wid}"
+            )])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="transfer_menu")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+async def token_external_address(query, token_addr, from_wallet_id):
+    """Ask for recipient address"""
+    user_id = query.from_user.id
+    symbol = await get_token_symbol(token_addr)
+    
+    pending_transfers[user_id] = {
+        'type': 'token_external',
+        'token_addr': token_addr,
+        'from_wallet_id': int(from_wallet_id),
+        'symbol': symbol
+    }
+    
+    await query.edit_message_text(
+        f"📤 *Send {symbol}*\n\nEnter recipient SOL address:",
+        reply_markup=get_back_keyboard(),
+        parse_mode='Markdown'
+    )
+    return ENTER_WITHDRAW_DETAILS
+async def execute_transfer_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle amount input for all transfer types"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if text.lower() == 'cancel':
+        pending_transfers.pop(user_id, None)
+        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    transfer_data = pending_transfers.get(user_id, {})
+    transfer_type = transfer_data.get('type', '')
+    
+    if transfer_type == 'sol_internal':
+        return await execute_sol_internal(update, user_id, text, transfer_data)
+    elif transfer_type == 'sol_external':
+        return await execute_sol_external(update, user_id, text, transfer_data)
+    elif transfer_type == 'token_internal':
+        return await execute_token_internal(update, user_id, text, transfer_data)
+    elif transfer_type == 'token_external':
+        return await execute_token_external(update, user_id, text, transfer_data)
+    
+    return SELECTING_ACTION
+# ============================================
+# TRANSFER EXECUTION FUNCTIONS
+# ============================================
+
+async def execute_sol_internal(update: Update, user_id: int, amount_text: str, transfer_data: dict):
+    """Execute SOL transfer between own wallets"""
+    from_wallet_id = transfer_data.get('from_wallet_id')
+    to_wallet_id = transfer_data.get('to_wallet_id')
+    
+    from_wallet = db.get_wallet(from_wallet_id)
+    to_wallet = db.get_wallet(to_wallet_id)
+    
+    from_key = derive_wallet_from_user(user_id, from_wallet['wallet_number'])
+    to_pubkey = Pubkey.from_string(to_wallet['public_key'])
+    
+    balance = await solana_service.get_balance(str(from_key.pubkey()))
+    
+    amount = balance - 0.0001 if amount_text.lower() == 'all' else float(amount_text)
+    
+    if amount <= 0 or amount > balance - 0.0001:
+        await update.message.reply_text("❌ Invalid amount!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    await update.message.reply_text(f"⏳ *Transferring {amount:.4f} SOL...*", parse_mode='Markdown')
+    
+    try:
+        from solders.system_program import transfer, TransferParams
+        from solders.message import MessageV0
+        from solders.hash import Hash
+        from solders.transaction import VersionedTransaction
+        import base64
+        
+        rpc_resp = sniper_service._rpc_call("getLatestBlockhash", [{"commitment": "processed"}])
+        blockhash_str = rpc_resp['result']['value']['blockhash']
+        blockhash = Hash.from_string(blockhash_str)
+        
+        transfer_ix = transfer(TransferParams(
+            from_pubkey=from_key.pubkey(),
+            to_pubkey=to_pubkey,
+            lamports=int(amount * 10**9)
+        ))
+        
+        msg = MessageV0.try_compile(
+            payer=from_key.pubkey(),
+            instructions=[transfer_ix],
+            address_lookup_table_accounts=[],
+            recent_blockhash=blockhash,
+        )
+        
+        tx = VersionedTransaction(msg, [from_key])
+        tx_base64 = base64.b64encode(bytes(tx)).decode()
+        
+        result = sniper_service._rpc_call("sendTransaction", [
+            tx_base64, {"encoding": "base64", "skipPreflight": True}
+        ])
+        
+        if 'result' in result:
+            txid = result['result']
+            await update.message.reply_text(
+                f"✅ *Transfer Complete!*\n\n"
+                f"From: {from_wallet['wallet_name']}\nTo: {to_wallet['wallet_name']}\n"
+                f"Amount: {amount:.4f} SOL\n"
+                f"TX: [{txid[:20]}...](https://solscan.io/tx/{txid})",
+                reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True
+            )
+        else:
+            await update.message.reply_text(f"❌ Failed: {result.get('error')}", reply_markup=get_main_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}", reply_markup=get_main_keyboard())
+    
+    pending_transfers.pop(user_id, None)
+    return SELECTING_ACTION
+
+
+async def execute_sol_external(update: Update, user_id: int, amount_text: str, transfer_data: dict):
+    """Execute SOL transfer to external address"""
+    from_wallet_id = transfer_data.get('from_wallet_id')
+    recipient = transfer_data.get('recipient')
+    
+    if not recipient or not is_valid_solana_address(recipient):
+        await update.message.reply_text("❌ Invalid recipient address!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    from_wallet = db.get_wallet(from_wallet_id)
+    from_key = derive_wallet_from_user(user_id, from_wallet['wallet_number'])
+    to_pubkey = Pubkey.from_string(recipient)
+    
+    balance = await solana_service.get_balance(str(from_key.pubkey()))
+    
+    amount = balance - 0.0001 if amount_text.lower() == 'all' else float(amount_text)
+    
+    if amount <= 0 or amount > balance - 0.0001:
+        await update.message.reply_text("❌ Invalid amount!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    await update.message.reply_text(f"⏳ *Sending {amount:.4f} SOL...*", parse_mode='Markdown')
+    
+    try:
+        from solders.system_program import transfer, TransferParams
+        from solders.message import MessageV0
+        from solders.hash import Hash
+        from solders.transaction import VersionedTransaction
+        import base64
+        
+        rpc_resp = sniper_service._rpc_call("getLatestBlockhash", [{"commitment": "processed"}])
+        blockhash_str = rpc_resp['result']['value']['blockhash']
+        blockhash = Hash.from_string(blockhash_str)
+        
+        transfer_ix = transfer(TransferParams(
+            from_pubkey=from_key.pubkey(),
+            to_pubkey=to_pubkey,
+            lamports=int(amount * 10**9)
+        ))
+        
+        msg = MessageV0.try_compile(
+            payer=from_key.pubkey(),
+            instructions=[transfer_ix],
+            address_lookup_table_accounts=[],
+            recent_blockhash=blockhash,
+        )
+        
+        tx = VersionedTransaction(msg, [from_key])
+        tx_base64 = base64.b64encode(bytes(tx)).decode()
+        
+        result = sniper_service._rpc_call("sendTransaction", [
+            tx_base64, {"encoding": "base64", "skipPreflight": True}
+        ])
+        
+        if 'result' in result:
+            txid = result['result']
+            await update.message.reply_text(
+                f"✅ *Sent!*\n\n{amount:.4f} SOL to `{recipient[:8]}...`\n"
+                f"TX: [{txid[:20]}...](https://solscan.io/tx/{txid})",
+                reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True
+            )
+        else:
+            await update.message.reply_text(f"❌ Failed: {result.get('error')}", reply_markup=get_main_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}", reply_markup=get_main_keyboard())
+    
+    pending_transfers.pop(user_id, None)
+    return SELECTING_ACTION
+
+
+async def execute_token_internal(update: Update, user_id: int, amount_text: str, transfer_data: dict):
+    """Execute token transfer between own wallets"""
+    from_wallet_id = transfer_data.get('from_wallet_id')
+    to_wallet_id = transfer_data.get('to_wallet_id')
+    token_addr = transfer_data.get('token_addr')
+    symbol = transfer_data.get('symbol', 'token')
+    
+    from_wallet = db.get_wallet(from_wallet_id)
+    to_wallet = db.get_wallet(to_wallet_id)
+    
+    from_key = derive_wallet_from_user(user_id, from_wallet['wallet_number'])
+    to_key = derive_wallet_from_user(user_id, to_wallet['wallet_number'])
+    
+    mint_pubkey = Pubkey.from_string(token_addr)
+    from_ata = get_associated_token_address(from_key.pubkey(), mint_pubkey)
+    to_ata = get_associated_token_address(to_key.pubkey(), mint_pubkey)
+    
+    balance = sniper_service.client.get_token_balance(str(from_ata))
+    decimals = await sniper_service.get_token_decimals(token_addr)
+    
+    amount = balance if amount_text.lower() == 'all' else float(amount_text)
+    
+    if amount <= 0 or amount > balance:
+        await update.message.reply_text("❌ Invalid amount!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    await update.message.reply_text(f"⏳ *Transferring {amount:,.2f} {symbol}...*", parse_mode='Markdown')
+    
+    try:
+        from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+        from solders.message import MessageV0
+        from solders.hash import Hash
+        from solders.transaction import VersionedTransaction
+        from spl.token.instructions import transfer_checked, TransferCheckedParams
+        import base64
+        
+        TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        
+        transfer_ix = transfer_checked(TransferCheckedParams(
+            program_id=TOKEN_PROGRAM,
+            source=from_ata,
+            mint=mint_pubkey,
+            dest=to_ata,
+            owner=from_key.pubkey(),
+            amount=int(amount * 10**decimals),
+            decimals=decimals
+        ))
+        
+        rpc_resp = sniper_service._rpc_call("getLatestBlockhash", [{"commitment": "processed"}])
+        blockhash_str = rpc_resp['result']['value']['blockhash']
+        blockhash = Hash.from_string(blockhash_str)
+        
+        instructions = [
+            set_compute_unit_limit(200000),
+            set_compute_unit_price(10000),
+            transfer_ix,
+        ]
+        
+        msg = MessageV0.try_compile(
+            payer=from_key.pubkey(),
+            instructions=instructions,
+            address_lookup_table_accounts=[],
+            recent_blockhash=blockhash,
+        )
+        
+        tx = VersionedTransaction(msg, [from_key])
+        tx_base64 = base64.b64encode(bytes(tx)).decode()
+        
+        result = sniper_service._rpc_call("sendTransaction", [
+            tx_base64, {"encoding": "base64", "skipPreflight": True}
+        ])
+        
+        if 'result' in result:
+            txid = result['result']
+            await update.message.reply_text(
+                f"✅ *Transfer Complete!*\n\n"
+                f"{symbol}: {amount:,.2f}\n"
+                f"From: {from_wallet['wallet_name']}\nTo: {to_wallet['wallet_name']}\n"
+                f"TX: [{txid[:20]}...](https://solscan.io/tx/{txid})",
+                reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True
+            )
+        else:
+            await update.message.reply_text(f"❌ Failed: {result.get('error')}", reply_markup=get_main_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}", reply_markup=get_main_keyboard())
+    
+    pending_transfers.pop(user_id, None)
+    return SELECTING_ACTION
+
+
+async def execute_token_external(update: Update, user_id: int, amount_text: str, transfer_data: dict):
+    """Execute token transfer to external address"""
+    from_wallet_id = transfer_data.get('from_wallet_id')
+    token_addr = transfer_data.get('token_addr')
+    symbol = transfer_data.get('symbol', 'token')
+    recipient = transfer_data.get('recipient')
+    
+    if not recipient or not is_valid_solana_address(recipient):
+        await update.message.reply_text("❌ Invalid recipient address!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    from_wallet = db.get_wallet(from_wallet_id)
+    from_key = derive_wallet_from_user(user_id, from_wallet['wallet_number'])
+    to_pubkey = Pubkey.from_string(recipient)
+    
+    mint_pubkey = Pubkey.from_string(token_addr)
+    from_ata = get_associated_token_address(from_key.pubkey(), mint_pubkey)
+    to_ata = get_associated_token_address(to_pubkey, mint_pubkey)
+    
+    balance = sniper_service.client.get_token_balance(str(from_ata))
+    decimals = await sniper_service.get_token_decimals(token_addr)
+    
+    amount = balance if amount_text.lower() == 'all' else float(amount_text)
+    
+    if amount <= 0 or amount > balance:
+        await update.message.reply_text("❌ Invalid amount!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    await update.message.reply_text(f"⏳ *Sending {amount:,.2f} {symbol}...*", parse_mode='Markdown')
+    
+    try:
+        from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+        from solders.message import MessageV0
+        from solders.hash import Hash
+        from solders.transaction import VersionedTransaction
+        from spl.token.instructions import transfer_checked, TransferCheckedParams
+        import base64
+        
+        TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        
+        transfer_ix = transfer_checked(TransferCheckedParams(
+            program_id=TOKEN_PROGRAM,
+            source=from_ata,
+            mint=mint_pubkey,
+            dest=to_ata,
+            owner=from_key.pubkey(),
+            amount=int(amount * 10**decimals),
+            decimals=decimals
+        ))
+        
+        rpc_resp = sniper_service._rpc_call("getLatestBlockhash", [{"commitment": "processed"}])
+        blockhash_str = rpc_resp['result']['value']['blockhash']
+        blockhash = Hash.from_string(blockhash_str)
+        
+        instructions = [
+            set_compute_unit_limit(200000),
+            set_compute_unit_price(10000),
+            transfer_ix,
+        ]
+        
+        msg = MessageV0.try_compile(
+            payer=from_key.pubkey(),
+            instructions=instructions,
+            address_lookup_table_accounts=[],
+            recent_blockhash=blockhash,
+        )
+        
+        tx = VersionedTransaction(msg, [from_key])
+        tx_base64 = base64.b64encode(bytes(tx)).decode()
+        
+        result = sniper_service._rpc_call("sendTransaction", [
+            tx_base64, {"encoding": "base64", "skipPreflight": True}
+        ])
+        
+        if 'result' in result:
+            txid = result['result']
+            await update.message.reply_text(
+                f"✅ *Sent!*\n\n{symbol}: {amount:,.2f} to `{recipient[:8]}...`\n"
+                f"TX: [{txid[:20]}...](https://solscan.io/tx/{txid})",
+                reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True
+            )
+        else:
+            await update.message.reply_text(f"❌ Failed: {result.get('error')}", reply_markup=get_main_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}", reply_markup=get_main_keyboard())
+    
+    pending_transfers.pop(user_id, None)
+    return SELECTING_ACTION
+async def token_internal_select_to(query, from_wallet_id):
+    """Select destination wallet for token transfer"""
+    user_id = query.from_user.id
+    wallets = db.get_user_wallets(user_id)
+    from_wallet = db.get_wallet(from_wallet_id)
+    
+    transfer_data = pending_transfers.get(user_id, {})
+    transfer_data['from_wallet_id'] = from_wallet_id
+    pending_transfers[user_id] = transfer_data
+    
+    symbol = transfer_data.get('symbol', 'token')
+    
+    text = f"🔄 *Transfer {symbol}*\nFrom: {from_wallet['wallet_name']}\n\nSelect destination:"
+    keyboard = []
+    for w in wallets:
+        if w['id'] != from_wallet_id:
+            keyboard.append([InlineKeyboardButton(
+                f"To: {w['wallet_name']}",
+                callback_data=f"tok_int_to_{w['id']}"
+            )])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="transfer_token_internal")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+
+async def token_internal_amount(query, to_wallet_id):
+    """Ask for amount"""
+    user_id = query.from_user.id
+    pending_transfers[user_id]['to_wallet_id'] = to_wallet_id
+    
+    transfer_data = pending_transfers[user_id]
+    from_wallet = db.get_wallet(transfer_data['from_wallet_id'])
+    to_wallet = db.get_wallet(to_wallet_id)
+    symbol = transfer_data.get('symbol', 'token')
+    
+    from_key = derive_wallet_from_user(user_id, from_wallet['wallet_number'])
+    mint_pubkey = Pubkey.from_string(transfer_data['token_addr'])
+    ata = get_associated_token_address(from_key.pubkey(), mint_pubkey)
+    balance = sniper_service.client.get_token_balance(str(ata))
+    
+    text = f"""
+🔄 *Transfer {symbol}*
+
+From: *{from_wallet['wallet_name']}*
+To: *{to_wallet['wallet_name']}*
+Available: {balance:,.2f}
+
+Enter amount (or *all*):
+"""
+    await query.edit_message_text(text, reply_markup=get_back_keyboard(), parse_mode='Markdown')
+    return ENTER_TRANSFER_DETAILS
 # ============================================
 # CHANNEL MONITORING (CORE SNIPING LOGIC)
 # ============================================
@@ -1712,6 +2373,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "portfolio_stats": return await show_portfolio_stats(query)
     elif action == "connect_user_session":return await connect_user_session(query)
     elif action == "connect_qr":return await connect_user_session_qr(query)
+    elif action == "transfer_menu": return await show_transfer_menu(query)
+    elif action == "transfer_sol_internal": return await transfer_sol_internal(query)
+    elif action == "transfer_sol_external": return await transfer_sol_external(query)
+    elif action == "transfer_token_internal": return await transfer_token_internal(query)
+    elif action == "transfer_token_external": return await transfer_token_external(query)
+
     
     # Settings
     elif action == "set_buy_amount":
@@ -1891,11 +2558,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == "confirm_withdraw": 
         return await execute_withdraw(query)
+    elif action.startswith("tok_int_to_"):
+     return await token_internal_amount(query, int(action.replace("tok_int_to_", "")))
     
     elif action.startswith("transfer_select_"):
         token_address = action.replace("transfer_select_", "")
         return await handle_transfer_select(query, token_address)
-    
+    elif action.startswith("sol_int_from_"):
+        return await sol_internal_select_to(query, int(action.replace("sol_int_from_", "")))
+    elif action.startswith("sol_int_to_"):
+        return await sol_internal_amount(query, int(action.replace("sol_int_to_", "")))
+    elif action.startswith("sol_ext_from_"):
+        return await sol_external_address(query, int(action.replace("sol_ext_from_", "")))
+    elif action.startswith("tok_int_"):
+        return await token_internal_select_from(query, action.replace("tok_int_", ""))
+    elif action.startswith("tok_int_from_"):
+        return await token_internal_select_to(query, int(action.replace("tok_int_from_", "")))
+    elif action.startswith("tok_ext_"):
+        parts = action.replace("tok_ext_", "").split("_")
+        token_addr = "_".join(parts[:-1])
+        from_wallet_id = parts[-1]
+        return await token_external_address(query, token_addr, from_wallet_id)
     return SELECTING_ACTION
 
 # ============================================
@@ -3691,6 +4374,10 @@ def main():
             ENTER_2FA: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_2fa)
+            ],
+            ENTER_TRANSFER_DETAILS: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, execute_transfer_final)
             ],
         },
         fallbacks=[CommandHandler('start', start)],
