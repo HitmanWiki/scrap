@@ -1761,7 +1761,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action.startswith("export_wallet_"):
         wallet_id = int(action.replace("export_wallet_", ""))
         return await export_single_wallet(query, wallet_id)
-    
+    elif action == "start_auth":
+        await query.edit_message_text(
+            "🔐 *Step 1/3*\n\nEnter your *API ID* (from my.telegram.org):\n\nType *cancel* to abort.",
+            reply_markup=get_back_keyboard(),
+            parse_mode='Markdown'
+        )
+        return ENTER_API_ID
+
+    elif action == "connect_session":
+        return await connect_user_session(query)
     # Channel type
     elif action == "add_public_channel":
         context.user_data['channel_type'] = 'public'
@@ -3314,7 +3323,7 @@ def main():
     time.sleep(3)
     
     application.add_handler(CommandHandler('debug', debug_wallet))
-    application.add_handler(CallbackQueryHandler(start_auth_process, pattern="^start_auth$"))
+    # application.add_handler(CallbackQueryHandler(start_auth_process, pattern="^start_auth$"))
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
