@@ -1267,16 +1267,16 @@ async def handle_channel_wallet_selection(query, wallet_id):
     """After selecting wallet for channel, ask for buy amount"""
     user_id = query.from_user.id
     wallet = db.get_wallet(wallet_id)
-    channel_name = query.message.text.split('`')[1] if '`' in query.message.text else 'channel'
     
-    # Store in context (using query's message for persistence)
-    # We'll use a global dict for simplicity
-    global channel_setup_data
-    if 'channel_setup_data' not in globals():
-        channel_setup_data = {}
+    # Get channel name from channel_setup_data (set by handle_channel_input)
+    setup = channel_setup_data.get(user_id, {})
+    channel_name = setup.get('channel_name', 'channel')
+    
+    # Update with wallet_id
     channel_setup_data[user_id] = {
         'channel_name': channel_name,
-        'wallet_id': wallet_id
+        'wallet_id': wallet_id,
+        'is_private': setup.get('is_private', False)
     }
     
     await query.edit_message_text(
