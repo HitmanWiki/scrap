@@ -2248,7 +2248,7 @@ async def connect_user_session(query):
         )
         return SELECTING_ACTION
 async def connect_user_session_qr(query):
-    """Connect via QR code - generates actual QR image"""
+    """Connect via QR code - handles 2FA"""
     global pending_clients
     user_id = query.from_user.id
     user = db.get_user(user_id)
@@ -2261,6 +2261,7 @@ async def connect_user_session_qr(query):
     
     try:
         from telethon.sessions import StringSession
+        from telethon.errors import SessionPasswordNeededError
         import qrcode
         import io
         
@@ -2273,7 +2274,7 @@ async def connect_user_session_qr(query):
         qr_login = await client.qr_login()
         
         # Store client
-        pending_clients[user_id] = {'client': client, 'qr': qr_login}
+        pending_clients[user_id] = {'client': client, 'qr': qr_login, 'type': 'qr'}
         
         # Generate QR code image
         qr = qrcode.QRCode(version=1, box_size=10, border=4)
@@ -2281,67 +2282,62 @@ async def connect_user_session_qr(query):
         qr.make(fit=True)
         img = qr.make_image(fill_color="black", back_color="white")
         
-        # Convert to bytes
         bio = io.BytesIO()
         img.save(bio, format='PNG')
         bio.seek(0)
         
-        # Send QR code image
         await query.message.reply_photo(
             photo=bio,
             caption=(
                 "📱 *Login via QR Code*\n\n"
                 "1. Open Telegram on your phone\n"
-                "2. Go to Settings → Devices → Scan QR\n"
+                "2. Settings → Devices → Scan QR\n"
                 "3. Scan this QR code\n\n"
-                "⏳ Waiting for approval... (2 min)"
+                "⏳ Waiting for approval..."
             ),
             parse_mode='Markdown'
         )
         
-        # Edit original message
         await query.edit_message_text(
-            "📱 *QR Code sent above!*\n\n"
-            "Scan it with your phone's Telegram app.\n"
-            "Settings → Devices → Scan QR\n\n"
-            "⏳ Waiting for approval...",
+            "📱 *QR Code sent above!*\n\nScan it with your phone.\n⏳ Waiting...",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
         
-        # Wait for QR login
+        # Wait for QR login with timeout
         try:
             await asyncio.wait_for(qr_login.wait(), timeout=120)
             
-            session_string = client.session.save()
-            db.update_user_settings(user_id, telegram_session_string=session_string)
-            active_clients[user_id] = client
-            pending_clients.pop(user_id, None)
-            
-            me = await client.get_me()
-            
-            # Start private channels
-            channels = db.get_user_channels(user_id)
-            private_count = 0
-            for ch in channels:
-                if ch.get('is_private'):
-                    global monitor_channel_queue
-                    if monitor_channel_queue:
-                        await monitor_channel_queue.put((user_id, ch['channel_name'], client))
-                        private_count += 1
-            
-            await query.edit_message_text(
-                f"✅ *Connected as @{me.username}!*\n\n"
-                f"📋 {private_count} private channels activated.",
-                reply_markup=get_main_keyboard(),
-                parse_mode='Markdown'
-            )
-            
+            # QR scan successful! Now check if 2FA is needed
+            try:
+                # Try to get me - this triggers 2FA if needed
+                me = await client.get_me()
+                
+                # No 2FA - success!
+                session_string = client.session.save()
+                db.update_user_settings(user_id, telegram_session_string=session_string)
+                active_clients[user_id] = client
+                pending_clients.pop(user_id, None)
+                
+                await finish_qr_connection(query, user_id, client, me)
+                
+            except SessionPasswordNeededError:
+                # 2FA is enabled - ask for password
+                pending_clients[user_id] = {'client': client, 'type': 'qr_2fa'}
+                await query.edit_message_text(
+                    "🔒 *2FA Password Required*\n\n"
+                    "Your account has Two-Factor Authentication.\n"
+                    "Enter your *2FA password*:",
+                    reply_markup=get_back_keyboard(),
+                    parse_mode='Markdown'
+                )
+                return ENTER_2FA
+                
         except asyncio.TimeoutError:
             pending_clients.pop(user_id, None)
             await client.disconnect()
             await query.edit_message_text(
-                "⏰ QR login timed out. Try again.",
+                "⏰ QR login timed out. Please try again.",
                 reply_markup=get_main_keyboard()
             )
             return SELECTING_ACTION
@@ -2354,33 +2350,75 @@ async def connect_user_session_qr(query):
         return SELECTING_ACTION
     
     return SELECTING_ACTION
+
+
+async def finish_qr_connection(query, user_id, client, me):
+    """Finish QR connection setup"""
+    channels = db.get_user_channels(user_id)
+    private_count = 0
+    for ch in channels:
+        if ch.get('is_private'):
+            global monitor_channel_queue
+            if monitor_channel_queue:
+                await monitor_channel_queue.put((user_id, ch['channel_name'], client))
+                private_count += 1
+    
+    await query.edit_message_text(
+        f"✅ *Connected as @{me.username}!*\n\n"
+        f"📋 {private_count} private channels activated.",
+        reply_markup=get_main_keyboard(),
+        parse_mode='Markdown'
+    )
 async def handle_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global pending_clients
+    
     password = update.message.text.strip()
     user_id = update.effective_user.id
     
     if password.lower() == 'cancel':
+        pending_clients.pop(user_id, None)
         await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    client = context.user_data.get('pending_client')
+    pending = pending_clients.get(user_id)
+    
+    if not pending:
+        await update.message.reply_text("❌ Session expired. Try again.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    client = pending['client']
+    auth_type = pending.get('type', '')
     
     try:
         await client.sign_in(password=password)
         
         session_string = client.session.save()
         db.update_user_settings(user_id, telegram_session_string=session_string)
-        
         active_clients[user_id] = client
+        pending_clients.pop(user_id, None)
+        
         me = await client.get_me()
         
+        # Start private channels
+        channels = db.get_user_channels(user_id)
+        private_count = 0
+        for ch in channels:
+            if ch.get('is_private'):
+                global monitor_channel_queue
+                if monitor_channel_queue:
+                    await monitor_channel_queue.put((user_id, ch['channel_name'], client))
+                    private_count += 1
+        
         await update.message.reply_text(
-            f"✅ *Connected as @{me.username}!*\n\nPrivate channel monitoring active.",
+            f"✅ *Connected as @{me.username}!*\n\n"
+            f"📋 {private_count} private channels activated.",
             reply_markup=get_main_keyboard(),
             parse_mode='Markdown'
         )
+        
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Wrong password: {str(e)[:200]}",
+            f"❌ Wrong password: {str(e)[:200]}\n\nTry again:",
             reply_markup=get_back_keyboard()
         )
         return ENTER_2FA
