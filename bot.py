@@ -607,7 +607,7 @@ async def get_or_create_user(user_id: int, username: str = None) -> Dict:
             db.update_wallet_settings(wallet_id, public_key=public_key)
         print(f"✅ Created W1 for user {user_id}: {public_key[:8]}...")
     
-    return user
+    return user or {}  # Return empty dict if still None
 
 # ============================================
 # MODERN UI KEYBOARDS
@@ -1633,10 +1633,21 @@ async def get_token_symbol(token_mint: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_data = await get_or_create_user(user.id, user.username)
-    wallet_addr = user_data['public_key']
+    
+    # SAFETY CHECK
+    if not user_data:
+        await update.message.reply_text("❌ Error creating user. Please try again.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    # Get W1 wallet
+    wallets = db.get_user_wallets(user.id)
+    if wallets:
+        wallet_addr = wallets[0].get('public_key', 'N/A')
+    else:
+        wallet_addr = 'N/A'
     
     try:
-        balance = await solana_service.get_balance(wallet_addr)
+        balance = await solana_service.get_balance(wallet_addr) if wallet_addr != 'N/A' else 0
     except:
         balance = 0
     
@@ -1657,16 +1668,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 │ 💳 `{wallet_addr[:6]}...{wallet_addr[-4:]}` │
 │ 💰 {balance:.4f} SOL                 │
 │ 📊 {positions} positions | 📋 {channels} channels │
-│ 🤖 Auto-Sell: {auto_sell}
- 🔫 Auto-Buy: {auto_buy}                 │
+│ 🤖 Sell: {auto_sell} | 🔫 Buy: {auto_buy}    │
 └─────────────────────────┘
 
 🔐 *Derived Wallet* — No keys stored!
 
 👇 *Select an option:*
 """
-    await update_pinned_positions(user.id)
     await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    await update_pinned_positions(user.id)
     return SELECTING_ACTION
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
