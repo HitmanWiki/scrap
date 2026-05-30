@@ -2124,27 +2124,29 @@ async def handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    client = pending_clients.get(user_id)
+    pending = pending_clients.get(user_id)
     
-    if not client:
+    if not pending:
         await update.message.reply_text(
-            "❌ Session expired. Please try Connect again.",
+            "❌ Session expired. Please click Connect again.",
             reply_markup=get_main_keyboard()
         )
         return SELECTING_ACTION
     
+    client = pending['client']
+    phone_code_hash = pending['phone_code_hash']
     phone = db.get_user(user_id).get('telegram_phone')
     
     try:
         from telethon.errors import SessionPasswordNeededError
         
-        await client.sign_in(phone=phone, code=code)
+        # Sign in with phone_code_hash
+        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
         
         # Save session
         session_string = client.session.save()
         db.update_user_settings(user_id, telegram_session_string=session_string)
         
-        # Store in active clients
         active_clients[user_id] = client
         pending_clients.pop(user_id, None)
         
@@ -2168,7 +2170,7 @@ async def handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
     except SessionPasswordNeededError:
-        pending_clients[user_id] = client
+        pending_clients[user_id] = {'client': client, 'phone_code_hash': phone_code_hash}
         await update.message.reply_text(
             "🔒 *2FA Enabled*\n\nEnter your *2FA password*:",
             reply_markup=get_back_keyboard(),
@@ -2178,10 +2180,18 @@ async def handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         pending_clients.pop(user_id, None)
-        await update.message.reply_text(
-            f"❌ Invalid OTP: {str(e)[:200]}\n\nTry Connect again.",
-            reply_markup=get_main_keyboard()
-        )
+        error_msg = str(e)
+        if "expired" in error_msg.lower():
+            await update.message.reply_text(
+                "⏰ *Code expired!*\n\nClick *Connect Session* to get a new code and enter it immediately.",
+                reply_markup=get_main_keyboard(),
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Login failed: {error_msg[:200]}\n\nClick Connect to try again.",
+                reply_markup=get_main_keyboard()
+            )
     
     return SELECTING_ACTION
 async def connect_user_session(query):
@@ -2193,63 +2203,39 @@ async def connect_user_session(query):
         await query.edit_message_text("❌ Setup credentials first!", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    await query.edit_message_text("⏳ *Connecting...*", parse_mode='Markdown')
+    await query.edit_message_text("⏳ *Sending OTP...*", parse_mode='Markdown')
     
     try:
         from telethon.sessions import StringSession
         from telethon.errors import SessionPasswordNeededError
         
-        session_string = user.get('telegram_session_string', '')
-        
-        if session_string:
-            # Already have session - just start it
-            client = TelegramClient(StringSession(session_string), 
-                                   user['telegram_api_id'], 
-                                   user['telegram_api_hash'])
-            await client.start()
-            
-            me = await client.get_me()
-            active_clients[user_id] = client
-            
-            await query.edit_message_text(
-                f"✅ *Connected as @{me.username}!*",
-                reply_markup=get_main_keyboard(), parse_mode='Markdown'
-            )
-            return SELECTING_ACTION
-        
-        # No session - need to authenticate
+        # Always start fresh for new auth
         client = TelegramClient(StringSession(), 
                                user['telegram_api_id'], 
                                user['telegram_api_hash'])
         await client.connect()
         
         # Send OTP
-        sent = await client.send_code_request(user.get('telegram_phone'))
-        print(f"   OTP sent via {sent.__class__.__name__}")
+        phone_code_hash = await client.send_code_request(user.get('telegram_phone'))
         
-        # Store client for later use
-        pending_clients[user_id] = client
+        # Store both client and phone_code_hash
+        pending_clients[user_id] = {
+            'client': client,
+            'phone_code_hash': phone_code_hash
+        }
         
         await query.edit_message_text(
-            "📱 *OTP Sent!*\n\nEnter the verification code you received:",
+            "📱 *OTP Sent!*\n\n"
+            "Enter the 5-digit code from Telegram:\n\n"
+            "⚠️ Enter it quickly - codes expire in 60 seconds!",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
         return ENTER_OTP
         
-    except SessionPasswordNeededError:
-        # This shouldn't happen on first connect, but handle it
-        pending_clients[user_id] = client
-        await query.edit_message_text(
-            "🔒 *2FA Enabled*\n\nEnter your *2FA password*:",
-            reply_markup=get_back_keyboard(),
-            parse_mode='Markdown'
-        )
-        return ENTER_2FA
-        
     except Exception as e:
         await query.edit_message_text(
-            f"❌ Connection failed: {str(e)[:200]}",
+            f"❌ Failed to send OTP: {str(e)[:200]}",
             reply_markup=get_main_keyboard()
         )
         return SELECTING_ACTION
