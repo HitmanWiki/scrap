@@ -2611,10 +2611,10 @@ async def show_wallet(query):
 ║        💼 WALLET          ║
 ╚═══════════════════════════╝
 
-*Address:*
+Address:
 `{wallet_addr}`
 
-*Balance:* `{balance:.6f} SOL`
+Balance: `{balance:.6f} SOL`
 
 🔐 Derived from Telegram ID
 ⚠️ Fund to start sniping!
