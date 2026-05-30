@@ -2619,12 +2619,19 @@ Balance: `{balance:.6f} SOL`
 🔐 Derived from Telegram ID
 ⚠️ Fund to start sniping!
 """
-    keyboard = [
+    keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 Copy Address", callback_data="copy_address")],
         [InlineKeyboardButton("🔑 Export Key", callback_data="export_key")],
         [InlineKeyboardButton("« Back", callback_data="back_main")]
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    ])
+    
+    # Delete the old message and send a new one to avoid entity parsing errors
+    try:
+        await query.message.delete()
+    except:
+        pass
+    
+    await query.message.reply_text(text, reply_markup=keyboard, parse_mode='Markdown')
     return SELECTING_ACTION
 async def export_private_key(query):
     """Show wallet selection for key export"""
