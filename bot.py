@@ -2606,32 +2606,23 @@ async def show_wallet(query):
     except:
         balance = 0
     
-    text = f"""
-╔═══════════════════════════╗
-║        💼 WALLET          ║
-╚═══════════════════════════╝
-
-Address:
-`{wallet_addr}`
-
-Balance: `{balance:.6f} SOL`
-
-🔐 Derived from Telegram ID
-⚠️ Fund to start sniping!
-"""
+    # NO Markdown - plain text to avoid entity errors
+    text = f"💼 WALLET\n\nAddress:\n{wallet_addr}\n\nBalance: {balance:.6f} SOL\n\n🔐 Derived from Telegram ID\n⚠️ Fund to start sniping!"
+    
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 Copy Address", callback_data="copy_address")],
         [InlineKeyboardButton("🔑 Export Key", callback_data="export_key")],
         [InlineKeyboardButton("« Back", callback_data="back_main")]
     ])
     
-    # Delete the old message and send a new one to avoid entity parsing errors
+    # Delete old message first
     try:
         await query.message.delete()
     except:
         pass
     
-    await query.message.reply_text(text, reply_markup=keyboard, parse_mode='Markdown')
+    # Send new message WITHOUT parse_mode
+    await query.message.reply_text(text, reply_markup=keyboard)
     return SELECTING_ACTION
 async def export_private_key(query):
     """Show wallet selection for key export"""
