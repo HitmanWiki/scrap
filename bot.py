@@ -2114,48 +2114,78 @@ async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return SELECTING_ACTION
 async def handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global pending_clients
+    
     code = update.message.text.strip()
     user_id = update.effective_user.id
     
     if code.lower() == 'cancel':
+        pending_clients.pop(user_id, None)
         await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    client = context.user_data.get('pending_client')
+    client = pending_clients.get(user_id)
+    
+    if not client:
+        await update.message.reply_text(
+            "❌ Session expired. Please try Connect again.",
+            reply_markup=get_main_keyboard()
+        )
+        return SELECTING_ACTION
+    
     phone = db.get_user(user_id).get('telegram_phone')
     
     try:
         from telethon.errors import SessionPasswordNeededError
+        
         await client.sign_in(phone=phone, code=code)
         
+        # Save session
         session_string = client.session.save()
         db.update_user_settings(user_id, telegram_session_string=session_string)
         
+        # Store in active clients
         active_clients[user_id] = client
+        pending_clients.pop(user_id, None)
+        
         me = await client.get_me()
         
+        # Start monitoring private channels
+        channels = db.get_user_channels(user_id)
+        private_count = 0
+        for ch in channels:
+            if ch.get('is_private'):
+                global monitor_channel_queue
+                if monitor_channel_queue:
+                    await monitor_channel_queue.put((user_id, ch['channel_name'], client))
+                    private_count += 1
+        
         await update.message.reply_text(
-            f"✅ *Connected as @{me.username}!*",
+            f"✅ *Connected as @{me.username}!*\n\n"
+            f"📋 {private_count} private channels activated.",
             reply_markup=get_main_keyboard(),
             parse_mode='Markdown'
         )
+        
     except SessionPasswordNeededError:
-        context.user_data['pending_client'] = client
+        pending_clients[user_id] = client
         await update.message.reply_text(
             "🔒 *2FA Enabled*\n\nEnter your *2FA password*:",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
         return ENTER_2FA
+        
     except Exception as e:
+        pending_clients.pop(user_id, None)
         await update.message.reply_text(
-            f"❌ Invalid OTP: {str(e)[:200]}",
+            f"❌ Invalid OTP: {str(e)[:200]}\n\nTry Connect again.",
             reply_markup=get_main_keyboard()
         )
     
     return SELECTING_ACTION
 async def connect_user_session(query):
-    global pending_clients  # ADD THIS
+    global pending_clients
     user_id = query.from_user.id
     user = db.get_user(user_id)
     
@@ -2172,65 +2202,57 @@ async def connect_user_session(query):
         session_string = user.get('telegram_session_string', '')
         
         if session_string:
+            # Already have session - just start it
             client = TelegramClient(StringSession(session_string), 
                                    user['telegram_api_id'], 
                                    user['telegram_api_hash'])
             await client.start()
-        else:
-            client = TelegramClient(StringSession(), 
-                                   user['telegram_api_id'], 
-                                   user['telegram_api_hash'])
-            await client.start(phone=user.get('telegram_phone'))
-            session_string = client.session.save()
-            db.update_user_settings(user_id, telegram_session_string=session_string)
+            
+            me = await client.get_me()
+            active_clients[user_id] = client
+            
+            await query.edit_message_text(
+                f"✅ *Connected as @{me.username}!*",
+                reply_markup=get_main_keyboard(), parse_mode='Markdown'
+            )
+            return SELECTING_ACTION
         
-        me = await client.get_me()
-        active_clients[user_id] = client
+        # No session - need to authenticate
+        client = TelegramClient(StringSession(), 
+                               user['telegram_api_id'], 
+                               user['telegram_api_hash'])
+        await client.connect()
         
-        channels = db.get_user_channels(user_id)
-        private_count = 0
-        for ch in channels:
-            if ch.get('is_private'):
-                global monitor_channel_queue
-                if monitor_channel_queue:
-                    await monitor_channel_queue.put((user_id, ch['channel_name'], client))
-                    private_count += 1
+        # Send OTP
+        sent = await client.send_code_request(user.get('telegram_phone'))
+        print(f"   OTP sent via {sent.__class__.__name__}")
+        
+        # Store client for later use
+        pending_clients[user_id] = client
         
         await query.edit_message_text(
-            f"✅ *Connected as @{me.username}!*\n\n📋 {private_count} private channels activated.",
-            reply_markup=get_main_keyboard(), parse_mode='Markdown'
+            "📱 *OTP Sent!*\n\nEnter the verification code you received:",
+            reply_markup=get_back_keyboard(),
+            parse_mode='Markdown'
         )
+        return ENTER_OTP
         
     except SessionPasswordNeededError:
-        pending_clients[user_id] = client  # Use global dict
+        # This shouldn't happen on first connect, but handle it
+        pending_clients[user_id] = client
         await query.edit_message_text(
             "🔒 *2FA Enabled*\n\nEnter your *2FA password*:",
-            reply_markup=get_back_keyboard(), parse_mode='Markdown'
+            reply_markup=get_back_keyboard(),
+            parse_mode='Markdown'
         )
         return ENTER_2FA
         
-    except EOFError:
-        try:
-            client = TelegramClient(StringSession(), 
-                                   user['telegram_api_id'], 
-                                   user['telegram_api_hash'])
-            await client.connect()
-            await client.send_code_request(user.get('telegram_phone'))
-            pending_clients[user_id] = client  # Use global dict
-            await query.edit_message_text(
-                "📱 *OTP Sent!*\n\nEnter the verification code:",
-                reply_markup=get_back_keyboard(), parse_mode='Markdown'
-            )
-            return ENTER_OTP
-        except Exception as e:
-            await query.edit_message_text(f"❌ Failed: {str(e)[:200]}", reply_markup=get_main_keyboard())
-            return SELECTING_ACTION
-    
     except Exception as e:
-        await query.edit_message_text(f"❌ Connection failed: {str(e)[:200]}", reply_markup=get_main_keyboard())
+        await query.edit_message_text(
+            f"❌ Connection failed: {str(e)[:200]}",
+            reply_markup=get_main_keyboard()
+        )
         return SELECTING_ACTION
-    
-    return SELECTING_ACTION
 async def handle_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
     user_id = update.effective_user.id
@@ -3319,15 +3341,22 @@ async def handle_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     user_id = update.effective_user.id
+    
     if phone.lower() == 'cancel':
         await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
+    
     db.update_user_settings(user_id, 
         telegram_api_id=context.user_data.get('api_id'),
         telegram_api_hash=context.user_data.get('api_hash'),
         telegram_phone=phone
     )
-    await update.message.reply_text("✅ Auth saved!", reply_markup=get_main_keyboard())
+    
+    await update.message.reply_text(
+        "✅ *Credentials saved!*\n\nNow click *Connect Session* to authenticate.",
+        reply_markup=get_main_keyboard(),
+        parse_mode='Markdown'
+    )
     return SELECTING_ACTION
 # ============================================
 # SETTINGS INPUT HANDLER
