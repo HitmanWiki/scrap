@@ -2209,14 +2209,18 @@ async def connect_user_session(query):
         from telethon.sessions import StringSession
         from telethon.errors import SessionPasswordNeededError
         
-        # Always start fresh for new auth
         client = TelegramClient(StringSession(), 
                                user['telegram_api_id'], 
                                user['telegram_api_hash'])
         await client.connect()
         
-        # Send OTP
-        phone_code_hash = await client.send_code_request(user.get('telegram_phone'))
+        # Send OTP - returns SentCode object
+        sent_code = await client.send_code_request(user.get('telegram_phone'))
+        
+        # Extract phone_code_hash from SentCode object
+        phone_code_hash = sent_code.phone_code_hash
+        
+        print(f"   OTP sent. Hash: {phone_code_hash[:10]}...")
         
         # Store both client and phone_code_hash
         pending_clients[user_id] = {
@@ -2227,7 +2231,7 @@ async def connect_user_session(query):
         await query.edit_message_text(
             "📱 *OTP Sent!*\n\n"
             "Enter the 5-digit code from Telegram:\n\n"
-            "⚠️ Enter it quickly - codes expire in 60 seconds!",
+            "⚠️ Enter it quickly - codes expire soon!",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
