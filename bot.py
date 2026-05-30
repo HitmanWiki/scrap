@@ -868,7 +868,33 @@ async def poll_channel_messages(channel_name: str, user_client=None):
     ctype = "🔒 Private" if user_client else "🌐 Public"
     
     try:
-        entity = await client.get_entity(channel_name)
+        # Try to resolve entity - handles @username, -100xxx IDs, and invite hashes
+        entity = None
+        try:
+            # First try as username or ID directly
+            entity = await client.get_entity(channel_name)
+        except:
+            try:
+                # Try as channel ID (remove @ and -100 prefix if present)
+                clean = channel_name.replace('@', '')
+                if clean.startswith('-100'):
+                    channel_id = int(clean)
+                elif clean.startswith('100'):
+                    channel_id = int('-' + clean)
+                else:
+                    channel_id = int(f'-100{clean}')
+                
+                from telethon.tl.types import PeerChannel
+                entity = PeerChannel(channel_id=channel_id)
+            except:
+                # Try as invite hash
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                try:
+                    invite = await client(CheckChatInviteRequest(channel_name.replace('@', '')))
+                    entity = invite.chat
+                except:
+                    raise ValueError(f"Cannot resolve channel: {channel_name}")
+        
         print(f"   ✅ Connected to {channel_name} ({ctype})")
         
         last_id = 0
