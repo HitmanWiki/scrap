@@ -3758,9 +3758,6 @@ Transfer SOL and Tokens between wallets or to external addresses.
 
 async def back_to_main(query):
     user_id = query.from_user.id
-    user = db.get_user(user_id) or {}
-    
-    # Get W1 wallet safely
     wallets = db.get_user_wallets(user_id) or []
     wallet_addr = wallets[0].get('public_key', 'N/A') if wallets else 'N/A'
     
@@ -3769,13 +3766,20 @@ async def back_to_main(query):
 ║     🔫 SOLANA SNIPER     ║
 ╚═══════════════════════════╝
 
-💳 `{wallet_addr[:8]}...{wallet_addr[-4:]}` if wallet_addr != 'N/A' else 'No wallet'
+💳 {wallet_addr[:8]}...{wallet_addr[-4:]}
 📋 {len(db.get_user_channels(user_id) or [])} channels
 📊 {db.get_user_positions_count(user_id) or 0} positions
 
 👇 Select option:
 """
-    await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    # Delete old message first to avoid entity errors
+    try:
+        await query.message.delete()
+    except:
+        pass
+    
+    # Send new message
+    await query.message.reply_text(text, reply_markup=get_main_keyboard())
     return SELECTING_ACTION
 # ============================================
 # TRANSFER & WITHDRAW
