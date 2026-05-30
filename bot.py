@@ -1372,7 +1372,6 @@ async def handle_channel_take_profit(update: Update, context: ContextTypes.DEFAU
     )
     return ENTER_CHANNEL_TARGET_MC
 
-
 async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
@@ -1398,7 +1397,7 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
     take_profit = setup.get('take_profit')
     target_mc = setup.get('target_mc')
     auto_sell = setup.get('auto_sell', True)
-    is_private = setup.get('is_private', False)  # GET THIS
+    is_private = setup.get('is_private', False)
     
     # Update wallet
     if wallet_id:
@@ -1413,7 +1412,7 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
     # Add channel with is_private flag
     db.add_channel(user_id, channel_name, wallet_id=wallet_id, is_private=is_private)
     
-    # Queue for monitoring with correct client
+    # Queue for monitoring
     global channel_subscribers, monitor_channel_queue
     if channel_name not in channel_subscribers:
         channel_subscribers[channel_name] = []
@@ -1421,10 +1420,11 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
         channel_subscribers[channel_name].append(user_id)
     
     if monitor_channel_queue:
-        if is_private and user_id in active_clients:
-            await monitor_channel_queue.put((user_id, channel_name, 'private'))
+        if is_private:
+            # Queue as (user_id, channel_name) - monitor thread creates client
+            await monitor_channel_queue.put((user_id, channel_name))
         else:
-            # Use monitor client for public
+            # Public channel - just channel name
             await monitor_channel_queue.put(channel_name)
     
     wallet = db.get_wallet(wallet_id) if wallet_id else None
@@ -2265,7 +2265,7 @@ async def connect_user_session(query):
         )
         return SELECTING_ACTION
 async def connect_user_session_qr(query):
-    """Connect via QR code"""
+    """Connect via QR code - saves session, does NOT store client"""
     global pending_clients
     user_id = query.from_user.id
     user = db.get_user(user_id)
@@ -2286,13 +2286,9 @@ async def connect_user_session_qr(query):
                                user['telegram_api_id'], 
                                user['telegram_api_hash'])
         
-        # CONNECT FIRST
         await client.connect()
-        
-        # Now generate QR login
         qr_login = await client.qr_login()
         
-        # Store client
         pending_clients[user_id] = {'client': client, 'qr': qr_login, 'type': 'qr'}
         
         # Generate QR code image
@@ -2317,11 +2313,10 @@ async def connect_user_session_qr(query):
             parse_mode='Markdown'
         )
         
-        # Wait for QR login
         try:
             await asyncio.wait_for(qr_login.wait(), timeout=120)
             
-            # QR scanned - try to complete auth
+            # Try to complete auth (triggers 2FA if needed)
             try:
                 await client.sign_in(password="")
             except SessionPasswordNeededError:
@@ -2335,15 +2330,24 @@ async def connect_user_session_qr(query):
             except:
                 pass
             
-            # Success!
+            # SUCCESS - save session string to DB
             session_string = client.session.save()
             db.update_user_settings(user_id, telegram_session_string=session_string)
-            active_clients[user_id] = client
+            
+            # DO NOT store in active_clients - monitor thread will create its own
+            # active_clients[user_id] = client  ← REMOVED
+            
             pending_clients.pop(user_id, None)
             
             me = await client.get_me()
+            
+            # DISCONNECT main thread client
+            await client.disconnect()
+            
             await query.edit_message_text(
-                f"✅ *Connected as @{me.username}!*",
+                f"✅ *Connected as @{me.username}!*\n\n"
+                f"Session saved. Private channels will be activated.\n"
+                f"Add a private channel to start monitoring.",
                 reply_markup=get_main_keyboard(),
                 parse_mode='Markdown'
             )
