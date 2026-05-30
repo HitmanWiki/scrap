@@ -1632,17 +1632,22 @@ async def get_token_symbol(token_mint: str) -> str:
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    user_data = await get_or_create_user(user.id, user.username)
     
-    # SAFETY CHECK
-    if not user_data:
-        await update.message.reply_text("❌ Error creating user. Please try again.", reply_markup=get_main_keyboard())
+    try:
+        user_data = await get_or_create_user(user.id, user.username)
+    except Exception as e:
+        print(f"Error creating user: {e}")
+        await update.message.reply_text("❌ Error initializing. Please /start again.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    # Get W1 wallet
-    wallets = db.get_user_wallets(user.id)
+    if not user_data:
+        await update.message.reply_text("❌ Could not create user. Try again.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    # Safe wallet lookup
+    wallets = db.get_user_wallets(user.id) or []
     if wallets:
-        wallet_addr = wallets[0].get('public_key', 'N/A')
+        wallet_addr = wallets[0].get('public_key') or 'N/A'
     else:
         wallet_addr = 'N/A'
     
@@ -1651,11 +1656,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         balance = 0
     
-    positions = db.get_user_positions_count(user.id)
-    channels = len(db.get_user_channels(user.id))
-    settings = db.get_user_settings(user.id)
-    auto_sell = "✅ ON" if (settings and settings.get('auto_sell_enabled')) else "❌ OFF"
-    auto_buy = "✅ ON" if (settings and settings.get('auto_snipe', 1)) else "❌ OFF"
+    # Rest of function with safe defaults
+    positions = db.get_user_positions_count(user.id) or 0
+    channels = len(db.get_user_channels(user.id) or [])
+    settings = db.get_user_settings(user.id) or {}
+    auto_sell = "✅ ON" if settings.get('auto_sell_enabled') else "❌ OFF"
+    auto_buy = "✅ ON" if settings.get('auto_snipe', 1) else "❌ OFF"
     
     welcome_text = f"""
 ╔═══════════════════════════╗
@@ -1676,9 +1682,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👇 *Select an option:*
 """
     await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
-    await update_pinned_positions(user.id)
     return SELECTING_ACTION
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
