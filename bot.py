@@ -2304,6 +2304,175 @@ async def get_token_symbol(token_mint: str) -> str:
     # Fallback: short address
     return f"{token_mint[:6]}...{token_mint[-4:]}"
 # ============================================
+# COMMAND HANDLERS
+# ============================================
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/help - Show available commands and features"""
+    text = """
+🔫 *Solana Sniper Bot - Help*
+
+*Commands:*
+/start - Main menu
+/help - This help message
+/balance - Check wallet balance
+/positions - View your positions
+/channels - List monitored channels
+/cancel - Cancel current operation
+
+*Features:*
+• Auto-snipe from Telegram channels
+• Multi-wallet support (up to 5)
+• Buy/Sell with custom amounts
+• SOL & Token transfers
+• Portfolio tracking
+• Auto-sell with take profit & target MC
+
+*Setup:*
+1. Fund your wallet
+2. Add channels to monitor
+3. Configure buy/sell settings
+
+💡 Use the menu buttons for easiest navigation!
+"""
+    await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+
+async def setapi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setapi - Quick API setup for private channels"""
+    text = """
+🔐 *API Setup*
+
+To monitor private channels:
+1. Go to my.telegram.org
+2. Create an app
+3. Get your API ID and API Hash
+
+Use /setapi ID HASH PHONE
+Example: `/setapi 12345678 abc123def +1234567890`
+
+Or use the menu: 🔐 TG Auth → Setup Credentials
+"""
+    args = context.args
+    if len(args) == 3:
+        api_id = args[0]
+        api_hash = args[1]
+        phone = args[2]
+        user_id = update.effective_user.id
+        
+        try:
+            db.update_user_settings(user_id, 
+                telegram_api_id=int(api_id),
+                telegram_api_hash=api_hash,
+                telegram_phone=phone
+            )
+            await update.message.reply_text("✅ API credentials saved! Use /connect to login.", reply_markup=get_main_keyboard())
+        except:
+            await update.message.reply_text("❌ Invalid format. Use: /setapi ID HASH PHONE")
+        return SELECTING_ACTION
+    
+    await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+
+async def removechannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/removechannel - Remove a channel"""
+    user_id = update.effective_user.id
+    channels = db.get_user_channels(user_id)
+    
+    if not channels:
+        await update.message.reply_text("📋 No channels to remove.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    text = "📋 *Remove Channel*\n\nSelect channel to remove:\n"
+    keyboard = []
+    for ch in channels:
+        text += f"• `{ch['channel_name']}`\n"
+        keyboard.append([InlineKeyboardButton(
+            f"❌ {ch['channel_name']}",
+            callback_data=f"remove_ch_{ch['id']}"
+        )])
+    keyboard.append([InlineKeyboardButton("« Cancel", callback_data="back_main")])
+    
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cancel - Cancel current operation and return to main menu"""
+    # Clear any pending state
+    user_id = update.effective_user.id
+    channel_setup_data.pop(user_id, None)
+    pending_transfers.pop(user_id, None)
+    context.user_data.clear()
+    
+    await update.message.reply_text("✅ Cancelled. Returning to main menu.", reply_markup=get_main_keyboard())
+    return SELECTING_ACTION
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/balance - Quick balance check"""
+    user_id = update.effective_user.id
+    wallets = db.get_user_wallets(user_id) or []
+    
+    if not wallets:
+        await update.message.reply_text("❌ No wallets found. /start first.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    text = "💰 *Balance*\n\n"
+    total = 0
+    for w in wallets:
+        try:
+            bal = await solana_service.get_balance(w.get('public_key', ''))
+            total += bal
+            text += f"*{w['wallet_name']}*: {bal:.4f} SOL\n"
+        except:
+            text += f"*{w['wallet_name']}*: Error\n"
+    
+    text += f"\n💎 *Total*: {total:.4f} SOL"
+    await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+
+async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/positions - Quick positions view"""
+    user_id = update.effective_user.id
+    positions = db.get_user_positions(user_id)
+    
+    if not positions:
+        await update.message.reply_text("📊 No active positions.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    text = "📊 *Positions*\n\n"
+    for pos in positions[:10]:
+        if pos['amount'] > 0:
+            symbol = await get_token_symbol(pos['token_address'])
+            text += f"• *{symbol}*: {pos['amount']:,.2f}\n"
+    
+    await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    return SELECTING_ACTION
+
+
+async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/channels - List monitored channels"""
+    user_id = update.effective_user.id
+    channels = db.get_user_channels(user_id)
+    
+    if not channels:
+        await update.message.reply_text("📋 No channels configured.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    text = "📋 *Monitored Channels*\n\n"
+    for ch in channels:
+        ctype = "🔒" if ch.get('is_private') else "🌐"
+        w = db.get_wallet(ch.get('wallet_id', 0)) if ch.get('wallet_id') else None
+        w_name = w['wallet_name'] if w else 'W1'
+        text += f"{ctype} `{ch['channel_name']}` → {w_name}\n"
+    
+    await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    return SELECTING_ACTION
+# ============================================
 # START COMMAND & UI HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4342,9 +4511,21 @@ def main():
     
     time.sleep(3)
     
+    # ============================================
+    # COMMAND HANDLERS
+    # ============================================
     application.add_handler(CommandHandler('debug', debug_wallet))
-    # application.add_handler(CallbackQueryHandler(start_auth_process, pattern="^start_auth$"))
+    application.add_handler(CommandHandler('help', help_command))
+    application.add_handler(CommandHandler('setapi', setapi_command))
+    application.add_handler(CommandHandler('removechannel', removechannel_command))
+    application.add_handler(CommandHandler('cancel', cancel_command))
+    application.add_handler(CommandHandler('balance', balance_command))
+    application.add_handler(CommandHandler('positions', positions_command))
+    application.add_handler(CommandHandler('channels', channels_command))
     
+    # ============================================
+    # CONVERSATION HANDLER
+    # ============================================
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -4357,7 +4538,6 @@ def main():
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_input)
             ],
-            # API AUTH STATES
             ENTER_API_ID: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_id)
@@ -4374,7 +4554,10 @@ def main():
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp)
             ],
-            # SETTINGS STATES
+            ENTER_2FA: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_2fa)
+            ],
             ENTER_BUY_AMOUNT: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)
@@ -4391,17 +4574,15 @@ def main():
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)
             ],
-            # TRANSFER/WITHDRAW
             ENTER_TRANSFER_DETAILS: [
                 CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_input)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, execute_transfer_final)
             ],
             ENTER_WITHDRAW_DETAILS: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_input)
             ],
             CONFIRM_BUY: [CallbackQueryHandler(button_handler)],
-            # CHANNEL SETUP STATES
             ENTER_CHANNEL_BUY_AMOUNT: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_buy_amount)
@@ -4417,14 +4598,6 @@ def main():
             ENTER_CHANNEL_TARGET_MC: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_target_mc)
-            ],
-            ENTER_2FA: [
-                CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_2fa)
-            ],
-            ENTER_TRANSFER_DETAILS: [
-                CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, execute_transfer_final)
             ],
         },
         fallbacks=[CommandHandler('start', start)],
