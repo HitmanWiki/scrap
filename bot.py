@@ -1679,6 +1679,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "portfolio_tokens": return await show_portfolio_by_token(query)
     elif action == "portfolio_stats": return await show_portfolio_stats(query)
     elif action == "connect_user_session":return await connect_user_session(query)
+    elif action == "connect_qr":return await connect_user_session_qr(query)
     
     # Settings
     elif action == "set_buy_amount":
@@ -2052,7 +2053,7 @@ async def telegram_auth_setup(query):
     if is_connected:
         status = "✅ Connected"
     elif has_creds:
-        status = "⚠️ Credentials saved - Click Connect"
+        status = "⚠️ Credentials saved - Click to connect"
     else:
         status = "❌ Not configured"
     
@@ -2070,9 +2071,12 @@ Get API credentials at my.telegram.org
         [InlineKeyboardButton("🔄 Setup Credentials", callback_data="start_auth")],
     ]
     if has_creds:
-        keyboard.insert(0, [InlineKeyboardButton("🔌 Connect Session", callback_data="connect_user_session")])
+        keyboard.insert(0, [
+            InlineKeyboardButton("📱 QR Login (Easy)", callback_data="connect_qr"),
+            InlineKeyboardButton("🔢 OTP Login", callback_data="connect_user_session")
+        ])
     if is_connected:
-        keyboard.insert(0, [InlineKeyboardButton("🔌 Reconnect", callback_data="connect_user_session")])
+        keyboard.insert(0, [InlineKeyboardButton("🔄 Reconnect", callback_data="connect_user_session")])
     keyboard.append([InlineKeyboardButton("« Back", callback_data="back_main")])
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -2243,6 +2247,77 @@ async def connect_user_session(query):
             reply_markup=get_main_keyboard()
         )
         return SELECTING_ACTION
+async def connect_user_session_qr(query):
+    """Connect via QR code - bypasses OTP relay detection"""
+    global pending_clients
+    user_id = query.from_user.id
+    user = db.get_user(user_id)
+    
+    if not user.get('telegram_api_id'):
+        await query.edit_message_text("❌ Setup credentials first!", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    await query.edit_message_text("⏳ *Generating QR code...*", parse_mode='Markdown')
+    
+    try:
+        from telethon.sessions import StringSession
+        from telethon.tl.types import LoginToken
+        
+        client = TelegramClient(StringSession(), 
+                               user['telegram_api_id'], 
+                               user['telegram_api_hash'])
+        await client.connect()
+        
+        # Generate QR login token
+        qr_login = await client.qr_login()
+        
+        # Store client
+        pending_clients[user_id] = {'client': client, 'qr': qr_login}
+        
+        # The QR code URL can be displayed or sent as a link
+        # User opens it on their phone where Telegram is logged in
+        await query.edit_message_text(
+            f"📱 *Scan QR Code to Login*\n\n"
+            f"🔗 [Click here to login]({qr_login.url})\n\n"
+            f"Or copy this link and open it on your phone:\n"
+            f"`{qr_login.url}`\n\n"
+            f"⏳ Waiting for you to approve...",
+            reply_markup=get_back_keyboard(),
+            parse_mode='Markdown',
+            disable_web_page_preview=True
+        )
+        
+        # Wait for QR login (with timeout)
+        try:
+            await asyncio.wait_for(qr_login.wait(), timeout=120)  # 2 minutes
+            
+            session_string = client.session.save()
+            db.update_user_settings(user_id, telegram_session_string=session_string)
+            active_clients[user_id] = client
+            pending_clients.pop(user_id, None)
+            
+            me = await client.get_me()
+            await query.edit_message_text(
+                f"✅ *Connected as @{me.username}!*\n\nPrivate channels activated.",
+                reply_markup=get_main_keyboard(), parse_mode='Markdown'
+            )
+            
+        except asyncio.TimeoutError:
+            pending_clients.pop(user_id, None)
+            await query.edit_message_text(
+                "⏰ QR login timed out. Please try again.",
+                reply_markup=get_main_keyboard()
+            )
+            return SELECTING_ACTION
+            
+    except Exception as e:
+        await query.edit_message_text(
+            f"❌ QR login failed: {str(e)[:200]}\n\nTry again or use OTP method.",
+            reply_markup=get_main_keyboard()
+        )
+        return SELECTING_ACTION
+    
+    return SELECTING_ACTION
 async def handle_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
     user_id = update.effective_user.id
