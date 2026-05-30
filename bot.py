@@ -3303,15 +3303,30 @@ def run_monitor_in_thread():
                 try:
                     item = await new_channel_queue.get()
                     
-                    if isinstance(item, tuple) and len(item) == 3:
-                        user_id, channel_name, channel_type = item
+                    # Handle both formats
+                    if isinstance(item, tuple):
+                        # Private channel: (user_id, channel_name)
+                        user_id, channel_name = item
+                        user_client = active_clients.get(user_id)
                         
-                        if channel_type == 'private':
-                            # Get user's client from active_clients
-                            user_client = active_clients.get(user_id)
-                        else:
-                            user_client = None
+                        # If user client not in active_clients, try to restore from DB
+                        if not user_client:
+                            user_data = db.get_user(user_id)
+                            if user_data and user_data.get('telegram_session_string'):
+                                try:
+                                    from telethon.sessions import StringSession
+                                    user_client = TelegramClient(
+                                        StringSession(user_data['telegram_session_string']),
+                                        user_data['telegram_api_id'],
+                                        user_data['telegram_api_hash']
+                                    )
+                                    await user_client.start()
+                                    active_clients[user_id] = user_client
+                                    print(f"   ✅ Restored client for user {user_id}")
+                                except Exception as e:
+                                    print(f"   ⚠️ Could not restore client: {e}")
                     else:
+                        # Public channel: just channel_name string
                         channel_name = item
                         user_client = None
                     
@@ -3322,6 +3337,7 @@ def run_monitor_in_thread():
                     
                     ctype = "🔒 Private" if user_client else "🌐 Public"
                     print(f"🔍 Started polling {channel_name} ({ctype})")
+                    
                 except Exception as e:
                     print(f"⚠️ Queue error: {e}")
         
