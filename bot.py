@@ -1388,7 +1388,7 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
         try:
             setup['target_mc'] = float(text)
         except:
-            await update.message.reply_text("❌ Invalid! Enter number or *skip*.", reply_markup=get_back_keyboard())
+            await update.message.reply_text("❌ Invalid!", reply_markup=get_back_keyboard())
             return ENTER_CHANNEL_TARGET_MC
     
     channel_name = setup.get('channel_name', '')
@@ -1398,7 +1398,9 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
     take_profit = setup.get('take_profit')
     target_mc = setup.get('target_mc')
     auto_sell = setup.get('auto_sell', True)
+    is_private = setup.get('is_private', False)  # GET THIS
     
+    # Update wallet
     if wallet_id:
         updates = {}
         if buy_amount: updates['default_buy_amount'] = buy_amount
@@ -1408,9 +1410,10 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
         updates['auto_sell_enabled'] = auto_sell
         db.update_wallet_settings(wallet_id, **updates)
     
-    db.add_channel(user_id, channel_name, wallet_id=wallet_id)
+    # Add channel with is_private flag
+    db.add_channel(user_id, channel_name, wallet_id=wallet_id, is_private=is_private)
     
-    # QUEUE for monitor thread instead of direct create_task
+    # Queue for monitoring with correct client
     global channel_subscribers, monitor_channel_queue
     if channel_name not in channel_subscribers:
         channel_subscribers[channel_name] = []
@@ -1418,13 +1421,19 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
         channel_subscribers[channel_name].append(user_id)
     
     if monitor_channel_queue:
-        await monitor_channel_queue.put(channel_name)
+        if is_private and user_id in active_clients:
+            # Use user's client for private
+            await monitor_channel_queue.put((user_id, channel_name, active_clients[user_id]))
+        else:
+            # Use monitor client for public
+            await monitor_channel_queue.put(channel_name)
     
     wallet = db.get_wallet(wallet_id) if wallet_id else None
     w_name = wallet['wallet_name'] if wallet else 'W1'
+    ctype = "🔒 Private" if is_private else "🌐 Public"
     
     summary = f"""
-✅ *Channel Added!*
+✅ *Channel Added!* ({ctype})
 
 📋 `{channel_name}`
 💼 Wallet: *{w_name}*
@@ -1435,27 +1444,10 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
 📈 Target MC: ${target_mc or wallet.get('target_mc', 0):,.0f}
 🤖 Auto-Sell: {'✅ ON' if auto_sell else '❌ OFF'}
 
-📡 Monitoring will start shortly...
+📡 Monitoring started!
 """
     await update.message.reply_text(summary, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     return SELECTING_ACTION
-async def handle_channel_wallet_setup(query, wallet_id):
-    """After wallet selected, ask for buy amount"""
-    user_id = query.from_user.id
-    wallet = db.get_wallet(wallet_id)
-    
-    channel_setup_data[user_id] = channel_setup_data.get(user_id, {})
-    channel_setup_data[user_id]['wallet_id'] = wallet_id
-    
-    channel_name = channel_setup_data[user_id].get('channel_name', '')
-    
-    await query.edit_message_text(
-        f"📋 `{channel_name}` → 💼 *{wallet['wallet_name']}*\n\n"
-        f"💵 *Buy Amount (SOL)*\n\nEnter amount or *skip* for default: {wallet.get('default_buy_amount', 0.01)} SOL",
-        reply_markup=get_back_keyboard(),
-        parse_mode='Markdown'
-    )
-    return ENTER_CHANNEL_BUY_AMOUNT
 async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_name = update.message.text.strip()
     user_id = update.effective_user.id
@@ -1739,7 +1731,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ENTER_SLIPPAGE
     elif action.startswith("chsetup_wallet_"):
         wallet_id = int(action.replace("chsetup_wallet_", ""))
-        return await handle_channel_wallet_setup(query, wallet_id)
+        return await handle_channel_wallet_selection(query, wallet_id)
     elif action == "set_take_profit":
         context.user_data['settings_state'] = 'take_profit'
         settings = db.get_user_settings(user_id)
