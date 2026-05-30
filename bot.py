@@ -594,20 +594,28 @@ async def get_token_market_cap(token_mint: str) -> Optional[float]:
 async def get_or_create_user(user_id: int, username: str = None) -> Dict:
     user = db.get_user(user_id)
     if not user:
-        db.create_user(user_id=user_id, username=username or f"user_{user_id}")
+        print(f"🔧 Creating new user: {user_id}")
+        result = db.create_user(user_id=user_id, username=username or f"user_{user_id}")
+        print(f"   create_user result: {result}")
         user = db.get_user(user_id)
+        print(f"   get_user after create: {user is not None}")
     
     # Create W1 ONLY if no wallets exist
     wallets = db.get_user_wallets(user_id)
+    print(f"   wallets count: {len(wallets) if wallets else 0}")
+    
     if not wallets:
         wallet = derive_wallet_from_user(user_id, 1)
         public_key = str(wallet.pubkey())
         wallet_id = db.create_wallet(user_id, 'W1', 1)
+        print(f"   create_wallet result: {wallet_id}")
         if wallet_id > 0:
             db.update_wallet_settings(wallet_id, public_key=public_key)
         print(f"✅ Created W1 for user {user_id}: {public_key[:8]}...")
+    else:
+        print(f"   Wallet already exists: {wallets[0].get('wallet_name', '?')}")
     
-    return user or {}  # Return empty dict if still None
+    return user or {}
 
 # ============================================
 # MODERN UI KEYBOARDS
@@ -2585,9 +2593,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 async def show_wallet(query):
     user_id = query.from_user.id
-    user = db.get_user(user_id)
+    wallets = db.get_user_wallets(user_id) or []
+    
+    if not wallets:
+        await query.edit_message_text("❌ No wallets found! Send /start.", reply_markup=get_main_keyboard())
+        return SELECTING_ACTION
+    
+    wallet_addr = wallets[0].get('public_key', 'N/A')
+    
     try:
-        balance = await solana_service.get_balance(user['public_key'])
+        balance = await solana_service.get_balance(wallet_addr)
     except:
         balance = 0
     
@@ -2597,7 +2612,7 @@ async def show_wallet(query):
 ╚═══════════════════════════╝
 
 *Address:*
-`{user['public_key']}`
+`{wallet_addr}`
 
 *Balance:* `{balance:.6f} SOL`
 
@@ -2611,7 +2626,6 @@ async def show_wallet(query):
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
-
 async def export_private_key(query):
     """Show wallet selection for key export"""
     user_id = query.from_user.id
@@ -3746,21 +3760,25 @@ Transfer SOL and Tokens between wallets or to external addresses.
 
 async def back_to_main(query):
     user_id = query.from_user.id
-    user = db.get_user(user_id)
+    user = db.get_user(user_id) or {}
+    
+    # Get W1 wallet safely
+    wallets = db.get_user_wallets(user_id) or []
+    wallet_addr = wallets[0].get('public_key', 'N/A') if wallets else 'N/A'
+    
     text = f"""
 ╔═══════════════════════════╗
 ║     🔫 SOLANA SNIPER     ║
 ╚═══════════════════════════╝
 
-💳 `{user.get('public_key', 'N/A')[:8]}...`
-📋 {len(db.get_user_channels(user_id))} channels
-📊 {db.get_user_positions_count(user_id)} positions
+💳 `{wallet_addr[:8]}...{wallet_addr[-4:]}` if wallet_addr != 'N/A' else 'No wallet'
+📋 {len(db.get_user_channels(user_id) or [])} channels
+📊 {db.get_user_positions_count(user_id) or 0} positions
 
 👇 Select option:
 """
     await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     return SELECTING_ACTION
-
 # ============================================
 # TRANSFER & WITHDRAW
 # ============================================
