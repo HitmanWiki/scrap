@@ -70,13 +70,13 @@ CONFIRM_BUY = 6
 ENTER_BUY_AMOUNT = 7
 ENTER_SLIPPAGE = 8
 ENTER_PROFIT_PERCENT = 9
-ENTER_TARGET_MC = 10
+
 ENTER_TRANSFER_DETAILS = 11
 ENTER_WITHDRAW_DETAILS = 12
 ENTER_CHANNEL_BUY_AMOUNT = 13
 ENTER_CHANNEL_SLIPPAGE = 14
 ENTER_CHANNEL_TAKE_PROFIT = 15
-ENTER_CHANNEL_TARGET_MC = 16
+
 ENTER_CHANNEL_AUTO_SELL = 17
 ENTER_OTP = 18  # Add to conversation states at top
 ENTER_2FA = 19
@@ -643,9 +643,8 @@ def get_settings_keyboard():
         [InlineKeyboardButton("💵 Buy Amount", callback_data="set_buy_amount")],
         [InlineKeyboardButton("📊 Slippage %", callback_data="set_slippage")],
         [InlineKeyboardButton("🎯 Take Profit %", callback_data="set_take_profit")],
-        [InlineKeyboardButton("📈 Target MC ($)", callback_data="set_target_mc")],
         [InlineKeyboardButton("🤖 Auto-Sell", callback_data="toggle_auto_sell")],
-        [InlineKeyboardButton("🔫 Auto-Buy", callback_data="toggle_auto_buy")],  # NEW
+        [InlineKeyboardButton("🔫 Auto-Buy", callback_data="toggle_auto_buy")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -1889,7 +1888,7 @@ async def show_portfolio_stats(query):
     return SELECTING_ACTION
 # 3. Fix ask_channel_buy_settings (remove or implement)
 async def ask_channel_buy_settings(update, context):
-    # Simplified - just add channel directly
+    """Simplified - just add channel directly"""
     user_id = update.effective_user.id
     channel_name = context.user_data.get('pending_channel', '')
     wallet_id = context.user_data.get('selected_wallet')
@@ -1901,13 +1900,18 @@ async def ask_channel_buy_settings(update, context):
         channel_subscribers[channel_name] = []
     if user_id not in channel_subscribers[channel_name]:
         channel_subscribers[channel_name].append(user_id)
-    asyncio.create_task(poll_channel_messages(channel_name))
+    
+    global monitor_channel_queue
+    if monitor_channel_queue:
+        await monitor_channel_queue.put(channel_name)
     
     await update.message.reply_text(
         f"✅ `{channel_name}` added!\n📡 Monitoring started.",
         reply_markup=get_main_keyboard(), parse_mode='Markdown'
     )
     return SELECTING_ACTION
+
+
 async def ask_channel_buy_amount(source, user_id):
     """Ask for buy amount"""
     wallet_id = channel_setup_data.get(user_id, {}).get('wallet_id')
@@ -1928,27 +1932,26 @@ Enter amount or *skip* for default: {default_buy} SOL
         await source.reply_text(text, reply_markup=get_back_keyboard(), parse_mode='Markdown')
     return ENTER_CHANNEL_BUY_AMOUNT
 
+
 async def add_channel_with_wallet(query):
     """New flow: Add channel → Select wallet"""
     user_id = query.from_user.id
-    
-    # Just go directly to channel input - wallet selection happens after
     await query.edit_message_text(
         "📋 *Add Channel*\n\nSend channel username (@name):\nType *cancel* to abort.",
         reply_markup=get_back_keyboard(),
         parse_mode='Markdown'
     )
     return ENTER_CHANNEL_USERNAME
+
+
 async def handle_channel_wallet_selection(query, wallet_id):
     """After selecting wallet for channel, ask for buy amount"""
     user_id = query.from_user.id
     wallet = db.get_wallet(wallet_id)
     
-    # Get channel name from channel_setup_data (set by handle_channel_input)
     setup = channel_setup_data.get(user_id, {})
     channel_name = setup.get('channel_name', 'channel')
     
-    # Update with wallet_id
     channel_setup_data[user_id] = {
         'channel_name': channel_name,
         'wallet_id': wallet_id,
@@ -1963,6 +1966,8 @@ async def handle_channel_wallet_selection(query, wallet_id):
         parse_mode='Markdown'
     )
     return ENTER_CHANNEL_BUY_AMOUNT
+
+
 async def handle_channel_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
@@ -1983,12 +1988,13 @@ async def handle_channel_buy_amount(update: Update, context: ContextTypes.DEFAUL
     
     channel_setup_data[user_id] = setup
     
-    # Ask for slippage
     await update.message.reply_text(
         "📊 *Slippage %*\n\nEnter % (e.g., 10) or *skip* for default:",
         reply_markup=get_back_keyboard(), parse_mode='Markdown'
     )
     return ENTER_CHANNEL_SLIPPAGE
+
+
 async def handle_channel_slippage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
@@ -2009,7 +2015,7 @@ async def handle_channel_slippage(update: Update, context: ContextTypes.DEFAULT_
     
     channel_setup_data[user_id] = setup
     
-    # NOW ASK FOR SELL SETTINGS
+    # Go directly to Take Profit (skip Target MC)
     await update.message.reply_text(
         "🎯 *Take Profit %*\n\nAuto-sell when profit reaches this %\n(or type *skip* for default: 50%, *0* to disable):",
         reply_markup=get_back_keyboard(),
@@ -2019,36 +2025,7 @@ async def handle_channel_slippage(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def handle_channel_take_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    user_id = update.effective_user.id
-    
-    if text.lower() == 'cancel':
-        channel_setup_data.pop(user_id, None)
-        await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard())
-        return SELECTING_ACTION
-    
-    setup = channel_setup_data.get(user_id, {})
-    
-    if text.lower() != 'skip':
-        try:
-            tp = float(text)
-            setup['take_profit'] = tp
-            setup['auto_sell'] = (tp > 0)
-        except:
-            await update.message.reply_text("❌ Invalid! Enter number or *skip*.", reply_markup=get_back_keyboard())
-            return ENTER_CHANNEL_TAKE_PROFIT
-    
-    channel_setup_data[user_id] = setup
-    
-    # Ask for Target MC
-    await update.message.reply_text(
-        "📈 *Target MC ($)*\n\nAuto-sell when market cap reaches this\n(or type *skip* to not set, e.g., 45000):",
-        reply_markup=get_back_keyboard(),
-        parse_mode='Markdown'
-    )
-    return ENTER_CHANNEL_TARGET_MC
-
-async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Final step - save channel with all settings (no Target MC)"""
     text = update.message.text.strip()
     user_id = update.effective_user.id
     
@@ -2061,34 +2038,32 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
     
     if text.lower() != 'skip':
         try:
-            setup['target_mc'] = float(text)
+            tp = float(text)
+            setup['take_profit'] = tp
+            setup['auto_sell'] = (tp > 0)
         except:
-            await update.message.reply_text("❌ Invalid!", reply_markup=get_back_keyboard())
-            return ENTER_CHANNEL_TARGET_MC
+            await update.message.reply_text("❌ Invalid! Enter number or *skip*.", reply_markup=get_back_keyboard())
+            return ENTER_CHANNEL_TAKE_PROFIT
     
+    # FINALIZE - no Target MC
     channel_name = setup.get('channel_name', '')
     wallet_id = setup.get('wallet_id')
     buy_amount = setup.get('buy_amount')
     slippage = setup.get('slippage')
     take_profit = setup.get('take_profit')
-    target_mc = setup.get('target_mc')
     auto_sell = setup.get('auto_sell', True)
     is_private = setup.get('is_private', False)
     
-    # Update wallet
     if wallet_id:
         updates = {}
         if buy_amount: updates['default_buy_amount'] = buy_amount
         if slippage: updates['default_slippage'] = slippage
         if take_profit is not None: updates['take_profit_percent'] = take_profit
-        if target_mc is not None: updates['target_mc'] = target_mc
         updates['auto_sell_enabled'] = auto_sell
         db.update_wallet_settings(wallet_id, **updates)
     
-    # Add channel with is_private flag
     db.add_channel(user_id, channel_name, wallet_id=wallet_id, is_private=is_private)
     
-    # Queue for monitoring
     global channel_subscribers, monitor_channel_queue
     if channel_name not in channel_subscribers:
         channel_subscribers[channel_name] = []
@@ -2097,10 +2072,8 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
     
     if monitor_channel_queue:
         if is_private:
-            # Queue as (user_id, channel_name) - monitor thread creates client
             await monitor_channel_queue.put((user_id, channel_name))
         else:
-            # Public channel - just channel name
             await monitor_channel_queue.put(channel_name)
     
     wallet = db.get_wallet(wallet_id) if wallet_id else None
@@ -2116,7 +2089,6 @@ async def handle_channel_target_mc(update: Update, context: ContextTypes.DEFAULT
 💰 Buy: {buy_amount or wallet.get('default_buy_amount', 0.01)} SOL
 📊 Slippage: {(slippage or wallet.get('default_slippage', 1000))/100}%
 🎯 Take Profit: {take_profit if take_profit is not None else wallet.get('take_profit_percent', 50)}%
-📈 Target MC: ${target_mc or wallet.get('target_mc', 0):,.0f}
 🤖 Auto-Sell: {'✅ ON' if auto_sell else '❌ OFF'}
 
 📡 Monitoring started!
@@ -2608,15 +2580,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wallet_id = int(action.replace("ch_wallet_", ""))
         return await handle_channel_wallet_selection(query, wallet_id)
     
-    elif action == "set_target_mc":
-        context.user_data['settings_state'] = 'target_mc'
-        settings = db.get_user_settings(user_id)
-        current = settings.get('target_mc', 0) if settings else 0
-        current_display = f"${current:,.0f}" if current > 0 else "Not set"
-        await query.edit_message_text(
-            f"📈 *Target Market Cap*\nCurrent: *{current_display}*\n\nAuto-sell when MC reaches this.\nEnter target in $ (e.g., 45000):",
-            reply_markup=get_back_keyboard(), parse_mode='Markdown')
-        return ENTER_TARGET_MC
+   
     elif action == "delete_message":
         try:
             await query.message.delete()
@@ -3903,10 +3867,8 @@ async def show_settings(query):
     user = db.get_user(user_id)
     settings = db.get_user_settings(user_id)
     take_profit = settings.get('take_profit_percent', 50) if settings else 50
-    target_mc = settings.get('target_mc', 0) if settings else 0
     auto_sell = "✅ ON" if (settings and settings.get('auto_sell_enabled')) else "❌ OFF"
     auto_buy = "✅ ON" if (settings and settings.get('auto_snipe', 1)) else "❌ OFF"
-    target_mc_display = f"${target_mc:,.0f}" if target_mc > 0 else "Not set"
     
     text = f"""
 ⚙️ *Settings*
@@ -3914,13 +3876,11 @@ async def show_settings(query):
 • Buy: {user.get('default_buy_amount', DEFAULT_BUY_AMOUNT)} SOL
 • Slippage: {user.get('default_slippage', DEFAULT_SLIPPAGE)/100}%
 • Take Profit: {take_profit}%
-• Target MC: {target_mc_display}
 • Auto-Sell: {auto_sell}
 • Auto-Buy: {auto_buy}
 """
     await query.edit_message_text(text, reply_markup=get_settings_keyboard(), parse_mode='Markdown')
     return SELECTING_ACTION
-
 async def show_balance(query):
     user_id = query.from_user.id
     user = db.get_user(user_id)
@@ -4570,10 +4530,7 @@ def main():
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)
             ],
-            ENTER_TARGET_MC: [
-                CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)
-            ],
+          
             ENTER_TRANSFER_DETAILS: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, execute_transfer_final)
@@ -4595,10 +4552,7 @@ def main():
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_take_profit)
             ],
-            ENTER_CHANNEL_TARGET_MC: [
-                CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_target_mc)
-            ],
+            
         },
         fallbacks=[CommandHandler('start', start)],
         per_message=False
