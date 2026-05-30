@@ -3378,6 +3378,22 @@ def main():
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp)
 ],
+            ENTER_API_ID: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_id)
+],
+            ENTER_API_HASH: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_hash)
+],
+            ENTER_PHONE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone)
+],
+            ENTER_OTP: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp)
+            ],
         },
         fallbacks=[CommandHandler('start', start)],
         per_message=False
