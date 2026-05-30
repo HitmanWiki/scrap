@@ -2261,35 +2261,35 @@ async def connect_user_session_qr(query):
     
     try:
         from telethon.sessions import StringSession
-        from telethon.tl.types import LoginToken
         
         client = TelegramClient(StringSession(), 
                                user['telegram_api_id'], 
                                user['telegram_api_hash'])
         await client.connect()
         
-        # Generate QR login token
+        # Generate QR login - returns a QRLogin object
         qr_login = await client.qr_login()
         
         # Store client
         pending_clients[user_id] = {'client': client, 'qr': qr_login}
         
-        # The QR code URL can be displayed or sent as a link
-        # User opens it on their phone where Telegram is logged in
+        # The QR code URL
+        qr_url = qr_login.url
+        
         await query.edit_message_text(
             f"📱 *Scan QR Code to Login*\n\n"
-            f"🔗 [Click here to login]({qr_login.url})\n\n"
-            f"Or copy this link and open it on your phone:\n"
-            f"`{qr_login.url}`\n\n"
-            f"⏳ Waiting for you to approve...",
+            f"🔗 [Click here to login]({qr_url})\n\n"
+            f"Or copy this link and open on your phone:\n"
+            f"`{qr_url}`\n\n"
+            f"⏳ Waiting for approval... (2 min timeout)",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown',
             disable_web_page_preview=True
         )
         
-        # Wait for QR login (with timeout)
+        # Wait for QR login with timeout
         try:
-            await asyncio.wait_for(qr_login.wait(), timeout=120)  # 2 minutes
+            await asyncio.wait_for(qr_login.wait(), timeout=120)
             
             session_string = client.session.save()
             db.update_user_settings(user_id, telegram_session_string=session_string)
@@ -2297,13 +2297,27 @@ async def connect_user_session_qr(query):
             pending_clients.pop(user_id, None)
             
             me = await client.get_me()
+            
+            # Start private channels
+            channels = db.get_user_channels(user_id)
+            private_count = 0
+            for ch in channels:
+                if ch.get('is_private'):
+                    global monitor_channel_queue
+                    if monitor_channel_queue:
+                        await monitor_channel_queue.put((user_id, ch['channel_name'], client))
+                        private_count += 1
+            
             await query.edit_message_text(
-                f"✅ *Connected as @{me.username}!*\n\nPrivate channels activated.",
-                reply_markup=get_main_keyboard(), parse_mode='Markdown'
+                f"✅ *Connected as @{me.username}!*\n\n"
+                f"📋 {private_count} private channels activated.",
+                reply_markup=get_main_keyboard(),
+                parse_mode='Markdown'
             )
             
         except asyncio.TimeoutError:
             pending_clients.pop(user_id, None)
+            await client.disconnect()
             await query.edit_message_text(
                 "⏰ QR login timed out. Please try again.",
                 reply_markup=get_main_keyboard()
@@ -2312,7 +2326,7 @@ async def connect_user_session_qr(query):
             
     except Exception as e:
         await query.edit_message_text(
-            f"❌ QR login failed: {str(e)[:200]}\n\nTry again or use OTP method.",
+            f"❌ QR login failed: {str(e)[:200]}\n\nTry OTP login instead.",
             reply_markup=get_main_keyboard()
         )
         return SELECTING_ACTION
