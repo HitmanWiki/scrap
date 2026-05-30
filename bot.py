@@ -626,6 +626,7 @@ def get_main_keyboard():
          InlineKeyboardButton("💼 Wallets", callback_data="manage_wallets")],  # NEW
         [InlineKeyboardButton("🔑 Export Key", callback_data="export_key"),
          InlineKeyboardButton("🔐 TG Auth", callback_data="telegram_auth_setup")],
+         [InlineKeyboardButton("⚡ Actions", callback_data="actions")],  # ADD THIS BACK
     ]
     return InlineKeyboardMarkup(keyboard)
 
