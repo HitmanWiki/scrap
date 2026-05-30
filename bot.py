@@ -1704,17 +1704,23 @@ async def handle_wallet_selection(query, wallet_id):
         return SELECTING_ACTION
     
     addr = wallet.get('public_key', 'N/A')
+    try:
+        bal = await solana_service.get_balance(addr)
+    except:
+        bal = 0
+    
     text = f"""
 💼 *{wallet['wallet_name']}*
 
-*Address:* `{addr}`
-*Buy Amount:* {wallet.get('default_buy_amount', 0.01)} SOL
-*Slippage:* {wallet.get('default_slippage', 1000)/100}%
+`{addr}`
 
-Fund this wallet to start trading!
+Balance: {bal:.6f} SOL
+Buy: {wallet.get('default_buy_amount', 0.01)} SOL
+Slippage: {wallet.get('default_slippage', 1000)/100}%
 """
     keyboard = [
         [InlineKeyboardButton("📋 Copy Address", callback_data="copy_address")],
+        [InlineKeyboardButton("🔑 Export Private Key", callback_data=f"export_wallet_{wallet_id}")],
         [InlineKeyboardButton("« Back", callback_data="manage_wallets")]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -2596,33 +2602,48 @@ async def show_wallet(query):
     wallets = db.get_user_wallets(user_id) or []
     
     if not wallets:
-        await query.edit_message_text("❌ No wallets found! Send /start.", reply_markup=get_main_keyboard())
+        await query.edit_message_text("❌ No wallets! Send /start.", reply_markup=get_main_keyboard())
         return SELECTING_ACTION
     
-    wallet_addr = wallets[0].get('public_key', 'N/A')
+    # If multiple wallets, show selection
+    if len(wallets) > 1:
+        text = "💼 *Select Wallet*\n\n"
+        keyboard = []
+        for w in wallets:
+            addr = w.get('public_key', 'N/A')
+            try:
+                bal = await solana_service.get_balance(addr)
+            except:
+                bal = 0
+            text += f"*{w['wallet_name']}* — `{addr[:8]}...` ({bal:.4f} SOL)\n"
+            keyboard.append([InlineKeyboardButton(
+                f"💼 {w['wallet_name']} - View/Export",
+                callback_data=f"select_wallet_{w['id']}"
+            )])
+        keyboard.append([InlineKeyboardButton("« Back", callback_data="back_main")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return SELECTING_ACTION
     
+    # Single wallet - show directly
+    wallet_addr = wallets[0].get('public_key', 'N/A')
     try:
         balance = await solana_service.get_balance(wallet_addr)
     except:
         balance = 0
     
-    # NO Markdown - plain text to avoid entity errors
-    text = f"💼 WALLET\n\nAddress:\n{wallet_addr}\n\nBalance: {balance:.6f} SOL\n\n🔐 Derived from Telegram ID\n⚠️ Fund to start sniping!"
-    
-    keyboard = InlineKeyboardMarkup([
+    text = f"""
+💼 *{wallets[0]['wallet_name']}*
+
+`{wallet_addr}`
+
+Balance: {balance:.6f} SOL
+"""
+    keyboard = [
         [InlineKeyboardButton("📋 Copy Address", callback_data="copy_address")],
         [InlineKeyboardButton("🔑 Export Key", callback_data="export_key")],
         [InlineKeyboardButton("« Back", callback_data="back_main")]
-    ])
-    
-    # Delete old message first
-    try:
-        await query.message.delete()
-    except:
-        pass
-    
-    # Send new message WITHOUT parse_mode
-    await query.message.reply_text(text, reply_markup=keyboard)
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return SELECTING_ACTION
 async def export_private_key(query):
     """Show wallet selection for key export"""
