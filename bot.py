@@ -3303,22 +3303,17 @@ def main():
     import threading
     import time
     
-    # CREATE APPLICATION FIRST so notifications work in monitor thread
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Health check server
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
     
-    # Monitor thread (application is now available)
     monitor_thread = threading.Thread(target=run_monitor_in_thread, daemon=True)
     monitor_thread.start()
     
     time.sleep(3)
     
-    # ADD DEBUG HANDLER HERE
     application.add_handler(CommandHandler('debug', debug_wallet))
-    # Add handlers
     application.add_handler(CallbackQueryHandler(start_auth_process, pattern="^start_auth$"))
     
     conv_handler = ConversationHandler(
@@ -3333,6 +3328,24 @@ def main():
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_input)
             ],
+            # API AUTH STATES
+            ENTER_API_ID: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_id)
+            ],
+            ENTER_API_HASH: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_hash)
+            ],
+            ENTER_PHONE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone)
+            ],
+            ENTER_OTP: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp)
+            ],
+            # SETTINGS STATES
             ENTER_BUY_AMOUNT: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)
@@ -3349,6 +3362,7 @@ def main():
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_input)
             ],
+            # TRANSFER/WITHDRAW
             ENTER_TRANSFER_DETAILS: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transfer_input)
@@ -3358,6 +3372,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_input)
             ],
             CONFIRM_BUY: [CallbackQueryHandler(button_handler)],
+            # CHANNEL SETUP STATES
             ENTER_CHANNEL_BUY_AMOUNT: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_buy_amount)
@@ -3373,26 +3388,6 @@ def main():
             ENTER_CHANNEL_TARGET_MC: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_target_mc)
-            ],
-            ENTER_OTP: [
-                CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp)
-],
-            ENTER_API_ID: [
-                CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_id)
-],
-            ENTER_API_HASH: [
-                CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_hash)
-],
-            ENTER_PHONE: [
-                CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone)
-],
-            ENTER_OTP: [
-                CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp)
             ],
         },
         fallbacks=[CommandHandler('start', start)],
